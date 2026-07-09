@@ -1,0 +1,26 @@
+# Cynthera - Agentic AI for Drug Repurposing
+
+cache/
+logs/
+chroma_db/
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.DS_Store
+*.log
+*.json
+!config/*.json

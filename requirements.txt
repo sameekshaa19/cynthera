@@ -1,0 +1,22 @@
+# Core Dependencies (Lightweight)
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Data Science & ML (Essential only)
+pydantic>=2.0.0
+requests>=2.31.0
+
+# Web Interface
+streamlit>=1.30.0
+plotly>=5.18.0
+
+# Testing
+pytest>=7.4.0
+
+# Utilities
+tqdm>=4.66.0
+
+# Note: LangGraph, LangChain, ChromaDB, and Sentence Transformers are OPTIONAL for MVP
+# The system works without them using rule-based reasoning
+# Install separately if needed:
+# pip install langgraph langchain chromadb sentence-transformers
