@@ -623,13 +623,13 @@ scoring_weights:
 
 recommendation_thresholds:
   promising:
-    min_support: 0.6
-    min_mechanism: 0.7
-    max_risk: 0.3
+    min_support: "MEDIUM"           # Enum level (mapped from 0.40–1.00 numeric)
+    min_mechanism: "MEDIUM"         # Enum level (mapped from 0.40–1.00 numeric)
+    max_risk: "LOW"                 # Enum level (mapped from 0.00–0.39 numeric)
   not_recommended:
-    max_support: 0.3
-    max_mechanism: 0.3
-    min_risk: 0.7
+    max_support: "LOW"              # Enum level (mapped from 0.00–0.39 numeric)
+    max_mechanism: "LOW"            # Enum level (mapped from 0.00–0.39 numeric)
+    min_risk: "HIGH"                # Enum level (mapped from 0.70–1.00 numeric)
 ```
 
 ---

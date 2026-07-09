@@ -1,22 +1,41 @@
-# Core Dependencies (Lightweight)
+# CYNTHERA — Python Dependencies
+# Aligned to 08_IMPLEMENTATION_GUIDE.md §2.1
+
+# Core
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
 
-# Data Science & ML (Essential only)
-pydantic>=2.0.0
-requests>=2.31.0
+# Async HTTP
+httpx>=0.27.0
 
-# Web Interface
-streamlit>=1.30.0
+# Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# LLM (Google Gemini)
+google-generativeai>=0.5.0
+
+# Web Interface (Streamlit MVP)
+streamlit>=1.35.0
 plotly>=5.18.0
+pandas>=2.0.0
+
+# Retry / Resilience
+tenacity>=8.2.0
 
 # Testing
 pytest>=7.4.0
+pytest-asyncio>=0.23.0
 
 # Utilities
 tqdm>=4.66.0
 
-# Note: LangGraph, LangChain, ChromaDB, and Sentence Transformers are OPTIONAL for MVP
-# The system works without them using rule-based reasoning
-# Install separately if needed:
-# pip install langgraph langchain chromadb sentence-transformers
+# Optional (future phases):
+# sqlalchemy>=2.0.0        # Phase 3: Database layer
+# asyncpg>=0.29.0          # Phase 3: PostgreSQL async driver
+# alembic>=1.13.0          # Phase 3: Migrations
+# redis>=5.0.0             # Phase 2: Distributed cache
+# structlog>=24.0.0        # Production: structured logging
+# prometheus-client>=0.20.0 # Production: metrics

@@ -1,0 +1,60 @@
+sources:
+  - name: chembl
+    display_name: "ChEMBL"
+    description: "Bioactivity data, drug-target interactions"
+    base_url: "https://www.ebi.ac.uk/chembl/api/data"
+    is_core: true
+    evidence_type: "IN_VITRO"
+    timeout_seconds: 30
+    rate_limit_rps: 10
+    requires_api_key: false
+
+  - name: uniprot
+    display_name: "UniProt"
+    description: "Protein target sequences and functional annotations"
+    base_url: "https://rest.uniprot.org"
+    is_core: true
+    evidence_type: "CURATED"
+    timeout_seconds: 30
+    rate_limit_rps: 10
+    requires_api_key: false
+
+  - name: pubmed
+    display_name: "PubMed"
+    description: "Biomedical literature abstracts"
+    base_url: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    is_core: false
+    evidence_type: "OBSERVATIONAL"
+    timeout_seconds: 30
+    rate_limit_rps: 3
+    requires_api_key: false
+
+  - name: reactome
+    display_name: "Reactome"
+    description: "Biological pathway knowledgebase"
+    base_url: "https://reactome.org/ContentService"
+    is_core: false
+    evidence_type: "CURATED"
+    timeout_seconds: 30
+    rate_limit_rps: 10
+    requires_api_key: false
+
+  - name: clinicaltrials
+    display_name: "ClinicalTrials.gov"
+    description: "Clinical trial registry and outcomes"
+    base_url: "https://clinicaltrials.gov/api/v2"
+    is_core: false
+    evidence_type: "RCT"
+    timeout_seconds: 30
+    rate_limit_rps: 10
+    requires_api_key: false
+
+  - name: disgenet
+    display_name: "DisGeNET"
+    description: "Gene-disease associations"
+    base_url: "https://www.disgenet.org/api"
+    is_core: false
+    evidence_type: "CURATED"
+    timeout_seconds: 30
+    rate_limit_rps: 5
+    requires_api_key: false

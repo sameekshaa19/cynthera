@@ -79,15 +79,25 @@ The system's biological and analytical reasoning is governed by the following co
 │     Target      │                     │                              │
 └────────┬────────┘                     │                              │
          │                              │                              │
-         ▼                              ▼                              │
-┌─────────────────┐            ┌─────────────────┐            ┌─────────────────┐
-│     Protein     │───────────►│Pathway / Chain  │◄───────────│     Source      │
-└─────────────────┘            └─────────────────┘            └────────┬────────┘
-                                                                       │
-         ┌──────────────────────────────┬──────────────────────────────┘
-         ▼                              ▼
+         ▼                              │                              │
+┌─────────────────┐                     │                              │
+│     Protein     │─────────────────────┘                              │
+└────────┬────────┘                                                    │
+         │                                                            │
+         ▼                                                            │
 ┌─────────────────┐            ┌─────────────────┐
-│    Evidence     │            │      Claim      │
+│      Gene       │───────────►│    Disease      │
+└────────┬────────┘            └─────────────────┘
+         │
+         ▼
+┌─────────────────┐            ┌─────────────────┐
+│Pathway / Chain  │◄───────────│     Source      │
+└─────────────────┘            └────────┬────────┘
+                                         │
+         ┌───────────────────────────────┼───────────────────────────────┐
+         ▼                               ▼                               ▼
+┌─────────────────┐            ┌─────────────────┐            ┌─────────────────┐
+│    Evidence     │            │      Claim      │            │   ClinicalTrial │
 └────────┬────────┘            └────────┬────────┘
          │                              │
          └──────────────┬───────────────┘
@@ -135,6 +145,7 @@ The system's biological and analytical reasoning is governed by the following co
     *   `Reasoned`: Stances have been mapped and target pathway traces are complete.
     *   `Evaluated`: Three-dimensional scores (SS, MS, RS) have been computed.
     *   `Completed`: Recommendation rules have run, and the report has been written.
+    *   `Failed`: Pipeline terminated at any prior stage due to a non-recoverable error.
 *   **Relationships**:
     *   Has exactly one **Drug** instance (1:1).
     *   Has exactly one **Disease** instance (1:1).
@@ -209,7 +220,25 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.6 Disease
+### 4.6 Gene
+
+*   **Definition**: A hereditary unit of DNA encoding a functional RNA or protein product, mapped to standard genomic taxonomies.
+*   **Purpose**: Bridge proteins to disease associations via DisGeNET, HGNC, and NCBI Gene; enable gene-level reasoning for disease relevance assessment.
+*   **Created by**: Normalization Layer (mapping DisGeNET gene-disease associations, HGNC approved symbols).
+*   **Consumed by**: Disease Biology Expert Agent, Mechanistic Expert Agent, Support Assessment Agent.
+*   **Mutability**: **Immutable**.
+*   **Lifecycle**: Resolved during target mapping; updated on HGNC or NCBI release.
+*   **Relationships**:
+    *   Linked to one or more **Protein** entities it encodes (1:N).
+    *   Associated with one or more **Disease** entities via DisGeNET gene-disease associations (N:M).
+*   **Validation Rules**:
+    *   Must contain a valid `HGNC symbol` (e.g., `PDE5A`).
+    *   Must contain a valid `NCBI Gene ID` (e.g., `8654`).
+*   **Example**: `Gene(hgnc_symbol="PDE5A", ncbi_gene_id=8654, name="phosphodiesterase 5A")`.
+
+---
+
+### 4.8 Disease
 
 *   **Definition**: The canonical disease entity mapped to standard biological taxonomies.
 *   **Purpose**: Uniquely identify the disease state and locate its corresponding pathophysiology markers.
@@ -227,7 +256,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.7 Pathway
+### 4.9 Pathway
 
 *   **Definition**: A curated sequence of molecular interactions and reactions in a cell.
 *   **Purpose**: Provide structural pathways for causal mechanistic tracing.
@@ -241,7 +270,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.8 Source
+### 4.10 Source
 
 *   **Definition**: A meta-entity defining the source database or publication registry where evidence originates.
 *   **Purpose**: Store API versions, licensing, citation rules, and reliability weights.
@@ -258,7 +287,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.9 Evidence
+### 4.11 Evidence
 
 *   **Definition**: An empirical observation, assay data, or literature record retrieved from a Source.
 *   **Purpose**: Ground every claim in an auditable external reference.
@@ -276,7 +305,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.10 Claim
+### 4.12 Claim
 
 *   **Definition**: A structured semantic statement extracted from text, representing a biological relationship as a triple.
 *   **Purpose**: Convert unstructured literature or assay text into standardized directional mechanisms.
@@ -293,7 +322,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.11 ClinicalTrial
+### 4.13 ClinicalTrial
 
 *   **Definition**: A registered, human-subject clinical study evaluating the therapeutic action of the drug on the disease.
 *   **Purpose**: Identify clinical outcomes, efficacy endpoints, and trial safety statuses.
@@ -311,7 +340,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.12 Contradiction
+### 4.14 Contradiction
 
 *   **Definition**: An analytical model documenting a directional conflict between two claims or experimental records.
 *   **Purpose**: Prevent the averaging of conflicting results, surfacing it as a safety penalty.
@@ -327,7 +356,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.13 MechanisticChain
+### 4.15 MechanisticChain
 
 *   **Definition**: The complete traced path linking a drug's target to the target disease pathophysiology.
 *   **Purpose**: Provide the visual and semantic explanation of target-pathway-disease cascade.
@@ -345,7 +374,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.14 SupportScore, MechanisticScore, RiskScore
+### 4.16 SupportScore, MechanisticScore, RiskScore
 
 *   **Definition**: Values representing the calculated support, mechanistic plausibility, and refutation risk of the hypothesis.
 *   **Purpose**: Quantify the three dimensions of hypothesis evaluation.
@@ -357,7 +386,7 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
-### 4.15 Recommendation
+### 4.17 Recommendation
 
 *   **Definition**: The final decision object generated by applying rules and vetoes over the three score dimensions.
 *   **Purpose**: Provide an actionable, transparent verdict for the researcher.

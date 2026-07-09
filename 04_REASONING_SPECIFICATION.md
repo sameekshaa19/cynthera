@@ -832,20 +832,57 @@ The Consensus Engine applies deterministic resolution rules when agent assessmen
 
 ---
 
-## 11. Rule Engine
+## 11. Scoring Architecture: Internal Numeric vs External Enum
 
-### 11.1 Purpose
+### 11.1 Two-Stage Scoring Model
+
+Scoring in CYNTHERA uses a two-stage model. Internally, all scores are computed as float values (0.0–1.0) by the Expert Agents. These numeric scores are then discretized to enum levels at the Consensus Engine boundary for consumption by the Rule Engine and the external API.
+
+```
+Internal (Expert Agents)       Boundary (Consensus Engine)       External (Rule Engine / API)
+─────────────────────────      ─────────────────────────────     ──────────────────────────────
+SupportScore = 0.82    ───→    Support → 0.70–1.00 = HIGH  ───→  support_level = HIGH
+MechanisticScore = 0.65 ──→    Mechanistic → 0.40–0.69 = MEDIUM → mechanistic_level = MEDIUM
+RiskScore = 0.22        ──→    Risk → 0.00–0.39 = LOW     ───→  risk_level = LOW
+```
+
+### 11.2 Numeric-to-Enum Mapping
+
+| Enum Level | Numeric Range | Interpretation |
+| :--- | :--- | :--- |
+| HIGH | 0.70 – 1.00 | Strong evidence or high confidence |
+| MEDIUM | 0.40 – 0.69 | Moderate evidence or moderate confidence |
+| LOW | 0.15 – 0.39 | Weak evidence or low confidence |
+| NONE / ABSENT | 0.00 – 0.14 | No evidence or baseline confidence only |
+
+### 11.3 When the Mapping Is Applied
+
+| Stage | Representation | Example |
+| :--- | :--- | :--- |
+| Expert Agent internal computation | Numeric (float 0.0–1.0) | `risk_score = compute_risk(...)` → `0.22` |
+| Assessment object output | Numeric (float 0.0–1.0) | `RiskAssessment.risk_score = 0.22` |
+| Consensus Engine discretization | Numeric → Enum | `risk_score (0.22)` → `risk_score_level (LOW)` |
+| ConsensusAssessment (Rule Engine input) | Enum only | `ConsensusAssessment.risk_score_level = LOW` |
+| API / UI presentation | Enum only | `"risk_level": "LOW"` |
+
+This means the Rule Engine configuration in `01_SYSTEM_ARCHITECTURE.md §12` specifies thresholds as enum levels (e.g., `max_risk: "LOW"`). The mapping between numeric scores and enum levels is defined in §11.2 above and is applied deterministically by the Consensus Engine.
+
+---
+
+## 12. Rule Engine
+
+### 12.1 Purpose
 
 The Rule Engine is the final decision-making component of the Reasoning Subsystem. It receives the `ConsensusAssessment` and applies a versioned, auditable rule set to produce a `RecommendationStatus`.
 
-### 11.2 Constraints
+### 12.2 Constraints
 
 *   **The Rule Engine is fully deterministic.** No LLM is used.
 *   Threshold values are configurable via the system configuration file (see `01_SYSTEM_ARCHITECTURE.md §12`).
 *   All rule firings are logged. Every recommendation can be traced to the exact rule that produced it.
 *   Rule set changes require a version bump. The active rule set version is recorded in the `ReasoningSessionManifest`.
 
-### 11.3 Recommendation Rule Set
+### 12.3 Recommendation Rule Set
 
 Rules are applied in strict priority order. The first matching rule wins.
 
@@ -959,19 +996,19 @@ OTHERWISE
 
 ---
 
-### 11.4 Rule Versioning
+### 12.4 Rule Versioning
 
 The active rule set version is recorded in the `ReasoningSessionManifest`. Changes to recommendation rules require a version bump, and the rule diff is preserved in the audit log. This ensures that a recommendation produced under rule version 1.2 can be distinguished from one produced under rule version 1.3 even if the underlying ConsensusAssessment is identical.
 
 ---
 
-## 12. Scientific Audit Agent
+## 13. Scientific Audit Agent
 
-### 12.1 Purpose
+### 13.1 Purpose
 
 The Scientific Audit Agent generates the final `ScientificAuditReport` and assembles the `ReasoningResult`. It converts the structured outputs of all reasoning stages into a human-readable, fully traceable scientific explanation.
 
-### 12.2 Constraints
+### 13.2 Constraints
 
 *   The Scientific Audit Agent **does not perform reasoning**.
 *   It **does not modify scores or assessments**.
@@ -979,7 +1016,7 @@ The Scientific Audit Agent generates the final `ScientificAuditReport` and assem
 *   It reads, formats, and structures. It explains conclusions; it does not make them.
 *   It may use an LLM to generate human-readable summary text for the scientific explanation sections of the audit report, provided that LLM output is clearly labelled as `AI_GENERATED_SUMMARY` and is never used to alter any structured field.
 
-### 12.3 Inputs
+### 13.3 Inputs
 
 *   All six Expert Agent Assessment objects
 *   `ConsensusAssessment`
@@ -988,7 +1025,7 @@ The Scientific Audit Agent generates the final `ScientificAuditReport` and assem
 *   Sealed `RetrievalPackage`
 *   `ReasoningSessionManifest`
 
-### 12.4 ScientificAuditReport Structure
+### 13.4 ScientificAuditReport Structure
 
 ```
 ScientificAuditReport
@@ -1045,10 +1082,10 @@ ScientificAuditReport
 |   +-- rule_fired                (String: which rule produced the recommendation)
 |   +-- reason                    (String: human-readable explanation)
 |
-+-- uncertainty_report            (UncertaintyReport — see Section 13)
++-- uncertainty_report            (UncertaintyReport — see Section 14)
 ```
 
-### 12.5 Audit Traceability Guarantee
+### 13.5 Audit Traceability Guarantee
 
 The `ScientificAuditReport` is a self-contained, archivable document. Every reference within it (to Claims, Evidence objects, Contradictions, Mechanistic Chain steps, Assessment objects) is a stable identifier that resolves to an object in either the `RetrievalPackage` or the `ReasoningResult`. No external state is required to interpret the audit.
 
@@ -1062,15 +1099,15 @@ The following questions must be answerable from the `ScientificAuditReport` alon
 
 ---
 
-## 13. Uncertainty Model
+## 14. Uncertainty Model
 
-### 13.1 Philosophy
+### 14.1 Philosophy
 
 Scientific uncertainty is not a failure state. It is information. An uncertainty-aware system that reports "this conclusion is based on sparse literature with significant gaps" is more scientifically honest — and more clinically useful — than one that produces a confident-sounding answer regardless of evidence quality.
 
 The Uncertainty Model is a mandatory component of every reasoning run. It is computed by the Consensus Engine and passed to the Rule Engine and Scientific Audit Agent. It becomes part of the `ScientificAuditReport`.
 
-### 13.2 Uncertainty Sources
+### 14.2 Uncertainty Sources
 
 | Uncertainty Source | Description |
 | :--- | :--- |
@@ -1085,7 +1122,7 @@ The Uncertainty Model is a mandatory component of every reasoning run. It is com
 | **Old evidence** | The majority of retrieved evidence is older than a configurable recency threshold |
 | **Expert Agent unavailable** | One or more parallel Expert Agents returned UNAVAILABLE |
 
-### 13.3 UncertaintyReport Structure
+### 14.3 UncertaintyReport Structure
 
 ```
 UncertaintyReport
@@ -1100,7 +1137,7 @@ UncertaintyReport
 +-- recommended_next_steps   (List[String]: suggested retrieval or validation actions)
 ```
 
-### 13.4 Uncertainty and the Recommendation
+### 14.4 Uncertainty and the Recommendation
 
 Uncertainty does not automatically change the `RecommendationStatus`. However:
 
@@ -1110,9 +1147,9 @@ Uncertainty does not automatically change the `RecommendationStatus`. However:
 
 ---
 
-## 14. LLM Boundaries
+## 15. LLM Boundaries
 
-### 14.1 Formal LLM Authority Table
+### 15.1 Formal LLM Authority Table
 
 The following table defines, with precision, where LLM involvement is permitted and where it is absolutely forbidden in the Reasoning Subsystem.
 
@@ -1138,7 +1175,7 @@ The following table defines, with precision, where LLM involvement is permitted 
 | Modifying canonical objects in RetrievalPackage | **NO** |
 | Modifying Claim Graph after sealing | **NO** |
 
-### 14.2 Enforcement
+### 15.2 Enforcement
 
 LLM operations are confined to:
 1.  The Claim Extraction Agent (Phase 1)
@@ -1148,9 +1185,9 @@ All LLM calls are logged with: model name, model version, temperature, prompt te
 
 ---
 
-## 15. Reasoning Result
+## 16. Reasoning Result
 
-### 15.1 ReasoningResult Composition
+### 16.1 ReasoningResult Composition
 
 The `ReasoningResult` is the final output of the Reasoning Subsystem, returned by the Reasoning Orchestrator to the Master Orchestrator.
 
@@ -1176,11 +1213,11 @@ ReasoningResult  [IMMUTABLE once produced]
 +-- scientific_audit_report     (ScientificAuditReport)
 ```
 
-### 15.2 ReasoningResult Immutability
+### 16.2 ReasoningResult Immutability
 
 The `ReasoningResult` is immutable once produced by the Reasoning Orchestrator. The Report Generation Layer (Streamlit or API) may render, format, and present its contents, but may not modify any field within it. This mirrors the `RetrievalPackage` immutability contract defined in `03_RETRIEVAL_SPECIFICATION.md §18.1`.
 
-### 15.3 ReasoningResult Quality Checklist
+### 16.3 ReasoningResult Quality Checklist
 
 Before the `ReasoningResult` is returned to the Master Orchestrator, the Reasoning Orchestrator performs a self-consistency check:
 
@@ -1197,11 +1234,11 @@ Before the `ReasoningResult` is returned to the Master Orchestrator, the Reasoni
 
 ---
 
-## 16. Cross-Document Consistency Notes
+## 17. Cross-Document Consistency Notes
 
 The following notes document how this specification relates to and supersedes references in other specification documents.
 
-### 16.1 Relationship to 01_SYSTEM_ARCHITECTURE.md
+### 17.1 Relationship to 01_SYSTEM_ARCHITECTURE.md
 
 Section 3.8 of `01_SYSTEM_ARCHITECTURE.md` describes the Reasoning Layer as containing "Support Calculation Engine, Mechanistic Pathway Tracer, Risk / Falsification Engine." This document expands and supersedes that description. The mapping is:
 
@@ -1217,7 +1254,7 @@ Section 3.8 of `01_SYSTEM_ARCHITECTURE.md` describes the Reasoning Layer as cont
 
 The system-level architecture diagram in `01_SYSTEM_ARCHITECTURE.md` remains accurate at the component label level. This document specifies the internal multi-agent structure of those components.
 
-### 16.2 Relationship to 02_DOMAIN_MODEL.md
+### 17.2 Relationship to 02_DOMAIN_MODEL.md
 
 The following entity ownership mappings apply under the multi-agent architecture:
 
@@ -1234,23 +1271,23 @@ The `Hypothesis.lifecycle` state `"Reasoned"` (02_DOMAIN_MODEL §4.2) correspond
 
 ---
 
-## 17. Future Reasoning Roadmap
+## 18. Future Reasoning Roadmap
 
 The Reasoning Subsystem is designed to support increasingly sophisticated reasoning paradigms without requiring structural changes to its core pipeline. The Claim Graph and the multi-agent architecture both serve as extensibility points for future capabilities.
 
-### 17.1 Near-Term
+### 18.1 Near-Term
 
 *   **Bayesian Evidence Integration**: Replace the deterministic ERW summation in Phase 3 with a Bayesian update mechanism. Each new Claim updates a prior probability over the hypothesis, producing a posterior with explicit confidence intervals. The Consensus Engine would integrate posterior distributions rather than discrete level enums.
 *   **Temporal Evidence Weighting**: Introduce time-decay into ERW computation, so that older evidence is weighted less than recent evidence for hypotheses where biological understanding is evolving rapidly.
 *   **Adversarial Claim Testing**: Add an Adversarial Agent to Phase 4 whose sole responsibility is to construct the strongest possible case against the hypothesis. The Consensus Engine evaluates both the primary reasoning outputs and the adversarial critique before producing its assessment.
 
-### 17.2 Medium-Term
+### 18.2 Medium-Term
 
 *   **Causal Inference**: Move beyond directional correlation to formal causal inference using causal graphical models (DAGs with do-calculus) to distinguish observed associations from causal effects.
 *   **Multi-Hop Reasoning**: Enable the Mechanistic Expert Agent to follow reasoning chains longer than the canonical five-step form, allowing identification of indirect drug repurposing opportunities.
 *   **Knowledge Graph Reasoning**: Integrate a locally deployed Neo4j instance. The Claim Graph is persisted into Neo4j. The Mechanistic Expert Agent uses Cypher path queries rather than in-memory graph traversal, enabling sub-second mechanistic chain construction over millions of nodes.
 
-### 17.3 Long-Term
+### 18.3 Long-Term
 
 *   **Personalized Genomic Reasoning**: Incorporate patient genomic variant data (ClinVar, GTEx) as Claim modifiers. The Mechanistic Expert Agent adjusts the mechanistic chain based on whether the patient carries variants in the target gene.
 *   **Continuous Calibration**: Develop a feedback loop in which recommendations that subsequently receive external validation (new clinical trial results, regulatory decisions) are used to recalibrate ERW values and Rule Engine thresholds over time.

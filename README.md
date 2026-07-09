@@ -1,16 +1,16 @@
-# 🧬 Cynthera - Agentic AI for Drug Repurposing
+# 🧬 CYNTHERA - Agentic AI for Drug Repurposing
 
 **Mechanism-grounded drug repurposing through multi-agent AI reasoning**
 
 > [!NOTE]
 > For the comprehensive, research-grade architectural blueprint and engineering design guidelines, see the [Foundational Engineering Specification](file:///c:/Users/User/Desktop/cynthera/SPECIFICATION.md).
 
-Cynthera is an agentic AI system that evaluates drug-disease pairs through mechanism-driven reasoning, cross-verification, and uncertainty modeling. Unlike similarity-based approaches, it prioritizes biological plausibility and produces explainable outputs with uncertainty as a first-class citizen.
+CYNTHERA is an agentic AI system that evaluates drug-disease pairs through mechanism-driven reasoning, cross-verification, and uncertainty modeling. Unlike similarity-based approaches, it prioritizes biological plausibility and produces explainable outputs with uncertainty as a first-class citizen.
 
 ## ✨ Features
 
 - **Mechanism-First Reasoning**: Prioritizes biological plausibility over similarity matching
-- **Multi-Agent Architecture**: 4 specialized agents working in coordination
+- **Multi-Agent Architecture**: Specialized agents across engineering and reasoning layers working in coordination
 - **Uncertainty Quantification**: Treats conflicts and uncertainty as first-class outputs
 - **Explainable Results**: Full citation tracking and provenance for all claims
 - **100% Free Resources**: Uses only free/open-source databases and tools
@@ -19,13 +19,41 @@ Cynthera is an agentic AI system that evaluates drug-disease pairs through mecha
 
 ## 🏗️ Architecture
 
-### MVP Agents (Phase 1)
+CYNTHERA follows a **hybrid architecture** with a deterministic engineering layer and an agentic reasoning layer separated by a sealed `RetrievalPackage` boundary.
 
-1. **MoA Enumeration Agent**: Identifies drug targets and mechanisms from PubChem, ChEMBL, Reactome
-2. **MoA Cross-Verification Agent**: Validates targets, scores strengths, and detects conflicts
-3. **Disease Relevance Agent**: Evaluates mechanism-disease alignment using gene-disease associations
-4. **Synthesis Agent**: Generates comprehensive hypothesis reports with confidence scores
-5. **Master Orchestrator**: Coordinates all agents and manages workflow
+### Engineering Layer (Deterministic)
+
+Orchestrates data acquisition, identifier resolution, and retrieval from external biomedical APIs. All operations are deterministic with no LLM involvement.
+
+- **Master Orchestrator**: Coordinates the full pipeline lifecycle
+- **Identifier Resolution Service**: Maps drug/disease names to standardized database keys (ChEMBL, PubChem, MeSH, UMLS)
+- **Retrieval Planner & Query Optimizer**: Plans and optimizes API call schedules
+- **Retrieval Pipeline**: Executes async parallel queries to external data sources
+- **Canonical Mapping Registry**: Normalizes raw API payloads into canonical domain objects
+- **Quality Gate**: Validates and seals the `RetrievalPackage` before passing to reasoning
+
+### Reasoning Layer (Agentic + Deterministic)
+
+Transforms structured evidence into reproducible scientific conclusions. LLMs are used strictly for claim extraction; all scoring and decision-making is deterministic.
+
+- **Claim Extraction Agent** (LLM-assisted): Extracts structured (subject, predicate, object) triplets from literature
+- **Claim Validation Agent** (deterministic): Validates and assigns Evidence Reliability Weights to claims
+- **Claim Graph**: Sealed immutable graph of validated claims — the central reasoning artifact
+
+Six parallel Expert Agents evaluate the hypothesis independently:
+
+1. **Mechanistic Expert Agent**: Constructs and validates biological pathway chains from drug to disease
+2. **Disease Biology Expert Agent**: Evaluates drug mechanism relevance to disease pathophysiology
+3. **Clinical Evidence Expert Agent**: Assesses human clinical trial evidence
+4. **Support Assessment Agent**: Aggregates evidence favoring the hypothesis
+5. **Risk Assessment Agent**: Evaluates harm, inefficacy, and contraindication signals
+6. **Contradiction Analysis Agent**: Detects and scores conflicting claims
+
+Synthesis and decision-making:
+
+- **Consensus Engine**: Integrates all six assessments into a unified consensus
+- **Rule Engine**: Applies deterministic, versioned rules to produce a `RecommendationStatus`
+- **Scientific Audit Agent**: Generates the fully traceable audit report
 
 ### Data Sources (All Free)
 
@@ -64,83 +92,90 @@ copy .env.example .env
 ### Running the Web Interface
 
 ```bash
-streamlit run ui/streamlit_app.py
+streamlit run frontend/app.py
 ```
 
-Then open your browser to `http://localhost:8501`
+Then open your browser to `http://localhost:8502`
 
 ### Using the CLI
 
 ```bash
-python main.py --drug "Metformin" --disease "Alzheimer's disease"
+python main.py --drug "Sildenafil" --disease "Pulmonary Arterial Hypertension" --policy STANDARD
 ```
 
 With JSON output:
 ```bash
-python main.py --drug "Sildenafil" --disease "Pulmonary Hypertension" --output report.json
+python main.py --drug "Sildenafil" --disease "Pulmonary Arterial Hypertension" --output report.json
 ```
 
 ## 📖 Usage Examples
 
-### Example 1: Known Repurposing (Sildenafil → Pulmonary Hypertension)
+### Example: Async Programmatic Execution
 
 ```python
-from models.data_models import DrugInput, DiseaseInput
-from orchestrator.orchestrator import MasterOrchestrator
+import asyncio
+from backend.engineering.orchestrator.master_orchestrator import MasterOrchestrator
+from backend.core.enums.retrieval_policy import RetrievalPolicy
 
-drug = DrugInput(name="Sildenafil")
-disease = DiseaseInput(name="Pulmonary Hypertension")
+async def run_evaluation():
+    orchestrator = MasterOrchestrator()
+    hypothesis, package, result = await orchestrator.evaluate(
+        drug_name="Sildenafil",
+        disease_name="Pulmonary Arterial Hypertension",
+        policy=RetrievalPolicy.STANDARD
+    )
+    
+    print(f"Recommendation: {result.recommendation_status.value}")
+    print(f"Support Score: {result.support_assessment.score:.3f}")
+    print(f"Mechanistic Score: {result.mechanistic_assessment.score:.3f}")
+    print(f"Risk Score: {result.risk_assessment.score:.3f}")
 
-orchestrator = MasterOrchestrator()
-report = orchestrator.process(drug, disease)
-
-print(f"Recommendation: {report.recommendation}")
-print(f"Confidence: {report.overall_confidence.value:.2f}")
+asyncio.run(run_evaluation())
 ```
 
-### Example 2: Controversial Case (Metformin → Alzheimer's)
-
-```python
-drug = DrugInput(name="Metformin", pubchem_cid=4091)
-disease = DiseaseInput(name="Alzheimer's disease")
-
-orchestrator = MasterOrchestrator()
-report = orchestrator.process(drug, disease)
-
-# Access detailed results
-for chain in report.moa_chains:
-    print(f"Mechanism: {chain.mechanism_description}")
-    print(f"Confidence: {chain.confidence.value:.2f}")
-
-for uncertainty in report.uncertainties:
-    print(f"Uncertainty: {uncertainty}")
-```
+> [!NOTE]
+> The Python API examples above use direct library calls for development and testing. Production deployments route through the FastAPI HTTP layer as documented in the [API Contracts specification](07_API_CONTRACTS.md).
 
 ## 📁 Project Structure
 
 ```
 cynthera/
-├── agents/                 # Individual agent implementations
-│   ├── moa_enumeration_agent.py
-│   ├── moa_cross_verification_agent.py
-│   ├── disease_relevance_agent.py
-│   └── synthesis_agent.py
-├── orchestrator/          # Master orchestrator
-│   └── orchestrator.py
-├── data/                  # Data access layer
-│   ├── database_connectors.py
-│   └── cache_manager.py
-├── models/                # Data models and schemas
-│   └── data_models.py
-├── utils/                 # Shared utilities
-│   ├── logger.py
-│   └── confidence_scoring.py
-├── ui/                    # User interface
-│   └── streamlit_app.py
-├── config/                # Configuration
-│   └── config.yaml
-├── main.py               # CLI entry point
-└── requirements.txt      # Dependencies
+├── backend/                 # Server-side application code
+│   ├── api/                 # FastAPI application layer
+│   │   ├── v1/routes/       # API route handlers (evaluate, hypotheses, system)
+│   │   ├── dependencies.py  # Dependency injection providers
+│   │   └── middleware.py    # Auth, rate limiting, trace injection
+│   │   └── main.py          # FastAPI app factory
+│   ├── core/                # Domain layer (no external dependencies)
+│   │   ├── domain/          #   Canonical entities (Drug, Disease, Claim, etc.)
+│   │   ├── enums/           #   Controlled vocabularies (PredicateType, EvidenceType, etc.)
+│   │   └── value_objects/   #   Immutable value types (ERW, Provenance, Identifiers)
+│   ├── engineering/         # Deterministic retrieval infrastructure
+│   │   ├── orchestrator/    #   Master Orchestrator
+│   │   ├── identity/        #   Identifier Resolution Service
+│   │   ├── retrieval/       #   Planner, Optimizer, Pipeline, Connectors, Parsers
+│   │   └── quality_gate/    #   Quality Gate
+│   ├── reasoning/           # Agentic + deterministic reasoning
+│   │   ├── extraction/      #   Claim Extraction Agent (LLM-assisted)
+│   │   ├── validation/      #   Claim Validation Agent (deterministic)
+│   │   ├── graph/           #   Claim Graph construction + sealing
+│   │   ├── agents/          #   6 Expert Agents (Mechanistic, Disease, Clinical, etc.)
+│   │   ├── consensus/       #   Consensus Engine + Uncertainty Model
+│   │   ├── rules/           #   Rule Engine + versioned rule sets
+│   │   └── audit/           #   Scientific Audit Agent
+│   ├── infrastructure/      # Cross-cutting services (LLM, cache, config, logging, metrics)
+│   ├── database/            # SQLAlchemy models, repositories, Alembic migrations
+│   └── schemas/             # Pydantic request/response models
+├── frontend/               # Streamlit MVP frontend
+│   ├── app.py
+│   ├── pages/              #   evaluate, results, audit, history
+│   └── components/         #   score_cards, chain_viz, contradiction_table
+├── tests/                  # Unit, integration, and scientific validation tests
+├── config/                 # Configuration files (settings, sources, rules)
+├── docker/                 # Dockerfiles + docker-compose
+├── scripts/                # Operational scripts
+├── pyproject.toml          # Poetry project definition
+└── .env.example            # Environment variable template
 ```
 
 ## 🔧 Configuration
@@ -174,19 +209,20 @@ Cynthera generates comprehensive `HypothesisReport` objects containing:
 
 ## 🛣️ Roadmap
 
-### Phase 1: MVP (Current)
-- ✅ Core 4 agents
-- ✅ Free data source integration
+### Phase 1: Foundation (Current)
+- ✅ Deterministic engineering layer (retrieval, normalization, quality gate)
+- ✅ Agentic reasoning layer (claim extraction, 6 expert agents, consensus, rules)
+- ✅ Free data source integration (ChEMBL, UniProt, PubMed, Reactome, ClinicalTrials, DisGeNET)
 - ✅ Streamlit UI
-- ✅ Basic confidence scoring
+- ✅ Structured confidence scoring with ERW hierarchy
 
 ### Phase 2: Enhanced Capabilities
-- [x] MoA Cross-Verification Agent
-- [ ] Clinical & Safety Agent
-- [ ] Literature Scan Agent
+- [ ] Clinical & Safety Agent enhancements
+- [ ] Literature Scan expansions
 - [ ] Prior Knowledge Agent (vector DB)
-- [ ] LLM integration for reasoning
+- [ ] Multi-hop mechanistic reasoning
 - [ ] Advanced conflict resolution
+- [ ] Batch evaluation API
 
 ### Phase 3: Production Features
 - [ ] Comprehensive test suite
