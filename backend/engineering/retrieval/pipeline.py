@@ -27,6 +27,7 @@ from backend.engineering.retrieval.connectors.uniprot import UniProtConnector
 from backend.engineering.retrieval.connectors.pubmed import PubMedConnector
 from backend.engineering.retrieval.connectors.reactome import ReactomeConnector
 from backend.engineering.retrieval.connectors.clinicaltrials import ClinicalTrialsConnector
+from backend.engineering.retrieval.connectors.disgenet import DisGeNETConnector
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,11 @@ class RetrievalPipeline:
             self._fetch_pubmed(drug.name, disease.name),
             self._fetch_reactome(uniprot_ids),
             self._fetch_clinicaltrials(drug.name, disease.name),
+            self._fetch_disgenet(disease.name),
             return_exceptions=True,
         )
 
-        uniprot_data, pubmed_data, reactome_data, trials_data = results
+        uniprot_data, pubmed_data, reactome_data, trials_data, disgenet_data = results
 
         # Process UniProt proteins
         if isinstance(uniprot_data, Exception):
@@ -144,6 +146,14 @@ class RetrievalPipeline:
         else:
             sources_queried.append("clinicaltrials")
             clinical_trials = self._parse_trials_data(trials_data, drug, disease)
+
+        # Process DisGeNET disease-gene associations (graceful degradation — requires API key)
+        if isinstance(disgenet_data, Exception):
+            logger.debug("disgenet_failed", extra={"error": str(disgenet_data)})
+        elif disgenet_data:
+            sources_queried.append("disgenet")
+            disgenet_evidence = self._parse_disgenet_data(disgenet_data, drug, disease)
+            evidence_records.extend(disgenet_evidence)
 
         # Determine retrieval confidence
         confidence = self._compute_confidence(
@@ -242,6 +252,22 @@ class RetrievalPipeline:
     async def _fetch_clinicaltrials(self, drug_name: str, disease_name: str) -> dict[str, Any]:
         async with ClinicalTrialsConnector() as conn:
             return await conn.fetch(drug_name, disease_name)
+
+    async def _fetch_disgenet(self, disease_name: str) -> dict[str, Any]:
+        """Fetch disease-gene associations from DisGeNET.
+
+        DisGeNET requires an API key for full access. Without one the connector
+        returns an empty payload rather than raising, so this method degrades
+        gracefully when the key is absent.
+        """
+        try:
+            async with DisGeNETConnector(api_key=self._disgenet_api_key) as conn:
+                # Use the disease name as the query identifier (may return empty if unauthenticated)
+                result = await conn.fetch(disease_id=disease_name.lower().replace(" ", "+"))
+                return result
+        except Exception as exc:
+            logger.debug("disgenet_fetch_failed", extra={"error": str(exc)})
+            return {}
 
     def _parse_chembl_data(
         self,
@@ -475,6 +501,62 @@ class RetrievalPipeline:
                 logger.debug("trial_parse_error", extra={"error": str(exc)})
                 continue
         return trials
+
+    def _parse_disgenet_data(
+        self,
+        data: dict[str, Any],
+        drug: Drug,
+        disease: Disease,
+    ) -> list[Evidence]:
+        """Parse DisGeNET gene-disease association data into Evidence objects.
+
+        Args:
+            data: Raw DisGeNET response (list of associations or dict with list).
+            drug: Drug entity (for provenance context).
+            disease: Disease entity.
+
+        Returns:
+            List of Evidence records derived from DisGeNET associations.
+        """
+        evidence: list[Evidence] = []
+        # DisGeNET response may be a list or a dict with a 'payload' key
+        associations: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            associations = data
+        elif isinstance(data, dict):
+            associations = data.get("payload", data.get("results", []))
+
+        for assoc in associations[:20]:  # cap at 20
+            try:
+                gene_symbol = assoc.get("gene_symbol") or assoc.get("geneName", "UNKNOWN")
+                score = float(assoc.get("score", 0.0))
+                if score <= 0:
+                    continue
+
+                erw = ERW.from_base(base_weight=EvidenceType.OBSERVATIONAL.base_erw)
+                prov = ProvenanceReference(
+                    source_name="DisGeNET",
+                    source_version="2024",
+                    record_id=f"disgenet_{gene_symbol}",
+                    url=f"https://www.disgenet.org/browser/0/1/0/{gene_symbol}/",
+                )
+                ev = Evidence(
+                    evidence_type=EvidenceType.OBSERVATIONAL,
+                    erw=erw,
+                    citation_key=f"DisGeNET:{gene_symbol}:{disease.name}",
+                    title=f"DisGeNET association: {gene_symbol} — {disease.name}",
+                    abstract=(
+                        f"Gene {gene_symbol} is associated with {disease.name} "
+                        f"with DisGeNET score {score:.3f}."
+                    ),
+                    provenance=prov,
+                    disease_identifier=disease.mesh_id,
+                )
+                evidence.append(ev)
+            except Exception as exc:
+                logger.debug("disgenet_parse_error", extra={"error": str(exc)})
+                continue
+        return evidence
 
     def _compute_confidence(
         self,

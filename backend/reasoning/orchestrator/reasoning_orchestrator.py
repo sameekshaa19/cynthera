@@ -203,6 +203,10 @@ class ReasoningOrchestrator:
     def _detect_contradictions(self, claims: list[Claim]) -> list[Contradiction]:
         """Detect directional conflicts between claims.
 
+        Builds a (subject, object) -> {predicate -> (claim_id, erw)} index.
+        Conflict pairs are checked for ACTIVATES/INHIBITS, UPREGULATES/DOWNREGULATES,
+        CAUSES/PREVENTS. When a conflict is found, both claim IDs are recorded.
+
         Args:
             claims: All extracted claims.
 
@@ -210,37 +214,55 @@ class ReasoningOrchestrator:
             List of Contradiction objects.
         """
         contradictions: list[Contradiction] = []
-        opposing: dict[str, dict[str, PredicateType]] = {}
+        # Index: (subject, object) -> {predicate_str -> (claim_id, erw_value)}
+        index: dict[str, dict[str, tuple]] = {}
+
+        conflict_pairs = [
+            (PredicateType.ACTIVATES, PredicateType.INHIBITS),
+            (PredicateType.UPREGULATES, PredicateType.DOWNREGULATES),
+            (PredicateType.CAUSES, PredicateType.PREVENTS),
+        ]
 
         for claim in claims:
-            key = f"{claim.subject}::{claim.object}"
-            if key not in opposing:
-                opposing[key] = {}
-            if str(claim.predicate) in opposing[key]:
-                # Check for directional conflict
-                existing = opposing[key][str(claim.predicate)]
-                conflict_pairs = {
-                    (PredicateType.ACTIVATES, PredicateType.INHIBITS),
-                    (PredicateType.UPREGULATES, PredicateType.DOWNREGULATES),
-                    (PredicateType.CAUSES, PredicateType.PREVENTS),
-                }
-                for a, b in conflict_pairs:
-                    if (claim.predicate == a and existing == b) or \
-                       (claim.predicate == b and existing == a):
-                        contradiction = Contradiction(
-                            claim_id_a=claim.id,
-                            claim_id_b=claim.id,  # simplified
-                            conflict_type="directional",
-                            contradiction_score=round(claim.erw.value * 0.8, 4),
-                            shared_subject=claim.subject,
-                            explanation=(
-                                f"Directional conflict: claim states '{claim.subject} "
-                                f"{claim.predicate.value} {claim.object}' but "
-                                f"another claim states the opposite."
-                            ),
-                        )
-                        contradictions.append(contradiction)
-            opposing[key][str(claim.predicate)] = claim.predicate
+            key = f"{claim.subject.lower()}::{claim.object.lower()}"
+            if key not in index:
+                index[key] = {}
+
+            current_pred = claim.predicate
+            current_pred_str = current_pred.value
+
+            # Check if any opposing predicate already exists for this key
+            for pred_a, pred_b in conflict_pairs:
+                # Determine which is the opposing predicate
+                if current_pred == pred_a:
+                    opposing_pred = pred_b
+                elif current_pred == pred_b:
+                    opposing_pred = pred_a
+                else:
+                    continue
+
+                opposing_pred_str = opposing_pred.value
+                if opposing_pred_str in index[key]:
+                    opposing_claim_id, opposing_erw = index[key][opposing_pred_str]
+                    # Average the ERW scores for contradiction strength
+                    contradiction_score = round((claim.erw.value + opposing_erw) / 2 * 0.8, 4)
+                    contradiction = Contradiction(
+                        claim_id_a=uuid.UUID(opposing_claim_id),
+                        claim_id_b=claim.id,
+                        conflict_type="directional",
+                        contradiction_score=contradiction_score,
+                        shared_subject=claim.subject,
+                        explanation=(
+                            f"Directional conflict on '{claim.subject} → {claim.object}': "
+                            f"one claim states '{pred_a.value}' but another states '{pred_b.value}'."
+                        ),
+                    )
+                    contradictions.append(contradiction)
+                    break
+
+            # Register this claim in the index
+            index[key][current_pred_str] = (str(claim.id), claim.erw.value)
+
         return contradictions
 
     async def _compute_support_score(
@@ -331,10 +353,19 @@ class ReasoningOrchestrator:
         pathway_score = min(1.0, pathway_count / 3) * 0.4
         score = round(target_score + pathway_score, 4)
 
-        chain = [package.drug.name]
-        chain.extend(t.protein_uniprot for t in package.targets[:3])
-        chain.extend(p.reactome_id for p in package.pathways[:2])
-        chain.append(package.disease.name)
+        # Build mechanistic chain with node-type labels for biological clarity
+        chain: list[str] = [f"Drug: {package.drug.name}"]
+        for t in package.targets[:3]:
+            # Prefer gene symbol from proteins if matched, else use UniProt ID
+            protein_label = t.protein_uniprot
+            for p in package.proteins:
+                if p.uniprot_accession == t.protein_uniprot:
+                    protein_label = f"{p.gene_symbol} ({p.uniprot_accession})"
+                    break
+            chain.append(f"Target: {protein_label}")
+        for pw in package.pathways[:2]:
+            chain.append(f"Pathway: {pw.name} ({pw.reactome_id})")
+        chain.append(f"Disease: {package.disease.name}")
 
         level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
 

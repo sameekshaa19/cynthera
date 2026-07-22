@@ -111,6 +111,56 @@ class ClaimGraph(BaseModel):
         """
         return self.claims.get(str(claim_id))
 
+    def get_claims_by_subject(self, subject: str) -> list[Claim]:
+        """Return all claims where the subject matches (case-insensitive).
+
+        Args:
+            subject: Subject string to filter on.
+
+        Returns:
+            List of Claim objects with matching subject.
+        """
+        subject_lower = subject.lower()
+        return [
+            c for c in self.claims.values()
+            if c.subject.lower() == subject_lower
+        ]
+
+    def find_conflicts(self) -> list[tuple[Claim, Claim, str]]:
+        """Find all directional claim conflicts within the graph.
+
+        Scans all (subject, object) pairs for opposing predicates.
+
+        Returns:
+            List of (claim_a, claim_b, conflict_type) tuples.
+        """
+        from backend.core.enums.predicate_type import PredicateType
+
+        conflict_pairs = [
+            (PredicateType.ACTIVATES, PredicateType.INHIBITS),
+            (PredicateType.UPREGULATES, PredicateType.DOWNREGULATES),
+            (PredicateType.CAUSES, PredicateType.PREVENTS),
+        ]
+
+        # Index: (subject_lower, object_lower) -> {predicate -> Claim}
+        index: dict[tuple[str, str], dict[str, Claim]] = {}
+        for claim in self.claims.values():
+            key = (claim.subject.lower(), claim.object.lower())
+            if key not in index:
+                index[key] = {}
+            index[key][claim.predicate.value] = claim
+
+        conflicts: list[tuple[Claim, Claim, str]] = []
+        for key, pred_map in index.items():
+            for pred_a, pred_b in conflict_pairs:
+                if pred_a.value in pred_map and pred_b.value in pred_map:
+                    conflicts.append((
+                        pred_map[pred_a.value],
+                        pred_map[pred_b.value],
+                        "directional",
+                    ))
+        return conflicts
+
     @property
     def node_count(self) -> int:
         """Total number of Claim nodes in the graph."""

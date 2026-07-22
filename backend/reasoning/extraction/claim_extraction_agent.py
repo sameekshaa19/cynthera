@@ -89,7 +89,7 @@ class ClaimExtractionAgent:
             return []
 
         text = evidence.abstract
-        raw_claims = await self._call_llm(text)
+        raw_claims = await self._call_llm(text, drug_name, disease_name)
 
         claims: list[Claim] = []
         for raw in raw_claims:
@@ -111,18 +111,20 @@ class ClaimExtractionAgent:
         )
         return claims
 
-    async def _call_llm(self, text: str) -> list[dict[str, Any]]:
+    async def _call_llm(self, text: str, drug_name: str = "drug", disease_name: str = "disease") -> list[dict[str, Any]]:
         """Call the LLM API and parse the response.
 
         Args:
             text: Abstract text to extract claims from.
+            drug_name: Drug name for context-aware extraction.
+            disease_name: Disease name for context-aware extraction.
 
         Returns:
             List of raw claim dicts from LLM output.
         """
         if not self._api_key:
             logger.warning("llm_api_key_not_set", extra={"model": self._model})
-            return self._rule_based_fallback(text)
+            return self._rule_based_fallback(text, drug_name, disease_name)
 
         prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])  # cap at 3000 chars
 
@@ -137,10 +139,10 @@ class ClaimExtractionAgent:
             return self._parse_llm_response(response.text)
         except ImportError:
             logger.warning("google_genai_not_installed", extra={"fallback": "rule_based"})
-            return self._rule_based_fallback(text)
+            return self._rule_based_fallback(text, drug_name, disease_name)
         except Exception as exc:
             logger.error("llm_call_failed", extra={"error": str(exc)})
-            return self._rule_based_fallback(text)
+            return self._rule_based_fallback(text, drug_name, disease_name)
 
     def _parse_llm_response(self, response_text: str) -> list[dict[str, Any]]:
         """Parse and validate LLM JSON response.
@@ -174,19 +176,28 @@ class ClaimExtractionAgent:
                 context={"response_snippet": text[:200]},
             ) from exc
 
-    def _rule_based_fallback(self, text: str) -> list[dict[str, Any]]:
-        """Simple rule-based fallback when LLM is unavailable.
+    def _rule_based_fallback(self, text: str, drug_name: str = "drug", disease_name: str = "disease") -> list[dict[str, Any]]:
+        """Context-aware rule-based fallback when LLM is unavailable.
 
-        Detects basic activation/inhibition patterns in text.
+        Uses drug and disease names from context to produce meaningful claims
+        rather than generic placeholders.
 
         Args:
             text: Abstract text to scan.
+            drug_name: Drug name for subject/object labeling.
+            disease_name: Disease name for object labeling.
 
         Returns:
             List of raw claim dicts detected by pattern matching.
         """
         claims = []
         text_lower = text.lower()
+        drug_lower = drug_name.lower()
+        disease_lower = disease_name.lower()
+
+        # Determine the primary object: disease name if mentioned, else generic "target"
+        primary_object = disease_name if disease_lower in text_lower else "molecular target"
+
         patterns = [
             ("inhibit", "INHIBITS"),
             ("activat", "ACTIVATES"),
@@ -194,14 +205,18 @@ class ClaimExtractionAgent:
             ("downregulat", "DOWNREGULATES"),
             ("prevent", "PREVENTS"),
             ("associat", "ASSOCIATED_WITH"),
+            ("bind", "BINDS"),
+            ("caus", "CAUSES"),
         ]
         for pattern, predicate in patterns:
             if pattern in text_lower:
+                # Use drug name as subject if found in text, else fallback to "compound"
+                subject = drug_name if drug_lower in text_lower else "compound"
                 claims.append({
-                    "subject": "drug",
+                    "subject": subject,
                     "predicate": predicate,
-                    "object": "target",
-                    "confidence": 0.3,
+                    "object": primary_object,
+                    "confidence": 0.25,  # Low confidence for rule-based extraction
                 })
                 break
         return claims

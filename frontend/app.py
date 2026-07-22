@@ -634,14 +634,32 @@ elif page == "📋 Audit Report":
 # ─────────────────────────────────────────────
 elif page == "🕐 History":
     st.markdown("## Evaluation History")
-    if not st.session_state.history:
+    st.markdown("Past evaluations are loaded from the persistent SQLite database.")
+
+    import pandas as pd
+    from backend.storage.repository import StorageRepository
+
+    _repo = StorageRepository(db_path="data/cynthera.db")
+    evaluations = _repo.list_evaluations(limit=100)
+
+    if not evaluations:
         st.info("No evaluations yet. Go to **🔬 Evaluate** to run your first analysis.")
     else:
-        import pandas as pd
-        df = pd.DataFrame(st.session_state.history)
-        df.columns = ["Drug", "Disease", "Recommendation", "SS", "MS", "RS"]
+        rows = []
+        for ev in evaluations:
+            rows.append({
+                "Hypothesis ID": ev.get("hypothesis_id", "")[:12] + "...",
+                "Drug": ev.get("drug_name", ""),
+                "Disease": ev.get("disease_name", ""),
+                "Recommendation": ev.get("recommendation", ""),
+                "Support Score": round(float(ev.get("support_score", 0)), 3),
+                "Mech. Score": round(float(ev.get("mechanistic_score", 0)), 3),
+                "Risk Score": round(float(ev.get("risk_score", 0)), 3),
+                "Retrieval Confidence": ev.get("retrieval_confidence", ""),
+                "Completed At": ev.get("completed_at", ""),
+            })
+        df = pd.DataFrame(rows)
 
-        # Color recommendation column
         def color_rec(val: str) -> str:
             colors = {
                 "PROMISING": "color: #10b981; font-weight: 600",
@@ -653,6 +671,14 @@ elif page == "🕐 History":
         styled = df.style.applymap(color_rec, subset=["Recommendation"])
         st.dataframe(styled, use_container_width=True)
 
-        if st.button("🗑️ Clear History"):
-            st.session_state.history = []
-            st.rerun()
+        st.caption(f"Showing {len(rows)} evaluation(s) from persistent storage.")
+
+        col_dl, _ = st.columns([1, 3])
+        with col_dl:
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "📥 Export CSV",
+                data=csv,
+                file_name="cynthera_history.csv",
+                mime="text/csv",
+            )

@@ -1,0 +1,1 @@
+"""CYNTHERA FastAPI Application Layer."""

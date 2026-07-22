@@ -24,6 +24,7 @@ from backend.core.exceptions import (
 from backend.engineering.identity.resolution_service import IdentifierResolutionService
 from backend.engineering.retrieval.pipeline import RetrievalPipeline
 from backend.reasoning.orchestrator.reasoning_orchestrator import ReasoningOrchestrator
+from backend.storage.repository import StorageRepository
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class MasterOrchestrator:
         ncbi_api_key: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str = "gemini-1.5-flash",
+        db_path: str = "data/cynthera.db",
     ) -> None:
         """Initialize the MasterOrchestrator with all subsystem components.
 
@@ -61,6 +63,7 @@ class MasterOrchestrator:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
             llm_api_key: LLM API key for claim extraction.
             llm_model: LLM model name (default 'gemini-1.5-flash').
+            db_path: Path to SQLite database file for persisting evaluations.
         """
         self._resolver = IdentifierResolutionService(ncbi_api_key=ncbi_api_key)
         self._retrieval = RetrievalPipeline(ncbi_api_key=ncbi_api_key)
@@ -68,6 +71,7 @@ class MasterOrchestrator:
             llm_api_key=llm_api_key,
             llm_model=llm_model,
         )
+        self._storage = StorageRepository(db_path=db_path)
 
     async def evaluate(
         self,
@@ -124,11 +128,14 @@ class MasterOrchestrator:
             disease = Disease(name=disease_name, identifiers=disease_ids)
 
             hypothesis.transition_to(HypothesisLifecycleState.ID_RESOLVED)
+            self._storage.save_hypothesis(hypothesis)
 
             # Step 3: Parallel Data Retrieval
             logger.info("step_retrieval", extra={"trace_id": str(trace_id)})
             package = await self._retrieval.execute(drug, disease, hypothesis.id)
             hypothesis.transition_to(HypothesisLifecycleState.DATA_RETRIEVED)
+            self._storage.save_hypothesis(hypothesis)
+            self._storage.save_retrieval_package(package)
 
             # Step 4–5: Normalization is embedded in the retrieval pipeline
             hypothesis.transition_to(HypothesisLifecycleState.NORMALIZED)
@@ -137,8 +144,10 @@ class MasterOrchestrator:
             logger.info("step_reasoning", extra={"trace_id": str(trace_id)})
             result = await self._reasoning.reason(package)
             hypothesis.transition_to(HypothesisLifecycleState.EVALUATED)
+            self._storage.save_reasoning_result(result)
 
             hypothesis.transition_to(HypothesisLifecycleState.COMPLETED)
+            self._storage.save_hypothesis(hypothesis)
 
             logger.info(
                 "evaluation_complete",
