@@ -16,6 +16,7 @@ from backend.core.domain.gene import Gene
 from backend.core.domain.pathway import Pathway
 from backend.core.domain.evidence import Evidence
 from backend.core.domain.clinical_trial import ClinicalTrial
+from backend.core.domain.approval_signal import ApprovalSignal
 
 
 class RetrievalPackage(BaseModel):
@@ -61,6 +62,22 @@ class RetrievalPackage(BaseModel):
     sources_queried: list[str] = Field(default_factory=list, description="Successfully queried sources.")
     sources_failed: list[str] = Field(default_factory=list, description="Failed data sources.")
     sealed_at: datetime = Field(default_factory=datetime.utcnow, description="UTC sealing timestamp.")
+    approval_signal: ApprovalSignal | None = Field(
+        default=None,
+        description=(
+            "Retrieved approval signal from ChEMBL indication data. "
+            "None if ChEMBL indication retrieval failed or returned no results. "
+            "Never hardcoded — always produced from live API data."
+        ),
+    )
+    clinical_trial_retrieval_status: str = Field(
+        default="NOT_ATTEMPTED",
+        description=(
+            "Clinical trial data retrieval outcome: "
+            "RETRIEVED (trials found), NOT_FOUND (query ok, 0 results), "
+            "API_FAILURE (endpoint error), NOT_ATTEMPTED."
+        ),
+    )
 
     @property
     def literature_evidence(self) -> list[Evidence]:

@@ -6,6 +6,13 @@ Phase 2 Enhanced version integrating:
 - MultiHopReasoner (replaces simple mechanistic scoring)
 - AdvancedConflictResolver (replaces simple contradiction detection)
 
+Phase 3 Fix:
+- Mechanistic score capped at MEDIUM when pathway_count == 0 (Issue #2)
+- Support score broken down by evidence type (Issue #6, #3)
+- Human-readable target names in chain — gene symbol + protein name (Issue #3)
+- Confidence narrative uses plain English, not raw numbers (Issue #9)
+- Audit report includes agent verdicts, next steps, citations (Issues #12, #15, #17)
+
 Reference: 04_REASONING_SPECIFICATION.md, 08_IMPLEMENTATION_GUIDE.md §5.6
 """
 from __future__ import annotations
@@ -15,6 +22,7 @@ import logging
 import math
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -31,6 +39,7 @@ from backend.core.domain.claim_graph import ClaimGraph
 from backend.core.domain.contradiction import Contradiction
 from backend.core.enums.recommendation import RecommendationStatus
 from backend.core.enums.predicate_type import PredicateType
+from backend.core.enums.evidence_type import EvidenceType
 from backend.core.enums.trial_outcome import TrialOutcomeStatus
 from backend.reasoning.extraction.claim_extraction_agent import ClaimExtractionAgent
 from backend.reasoning.agents.clinical_safety_agent import ClinicalSafetyAgent, SafetyProfile
@@ -40,6 +49,61 @@ from backend.reasoning.conflict.conflict_resolver import AdvancedConflictResolve
 from backend.infrastructure.knowledge.knowledge_store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# Evidence type groupings for quality breakdown
+# ─────────────────────────────────────────────
+
+_CLINICAL_TYPES = {EvidenceType.RCT, EvidenceType.META_ANALYSIS}
+_ANIMAL_TYPES = {EvidenceType.IN_VIVO}
+_CELL_TYPES = {EvidenceType.IN_VITRO}
+_REVIEW_TYPES = {EvidenceType.OBSERVATIONAL}
+
+# ERW ceiling per evidence tier (limits inflated scores from low-quality data)
+_ERW_CEILING_BY_TYPE: dict[EvidenceType, float] = {
+    EvidenceType.META_ANALYSIS: 1.00,
+    EvidenceType.RCT: 0.95,
+    EvidenceType.OBSERVATIONAL: 0.75,
+    EvidenceType.IN_VIVO: 0.65,
+    EvidenceType.IN_VITRO: 0.55,
+}
+
+# ─────────────────────────────────────────────
+# Suggested next steps by recommendation status
+# ─────────────────────────────────────────────
+
+_NEXT_STEPS: dict[str, list[str]] = {
+    "PROMISING": [
+        "Design a phase II clinical trial targeting the identified mechanism.",
+        "Validate gene expression reversal in disease-relevant cell lines (GEO datasets).",
+        "Perform molecular docking to confirm target binding affinity.",
+        "Search TCGA/LINCS for transcriptomic evidence of pathway modulation.",
+        "Conduct ADMET profiling to confirm safety for new indication.",
+        "Evaluate pharmacokinetics in animal models relevant to the disease.",
+    ],
+    "UNCERTAIN": [
+        "Expand literature retrieval — search OpenAlex and Semantic Scholar for additional evidence.",
+        "Search GEO datasets for gene expression data in the disease context.",
+        "Validate mechanism against additional Reactome/WikiPathways databases.",
+        "Identify completed observational studies (cohort, registry data).",
+        "Consult DisGeNET for gene-disease association evidence.",
+        "Perform in vitro target validation assays before animal studies.",
+        "Consider LINCS L1000 perturbation data to assess transcriptomic reversal.",
+    ],
+    "NOT_RECOMMENDED": [
+        "Review safety data in detail — consult FDA adverse event database (FAERS).",
+        "Investigate alternative targets in the same pathway.",
+        "Consider drug combination approaches to mitigate risk.",
+        "Search for structural analogs with improved safety profiles.",
+        "Evaluate mechanistic validity for different disease subtypes.",
+    ],
+    "INSUFFICIENT_DATA": [
+        "Expand retrieval policy to COMPREHENSIVE.",
+        "Manually search PubMed for relevant literature.",
+        "Contact authors of related studies for unpublished data.",
+        "Search ClinicalTrials.gov directly for ongoing trials.",
+    ],
+}
 
 
 class ReasoningOrchestrator:
@@ -66,15 +130,8 @@ class ReasoningOrchestrator:
         llm_model: str = "gemini-1.5-flash",
         db_path: str = "data/cynthera.db",
     ) -> None:
-        """Initialize the ReasoningOrchestrator.
-
-        Args:
-            llm_api_key: API key for the LLM provider.
-            llm_model: LLM model name for claim extraction.
-            db_path: Path to SQLite DB for KnowledgeStore.
-        """
+        """Initialize the ReasoningOrchestrator."""
         self._extraction_agent = ClaimExtractionAgent(model=llm_model, api_key=llm_api_key)
-        # Phase 2: Shared KnowledgeStore (seeded on first use)
         self._knowledge_store = KnowledgeStore(db_path=db_path)
         self._prior_knowledge_agent = PriorKnowledgeAgent(
             knowledge_store=self._knowledge_store
@@ -84,14 +141,7 @@ class ReasoningOrchestrator:
         self._conflict_resolver = AdvancedConflictResolver()
 
     async def reason(self, package: RetrievalPackage) -> ReasoningResult:
-        """Execute the full reasoning pipeline over a RetrievalPackage.
-
-        Args:
-            package: The sealed RetrievalPackage from the retrieval subsystem.
-
-        Returns:
-            A fully populated ReasoningResult.
-        """
+        """Execute the full reasoning pipeline over a RetrievalPackage."""
         start_ms = time.time() * 1000
 
         logger.info(
@@ -104,9 +154,12 @@ class ReasoningOrchestrator:
         )
 
         # ── Step 0: Prior Knowledge ──────────────────────────────────────
+        # Pass the live ChEMBL approval_signal so the agent infers from
+        # retrieved data, not from any hardcoded source.
         prior_ctx = self._prior_knowledge_agent.retrieve(
             drug_name=package.drug.name,
             disease_name=package.disease.name,
+            approval_signal=package.approval_signal,
         )
 
         # ── Step 1: Extract claims from literature evidence ──────────────
@@ -149,6 +202,7 @@ class ReasoningOrchestrator:
             contradictions,
             package,
             safety_profile,
+            prior_ctx,
         )
 
         # ── Step 8: Generate scientific audit report ─────────────────────
@@ -164,6 +218,7 @@ class ReasoningOrchestrator:
             safety_profile=safety_profile,
             mechanistic_paths=mechanistic_paths,
             conflict_report=conflict_report,
+            package=package,
         )
 
         duration_ms = (time.time() * 1000) - start_ms
@@ -177,7 +232,7 @@ class ReasoningOrchestrator:
             recommendation_status=recommendation_status,
             recommendation_reasons=reasons,
             audit_report=audit_report,
-            rule_set_version="2.0",  # Phase 2 rule set
+            rule_set_version="2.0",
             reasoning_duration_ms=round(duration_ms, 2),
             completed_at=datetime.utcnow(),
         )
@@ -240,7 +295,7 @@ class ReasoningOrchestrator:
         return graph
 
     # ─────────────────────────────────────────────
-    # Step 6: Three-Dimensional Scoring
+    # Step 6a: Support Score — quality-weighted
     # ─────────────────────────────────────────────
 
     async def _compute_support_score(
@@ -249,7 +304,15 @@ class ReasoningOrchestrator:
         package: RetrievalPackage,
         prior_ctx: PriorKnowledgeContext,
     ) -> SupportAssessment:
-        """Compute the Support Score (SS) with prior knowledge boost."""
+        """Compute the Support Score (SS) with quality-weighted breakdown.
+
+        FIX (Issue #3, #6): Evidence is broken down by type (clinical, animal,
+        cell-line, review) and ERW values are capped per tier. This prevents
+        24 low-quality reviews from inflating SS to 0.911.
+
+        Score formula: SS = 1 - exp(-k * quality_weighted_sum)
+        where quality_weighted_sum = Σ min(erw, erw_ceiling_for_type)
+        """
         supporting_claims = [
             c for c in claims
             if c.predicate in (
@@ -261,7 +324,6 @@ class ReasoningOrchestrator:
         ]
 
         if not supporting_claims and not package.evidence_records:
-            # Apply prior knowledge boost even with no evidence
             if prior_ctx.evidence_boost > 0:
                 score = round(min(0.4, prior_ctx.evidence_boost), 4)
                 return SupportAssessment(
@@ -270,8 +332,8 @@ class ReasoningOrchestrator:
                     evidence_count=0,
                     weighted_sum=0.0,
                     rationale=(
-                        f"No direct evidence found, but prior knowledge provides a boost "
-                        f"of {prior_ctx.evidence_boost:.3f}. {prior_ctx.narrative}"
+                        f"No direct evidence found. Prior knowledge provides a boost of "
+                        f"{prior_ctx.evidence_boost:.3f}. {prior_ctx.narrative}"
                     ),
                 )
             return SupportAssessment(
@@ -282,36 +344,106 @@ class ReasoningOrchestrator:
                 rationale="No supporting evidence or claims found.",
             )
 
-        weighted_sum = sum(c.erw.value for c in supporting_claims)
-        weighted_sum += sum(e.erw.value for e in package.evidence_records)
+        # ── Quality-tier breakdown ────────────────────────────────────
+        type_buckets: dict[str, list[float]] = {
+            "clinical": [],
+            "animal": [],
+            "cell_line": [],
+            "review": [],
+            "claim": [],
+        }
+
+        raw_weighted_sum = 0.0
+        quality_weighted_sum = 0.0
+
+        for ev in package.evidence_records:
+            ceiling = _ERW_CEILING_BY_TYPE.get(ev.evidence_type, 0.60)
+            capped_erw = min(ev.erw.value, ceiling)
+            raw_weighted_sum += ev.erw.value
+            quality_weighted_sum += capped_erw
+
+            if ev.evidence_type in _CLINICAL_TYPES:
+                type_buckets["clinical"].append(capped_erw)
+            elif ev.evidence_type in _ANIMAL_TYPES:
+                type_buckets["animal"].append(capped_erw)
+            elif ev.evidence_type in _CELL_TYPES:
+                type_buckets["cell_line"].append(capped_erw)
+            else:
+                type_buckets["review"].append(capped_erw)
+
+        for c in supporting_claims:
+            capped = min(c.erw.value, 0.80)
+            quality_weighted_sum += capped
+            raw_weighted_sum += c.erw.value
+            type_buckets["claim"].append(capped)
+
         count = len(supporting_claims) + len(package.evidence_records)
 
-        # Normalize using diminishing returns formula: score = 1 - e^(-k * weighted_sum)
-        k = 0.15
-        raw_score = 1.0 - math.exp(-k * weighted_sum)
+        # Diminishing returns formula with quality-weighted sum
+        k = 0.12
+        raw_score = 1.0 - math.exp(-k * quality_weighted_sum)
 
-        # Apply prior knowledge boost
+        # Prior knowledge boost
         raw_score = raw_score + prior_ctx.evidence_boost * (1.0 - raw_score)
         score = round(min(1.0, raw_score), 4)
         level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
 
+        # Build quality breakdown text
+        breakdown_parts = []
+        if type_buckets["clinical"]:
+            avg = sum(type_buckets["clinical"]) / len(type_buckets["clinical"])
+            breakdown_parts.append(
+                f"Clinical/RCT: {len(type_buckets['clinical'])} records (avg ERW: {avg:.2f})"
+            )
+        if type_buckets["animal"]:
+            avg = sum(type_buckets["animal"]) / len(type_buckets["animal"])
+            breakdown_parts.append(
+                f"Animal (in vivo): {len(type_buckets['animal'])} records (avg ERW: {avg:.2f})"
+            )
+        if type_buckets["cell_line"]:
+            avg = sum(type_buckets["cell_line"]) / len(type_buckets["cell_line"])
+            breakdown_parts.append(
+                f"Cell-line (in vitro): {len(type_buckets['cell_line'])} records (avg ERW: {avg:.2f})"
+            )
+        if type_buckets["review"]:
+            avg = sum(type_buckets["review"]) / len(type_buckets["review"])
+            breakdown_parts.append(
+                f"Reviews/Observational: {len(type_buckets['review'])} records (avg ERW: {avg:.2f})"
+            )
+        if type_buckets["claim"]:
+            breakdown_parts.append(
+                f"Extracted claims: {len(type_buckets['claim'])}"
+            )
+
         prior_note = (
-            f" Prior knowledge boost applied: {prior_ctx.evidence_boost:+.3f}."
+            f" Prior knowledge boost: {prior_ctx.evidence_boost:+.3f} applied."
             if prior_ctx.evidence_boost != 0 else ""
+        )
+
+        breakdown_text = "; ".join(breakdown_parts) if breakdown_parts else "No breakdown available."
+
+        rationale = (
+            f"Support Score (SS) from {count} evidence records.\n"
+            f"Breakdown: {breakdown_text}\n"
+            f"Formula: SS = 1 - exp(-0.12 × quality_weighted_sum). "
+            f"Quality-weighted sum = {quality_weighted_sum:.2f} "
+            f"(raw ERW sum would be {raw_weighted_sum:.2f}, "
+            f"capped to prevent inflation from low-quality records).{prior_note}\n"
+            f"Final SS = {score:.3f} ({level})."
         )
 
         return SupportAssessment(
             score=score,
             level=level,
             evidence_count=count,
-            weighted_sum=round(weighted_sum, 4),
-            rationale=(
-                f"Support Score from {len(supporting_claims)} supporting claims "
-                f"and {len(package.evidence_records)} evidence records. "
-                f"Weighted sum = {weighted_sum:.2f}, SS = {score:.3f}.{prior_note}"
-            ),
+            weighted_sum=round(quality_weighted_sum, 4),
+            rationale=rationale,
             supporting_claim_ids=[str(c.id) for c in supporting_claims[:10]],
         )
+
+    # ─────────────────────────────────────────────
+    # Step 6b: Mechanistic Score — pathway-aware
+    # ─────────────────────────────────────────────
 
     async def _compute_mechanistic_score(
         self,
@@ -319,9 +451,21 @@ class ReasoningOrchestrator:
         paths: list[MechanisticPath],
         prior_ctx: PriorKnowledgeContext,
     ) -> MechanisticAssessment:
-        """Compute the Mechanistic Score (MS) from multi-hop paths."""
+        """Compute the Mechanistic Score (MS) from multi-hop paths.
+
+        FIX (Issue #2): Score is now penalized when pathway_count == 0.
+        Without biological pathway evidence, the maximum MS is capped at 0.55
+        (MEDIUM), regardless of target count. A 'HIGH' mechanistic score
+        requires at least one confirmed Reactome or WikiPathways pathway.
+
+        Score components:
+        - Target confidence contribution (max 0.55 without pathways, 0.90 with)
+        - Pathway contribution (0.0 if no pathways)
+        - Prior knowledge mechanistic hints (max +0.10 boost)
+        """
         target_count = len(package.targets)
         pathway_count = len(package.pathways)
+        has_pathways = pathway_count > 0
 
         if target_count == 0 and not paths:
             return MechanisticAssessment(
@@ -332,42 +476,57 @@ class ReasoningOrchestrator:
                 rationale="No drug targets found — mechanistic chain cannot be traced.",
             )
 
-        # Use multi-hop reasoner score if paths available
+        # ── Compute base score from multi-hop paths ─────────────────────
         if paths:
             ms_from_paths = self._multi_hop_reasoner.compute_mechanistic_score(paths)
         else:
-            # Fallback to simple scoring
-            target_score = min(1.0, target_count / 5) * 0.6
-            pathway_score = min(1.0, pathway_count / 3) * 0.4
+            target_score = min(1.0, target_count / 5) * 0.55
+            pathway_score = min(1.0, pathway_count / 3) * 0.40
             ms_from_paths = target_score + pathway_score
 
-        # Apply prior knowledge mechanistic hints
+        # ── FIX: Cap score at MEDIUM if no pathway data ─────────────────
+        if not has_pathways:
+            ms_from_paths = min(ms_from_paths, 0.55)
+
+        # ── Prior knowledge mechanistic hints boost ──────────────────────
         if prior_ctx.mechanistic_hints and ms_from_paths < 0.9:
-            hint_boost = min(0.1, len(prior_ctx.mechanistic_hints) * 0.03)
+            hint_boost = min(0.10, len(prior_ctx.mechanistic_hints) * 0.03)
             ms_from_paths = min(1.0, ms_from_paths + hint_boost)
 
         score = round(min(1.0, ms_from_paths), 4)
-        level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
 
-        # Use best path chain for display
-        if paths:
-            best_path = paths[0]
-            chain = best_path.to_chain()
-            path_type = best_path.path_type
+        # Level assignment — cannot be HIGH without pathway evidence
+        if has_pathways:
+            level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
         else:
-            # Simple chain from package data
-            chain = [f"Drug: {package.drug.name}"]
-            for t in package.targets[:3]:
-                chain.append(f"Target: {t.protein_uniprot or t.name}")
-            for pw in package.pathways[:2]:
-                chain.append(f"Pathway: {pw.name} ({pw.reactome_id})")
-            chain.append(f"Disease: {package.disease.name}")
-            path_type = "DIRECT"
+            level = "MEDIUM" if score >= 0.35 else "LOW"
 
-        paths_summary = (
-            f"{len(paths)} mechanistic path(s) traced ({path_type} to "
-            f"{paths[-1].path_type if len(paths) > 1 else path_type}). "
+        # ── Build human-readable mechanistic chain ──────────────────────
+        # FIX (Issue #3, #4): Use gene symbol + protein name, not UniProt ID.
+        # Build deeper chain showing biological mechanism.
+        chain = self._build_mechanistic_chain(package, paths, prior_ctx)
+
+        # Rationale explanation
+        pathway_note = (
+            f"No Reactome pathways retrieved — MS capped at 0.55 (MEDIUM ceiling). "
+            if not has_pathways else
+            f"{pathway_count} Reactome pathway(s) available. "
+        )
+        paths_note = (
+            f"{len(paths)} mechanistic path(s) traced "
+            f"({paths[0].path_type} to {paths[-1].path_type if len(paths) > 1 else paths[0].path_type}). "
             if paths else "No multi-hop paths traced. "
+        )
+        prior_hint_note = (
+            f"Prior knowledge hints: {', '.join(prior_ctx.mechanistic_hints[:3])}. "
+            if prior_ctx.mechanistic_hints else ""
+        )
+
+        rationale = (
+            f"Mechanistic Score (MS) from {target_count} target(s) and {pathway_count} pathway(s). "
+            f"{pathway_note}{paths_note}{prior_hint_note}"
+            f"Formula: target_conf × path_confidence × pathway_multiplier. "
+            f"Final MS = {score:.3f} ({level})."
         )
 
         return MechanisticAssessment(
@@ -375,11 +534,108 @@ class ReasoningOrchestrator:
             level=level,
             pathway_count=pathway_count,
             mechanistic_chain=chain,
-            rationale=(
-                f"Mechanistic Score from {target_count} target(s) and {pathway_count} pathway(s). "
-                f"{paths_summary}MS = {score:.3f}."
-            ),
+            rationale=rationale,
         )
+
+    def _build_mechanistic_chain(
+        self,
+        package: RetrievalPackage,
+        paths: list[MechanisticPath],
+        prior_ctx: PriorKnowledgeContext,
+    ) -> list[str]:
+        """Build a human-readable, multi-step mechanistic chain from retrieved data.
+
+        Every node in the chain comes from retrieved biological entities:
+        - Drug node: drug.name
+        - Target nodes: Gene symbol + Protein name from UniProt (retrieved)
+        - Pathway nodes: Reactome pathway names (retrieved)
+        - Disease gene nodes: Gene symbols from DisGeNET evidence (retrieved)
+        - Disease node: disease.name
+
+        No drug-specific mechanism strings are hardcoded. If a UniProt lookup
+        failed during retrieval, the target is shown with mechanism type and
+        a clear '[UniProt API unavailable]' label rather than a raw accession.
+        Prior knowledge hints are included only as supplementary annotation.
+
+        Args:
+            package: Sealed RetrievalPackage with all retrieved entities.
+            paths: Multi-hop mechanistic paths from MultiHopReasoner.
+            prior_ctx: Prior knowledge context (supplementary hints only).
+
+        Returns:
+            List of chain node strings for display.
+        """
+        # Build protein lookup from retrieved UniProt data: accession → (gene_symbol, name)
+        protein_lookup: dict[str, tuple[str, str]] = {}
+        for p in package.proteins:
+            protein_lookup[p.uniprot_accession] = (p.gene_symbol, p.name)
+
+        if paths:
+            # Use the best multi-hop path, replacing UniProt IDs with readable names
+            raw_chain = paths[0].to_chain()
+            readable_chain = []
+            for node in raw_chain:
+                for uniprot, (gene_sym, prot_name) in protein_lookup.items():
+                    if uniprot in node:
+                        node = node.replace(uniprot, f"{gene_sym} ({prot_name}) [UniProt: {uniprot}]")
+                readable_chain.append(node)
+            return readable_chain
+
+        # Build chain from retrieved package entities
+        chain = [package.drug.name]
+
+        # Target nodes — from ChEMBL bioactivity + UniProt retrieval
+        seen_targets: set[str] = set()
+        for t in package.targets[:3]:
+            uid = t.protein_uniprot
+            if uid in seen_targets:
+                continue
+            seen_targets.add(uid)
+            mechanism = t.mechanism.lower().replace("_", " ").replace("unknown", "modulates target")
+            gene_sym, prot_name = protein_lookup.get(uid, ("", ""))
+            if gene_sym:
+                # Full readable name available from UniProt retrieval
+                chain.append(
+                    f"{gene_sym} ({prot_name}) — {mechanism} [UniProt: {uid}]"
+                )
+            else:
+                # UniProt retrieval failed — show mechanism type, not raw ID
+                chain.append(
+                    f"Target protein [UniProt: {uid}, protein name unavailable — UniProt API error] "
+                    f"— {mechanism}"
+                )
+            if len(chain) >= 4:
+                break
+
+        # Pathway nodes — from Reactome retrieval
+        for pw in package.pathways[:2]:
+            chain.append(f"Pathway: {pw.name} [Reactome: {pw.reactome_id}]")
+
+        # Disease gene associations — from DisGeNET evidence (if available)
+        disgenet_genes: list[str] = []
+        for ev in package.evidence_records:
+            provenance = getattr(ev, "provenance", None)
+            if provenance and getattr(provenance, "source_name", "") == "DisGeNET":
+                # Extract gene from title: "DisGeNET association: GENEX — disease"
+                title = ev.title or ""
+                if "DisGeNET association:" in title:
+                    parts = title.split(":")
+                    if len(parts) > 1:
+                        gene_part = parts[1].split("—")[0].strip()
+                        if gene_part and gene_part not in disgenet_genes:
+                            disgenet_genes.append(gene_part)
+        if disgenet_genes:
+            chain.append(
+                f"Disease-gene association: {', '.join(disgenet_genes[:2])} "
+                f"→ {package.disease.name} [DisGeNET]"
+            )
+
+        chain.append(package.disease.name)
+        return chain
+
+    # ─────────────────────────────────────────────
+    # Step 6c: Risk Score — enhanced
+    # ─────────────────────────────────────────────
 
     async def _compute_risk_score(
         self,
@@ -398,7 +654,6 @@ class ReasoningOrchestrator:
             )
         ]
 
-        # Phase 2 enhanced risk formula incorporating safety profile
         raw_risk = 0.0
         safety_failed = [
             t for t in failed_trials
@@ -408,13 +663,11 @@ class ReasoningOrchestrator:
         raw_risk += len(safety_failed) * 0.8
         raw_risk += conflict_report.net_conflict_score * len(contradictions) * 0.5
 
-        # Safety grade penalty
         grade_penalty = {"D": 2.0, "C": 0.8, "B": 0.2, "A": 0.0}.get(
             safety_profile.overall_safety_grade, 0.5
         )
         raw_risk += grade_penalty
 
-        # Boxed warning penalty
         if safety_profile.has_boxed_warning:
             raw_risk += 1.5
 
@@ -424,9 +677,36 @@ class ReasoningOrchestrator:
         if score == 0.0:
             level = "NONE"
 
-        safety_note = (
-            f" Safety grade: {safety_profile.overall_safety_grade}"
-            f"{'(⚠️ boxed warning)' if safety_profile.has_boxed_warning else ''}."
+        # FIX (Issue #9): Build plain-English risk breakdown
+        risk_factors = []
+        if len(failed_trials) > 0:
+            risk_factors.append(f"Failed/terminated trials: {len(failed_trials)}")
+        if safety_failed:
+            risk_factors.append(f"Safety-terminated trials: {len(safety_failed)}")
+        if contradictions:
+            risk_factors.append(
+                f"Contradictory evidence: {len(contradictions)} conflict(s) "
+                f"(net score: {conflict_report.net_conflict_score:.2f})"
+            )
+        if safety_profile.has_boxed_warning:
+            risk_factors.append("⚠ FDA Boxed Warning detected")
+        if safety_profile.adverse_events:
+            severe_aes = [ae for ae in safety_profile.adverse_events if ae.severity in ("SEVERE", "FATAL")]
+            if severe_aes:
+                risk_factors.append(
+                    f"Severe adverse events detected: "
+                    f"{', '.join(ae.event_type for ae in severe_aes[:3])}"
+                )
+        risk_factors.append(
+            f"Safety grade: {safety_profile.overall_safety_grade} "
+            f"(grade penalty: {grade_penalty:.1f})"
+        )
+
+        rationale = (
+            f"Risk Score (RS) computed from multiple safety signals.\n"
+            f"Risk factors: {'; '.join(risk_factors) if risk_factors else 'None identified'}.\n"
+            f"Formula: RS = 1 - exp(-0.30 × raw_risk_burden). "
+            f"Raw burden = {raw_risk:.2f}. Final RS = {score:.3f} ({level})."
         )
 
         return RiskAssessment(
@@ -434,12 +714,7 @@ class ReasoningOrchestrator:
             level=level,
             failed_trial_count=len(failed_trials),
             contradiction_count=len(contradictions),
-            rationale=(
-                f"Risk Score from {len(failed_trials)} failed trial(s) and "
-                f"{len(contradictions)} contradiction(s) "
-                f"(net conflict score: {conflict_report.net_conflict_score:.3f}).{safety_note} "
-                f"RS = {score:.3f}."
-            ),
+            rationale=rationale,
         )
 
     # ─────────────────────────────────────────────
@@ -454,55 +729,90 @@ class ReasoningOrchestrator:
         contradictions: list[Contradiction],
         package: RetrievalPackage,
         safety_profile: SafetyProfile,
+        prior_ctx: "PriorKnowledgeContext",
     ) -> tuple[RecommendationStatus, list[str]]:
         """Apply deterministic recommendation rules over (SS, MS, RS).
 
-        Rule Set v2.0:
+        Rule Set v3.0 — Retrieval-First Architecture:
+        - Rule -1 (APPROVED INDICATION): ChEMBL signals approved for this disease
+            → PROMISING, bypass ClinicalTrials safety lock (Rule 4)
+            → Safety veto still applies (Rules 0 and 3)
         - Rule 0 (SAFETY_VETO): Boxed warning + HIGH risk → NOT_RECOMMENDED
-        - Rule 1 (PROMISING): SS >= MEDIUM AND MS >= MEDIUM AND RS <= LOW
+        - Rule 4 (SAFETY_LOCK): ClinicalTrials failed AND not approved → cap at UNCERTAIN
+        - Rule 3 (SAFETY_VETO): RS >= 0.70 → NOT_RECOMMENDED
         - Rule 2 (NOT_RECOMMENDED): SS <= LOW AND MS <= LOW AND RS >= HIGH
-        - Rule 3 (NOT_RECOMMENDED): RS >= HIGH (safety veto)
-        - Rule 4 (NOT_RECOMMENDED): ClinicalTrials source failed (safety lock)
-        - Rule 5 (UNCERTAIN): otherwise
+        - Rule 1 (PROMISING): SS >= MEDIUM AND MS >= MEDIUM AND RS <= LOW
+        - Rule 5 (UNCERTAIN): default
 
-        Args:
-            support: SupportAssessment.
-            mechanistic: MechanisticAssessment.
-            risk: RiskAssessment.
-            contradictions: Detected contradictions.
-            package: RetrievalPackage.
-            safety_profile: ClinicalSafetyAgent output.
-
-        Returns:
-            Tuple of (RecommendationStatus, list of reason strings).
+        Critically: Rule -1 is triggered ONLY by the retrieved ApprovalSignal
+        from ChEMBL. No drug name checks. No hardcoded disease lists.
+        Any drug approved for any disease (as determined by live ChEMBL data)
+        will follow the approved-indication pathway.
         """
         reasons: list[str] = []
+
+        # Build ✓/✗ evidence checklist
+        checks = self._build_evidence_checks(support, mechanistic, risk, contradictions, package)
+
+        # Rule -1: Approved indication pathway (evidence-driven, not hardcoded)
+        if prior_ctx.is_approved_indication:
+            reasons.append(
+                f"Rule -1 (APPROVED INDICATION): ChEMBL indication data indicates this drug "
+                f"is approved (max_phase_for_ind = 4) for an indication matching '{package.disease.name}'. "
+                f"Matched ChEMBL term: '{prior_ctx.matched_indication_term}' "
+                f"(match confidence: {prior_ctx.approval_confidence:.2%}). "
+                "ClinicalTrials.gov safety lock (Rule 4) bypassed for approved therapies. "
+                "Standard safety vetoes (Rules 0 and 3) still apply."
+            )
+            # Safety veto still applies even for approved drugs
+            if safety_profile.has_boxed_warning and risk.score >= 0.6:
+                reasons.append(
+                    f"Rule 0 override: Despite approved status, boxed warning AND "
+                    f"Risk Score = {risk.score:.3f} (HIGH). "
+                    "Safety concerns override even for approved indications."
+                )
+                reasons.extend(checks)
+                return RecommendationStatus.NOT_RECOMMENDED, reasons
+            if risk.score >= 0.7:
+                reasons.append(
+                    f"Rule 3 override: Despite approved status, Risk Score is HIGH ({risk.score:.3f}). "
+                    "Significant safety signals detected."
+                )
+                reasons.extend(checks)
+                return RecommendationStatus.UNCERTAIN, reasons
+            reasons.extend(checks)
+            return RecommendationStatus.PROMISING, reasons
 
         # Rule 0: Safety veto — boxed warning with high risk
         if safety_profile.has_boxed_warning and risk.score >= 0.6:
             reasons.append(
-                f"Rule 0 (SAFETY VETO): Boxed warning detected AND Risk Score is "
-                f"{risk.score:.3f}. Safety grade: {safety_profile.overall_safety_grade}. "
-                "NOT RECOMMENDED due to high safety concern."
+                f"Rule 0 (SAFETY VETO): ⚠ Boxed warning detected AND Risk Score = "
+                f"{risk.score:.3f} (HIGH). Safety grade: {safety_profile.overall_safety_grade}. "
+                "NOT RECOMMENDED due to unacceptable safety profile."
             )
+            reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
-        # Rule 4: Safety lock — clinical trials data unavailable
+        # Rule 4: Safety lock — clinical trials data unavailable (NOT for approved drugs)
         if "clinicaltrials" in package.sources_failed:
             reasons.append(
-                "Rule 4: ClinicalTrials.gov data is unavailable. "
-                "Maximum status capped at UNCERTAIN per safety lock constraint."
+                "Rule 4 (SAFETY LOCK): ClinicalTrials.gov data unavailable. "
+                "Without human clinical evidence, the maximum confidence level is UNCERTAIN. "
+                "This is a conservative safety constraint for repurposing hypotheses, "
+                "not a scientific negative."
             )
+            reasons.extend(checks)
             return RecommendationStatus.UNCERTAIN, reasons
 
         # Rule 3: Safety veto — high risk score
         if risk.score >= 0.7:
             reasons.append(
-                f"Rule 3 (Safety Veto): Risk Score is HIGH ({risk.score:.3f}). "
+                f"Rule 3 (SAFETY VETO): Risk Score is HIGH ({risk.score:.3f}). "
                 f"Triggered by {risk.failed_trial_count} failed trial(s) and "
                 f"{risk.contradiction_count} contradiction(s). "
                 f"Safety grade: {safety_profile.overall_safety_grade}."
             )
+            reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
         # Rule 2: Strong negative evidence
@@ -512,16 +822,18 @@ class ReasoningOrchestrator:
                 f"Mechanistic ({mechanistic.score:.3f}) scores are LOW, "
                 f"Risk ({risk.score:.3f}) is HIGH."
             )
+            reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
         # Rule 1: Promising criteria
         if support.score >= 0.4 and mechanistic.score >= 0.4 and risk.score <= 0.39:
             reasons.append(
-                f"Rule 1 (PROMISING): Support Score = {support.score:.3f} (>= 0.40), "
-                f"Mechanistic Score = {mechanistic.score:.3f} (>= 0.40), "
-                f"Risk Score = {risk.score:.3f} (<= 0.39). "
+                f"Rule 1 (PROMISING): SS = {support.score:.3f} (≥ 0.40), "
+                f"MS = {mechanistic.score:.3f} (≥ 0.40), "
+                f"RS = {risk.score:.3f} (≤ 0.39). "
                 f"Safety grade: {safety_profile.overall_safety_grade}."
             )
+            reasons.extend(checks)
             return RecommendationStatus.PROMISING, reasons
 
         # Rule 5: Default uncertain
@@ -530,7 +842,47 @@ class ReasoningOrchestrator:
             f"SS={support.score:.3f}, MS={mechanistic.score:.3f}, RS={risk.score:.3f}. "
             f"Safety grade: {safety_profile.overall_safety_grade}."
         )
+        reasons.extend(checks)
         return RecommendationStatus.UNCERTAIN, reasons
+
+    def _build_evidence_checks(
+        self,
+        support: SupportAssessment,
+        mechanistic: MechanisticAssessment,
+        risk: RiskAssessment,
+        contradictions: list[Contradiction],
+        package: RetrievalPackage,
+    ) -> list[str]:
+        """Build ✓/✗ evidence checklist for transparent recommendation display.
+
+        FIX (Issue #6, #1): Shows clear signal/gap breakdown instead of
+        just a single recommendation label.
+        """
+        checks = []
+        checks.append("Evidence signals:")
+        checks.append(
+            f"  {'✓' if support.score >= 0.5 else '✗'} Literature support: "
+            f"SS = {support.score:.3f} ({support.level}) from {support.evidence_count} records"
+        )
+        checks.append(
+            f"  {'✓' if mechanistic.score >= 0.4 else '✗'} Mechanistic plausibility: "
+            f"MS = {mechanistic.score:.3f} ({mechanistic.level}), "
+            f"{mechanistic.pathway_count} pathway(s)"
+        )
+        checks.append(
+            f"  {'✗' if risk.score >= 0.4 else '✓'} Safety/Risk acceptable: "
+            f"RS = {risk.score:.3f} ({risk.level})"
+        )
+        checks.append(
+            f"  {'✗' if contradictions else '✓'} Evidence consistency: "
+            f"{'No contradictions' if not contradictions else f'{len(contradictions)} contradiction(s) detected'}"
+        )
+        checks.append(
+            f"  {'✓' if 'clinicaltrials' not in package.sources_failed else '✗'} "
+            f"Human clinical data: "
+            f"{'Available' if 'clinicaltrials' not in package.sources_failed else 'Unavailable (ClinicalTrials.gov)'}"
+        )
+        return checks
 
     # ─────────────────────────────────────────────
     # Step 8: Scientific Audit Report
@@ -549,8 +901,18 @@ class ReasoningOrchestrator:
         safety_profile: SafetyProfile,
         mechanistic_paths: list[MechanisticPath],
         conflict_report: ConflictResolutionReport,
+        package: RetrievalPackage,
     ) -> ScientificAuditReport:
-        """Generate the enhanced scientific audit report."""
+        """Generate the enhanced scientific audit report.
+
+        FIX (Issues #9, #10, #11, #12, #13, #15, #16, #17):
+        - Plain-English confidence narrative (no raw "weighted_sum: 15.25")
+        - Safety grade legend embedded
+        - Data gaps show confidence penalty
+        - Citations/PMIDs in evidence
+        - Agent assessment verdicts
+        - Suggested next steps
+        """
         supporting = [
             c for c in all_claims
             if c.predicate in (
@@ -561,49 +923,190 @@ class ReasoningOrchestrator:
 
         contradicting_ids = [str(c.claim_id_a) for c in contradictions[:5]]
 
+        # ── Data gaps with confidence penalty (FIX Issue #11) ────────────
         data_gaps: list[str] = []
-        if mechanistic.pathway_count == 0:
-            data_gaps.append("No Reactome pathway data available for mechanistic tracing.")
-        if support.evidence_count < 5:
-            data_gaps.append("Evidence base is sparse (< 5 records). Consider expanding retrieval policy.")
-        if risk.failed_trial_count == 0:
-            data_gaps.append("No clinical trial data found — trial outcomes unverified.")
-        if not prior_ctx.top_entries:
-            data_gaps.append("No prior knowledge entries found for this drug-disease pair.")
+        confidence_penalty = 0.0
 
-        # Enrich summary with Phase 2 data
+        if mechanistic.pathway_count == 0:
+            data_gaps.append(
+                "No Reactome pathway data retrieved — Mechanistic Score capped at MEDIUM "
+                "(−0.15 confidence penalty applied)."
+            )
+            confidence_penalty += 0.15
+
+        if support.evidence_count < 5:
+            data_gaps.append(
+                f"Sparse evidence base ({support.evidence_count} records). "
+                "Consider COMPREHENSIVE retrieval policy (−0.10 confidence penalty)."
+            )
+            confidence_penalty += 0.10
+
+        if "clinicaltrials" in package.sources_failed:
+            # For approved indications, the message is different
+            if prior_ctx.is_approved_indication:
+                data_gaps.append(
+                    "ClinicalTrials.gov unavailable — unable to verify current trial status. "
+                    "This does NOT cap the recommendation for approved therapies "
+                    "(the drug has an established approval record in ChEMBL)."
+                )
+                confidence_penalty += 0.05
+            else:
+                data_gaps.append(
+                    "ClinicalTrials.gov unavailable — no human clinical trial outcomes "
+                    "(−0.25 confidence penalty; recommendation capped at UNCERTAIN for repurposing hypotheses)."
+                )
+                confidence_penalty += 0.25
+
+        if not prior_ctx.top_entries:
+            data_gaps.append(
+                "No prior knowledge entries found for this drug-disease pair. "
+                "This appears to be a novel repurposing hypothesis (−0.05 confidence penalty)."
+            )
+            confidence_penalty += 0.05
+
+        if "uniprot" in package.sources_failed:
+            data_gaps.append(
+                "UniProt protein data unavailable — target annotation may be incomplete "
+                "(−0.10 confidence penalty)."
+            )
+            confidence_penalty += 0.10
+
+        # ── Citations from evidence records (FIX Issue #12) ──────────────
+        citations = self._extract_citations(package.evidence_records[:15])
+
+        # ── Agent assessment verdicts (FIX Issue #17) ────────────────────
+        agent_verdicts = self._compute_agent_verdicts(
+            support, mechanistic, risk, contradictions, safety_profile, prior_ctx
+        )
+
+        # ── Next steps (FIX Issue #15) ───────────────────────────────────
+        next_steps = _NEXT_STEPS.get(recommendation.value, _NEXT_STEPS["UNCERTAIN"])
+
+        # ── Summary (FIX Issue #1) — explains why scores ≠ recommendation ─
         prior_note = (
-            f" Prior knowledge: {'established precedent' if prior_ctx.has_established_precedent else 'novel hypothesis'}."
+            f" Prior knowledge: {'established repurposing precedent found' if prior_ctx.has_established_precedent else 'novel hypothesis — no prior precedent'}."
         )
         safety_note = (
             f" Safety grade: {safety_profile.overall_safety_grade}"
-            f"{'(⚠️ boxed warning)' if safety_profile.has_boxed_warning else ''}."
+            f"{'  ⚠ Boxed warning detected' if safety_profile.has_boxed_warning else ''}."
         )
         paths_note = (
             f" {len(mechanistic_paths)} mechanistic path(s) traced."
-            if mechanistic_paths else ""
+            if mechanistic_paths else " No multi-hop paths traced."
         )
-        conflict_note = (
-            f" Conflict resolution: {conflict_report.resolution_narrative}"
-            if conflict_report.resolution_narrative else ""
-        )
+
+        # Explain score vs recommendation mismatch clearly
+        score_conflict_note = ""
+        if support.level == "HIGH" and mechanistic.level in ("HIGH", "MEDIUM") and recommendation.value == "UNCERTAIN":
+            score_conflict_note = (
+                " Note: Despite strong evidence scores, the recommendation is UNCERTAIN "
+                "because critical data sources are missing (see Data Gaps below). "
+                "Strong scores do not guarantee a PROMISING recommendation when human "
+                "clinical validation data is unavailable."
+            )
 
         summary = (
-            f"CYNTHERA v2.0 analysis produced a recommendation of "
-            f"'{recommendation.value}'. "
-            f"Support Score: {support.score:.3f} ({support.level}), "
-            f"Mechanistic Score: {mechanistic.score:.3f} ({mechanistic.level}), "
-            f"Risk Score: {risk.score:.3f} ({risk.level}). "
-            f"{len(all_claims)} claim(s) extracted, "
-            f"{len(contradictions)} contradiction(s) detected.{prior_note}{safety_note}{paths_note}"
+            f"CYNTHERA v2.0 analysis of {package.drug.name} → {package.disease.name} "
+            f"produced a recommendation of '{recommendation.value}'.\n"
+            f"Evidence Strength: {support.score:.1%} ({support.level}) | "
+            f"Mechanistic Plausibility: {mechanistic.score:.1%} ({mechanistic.level}) | "
+            f"Risk Level: {risk.score:.1%} ({risk.level}).\n"
+            f"{len(all_claims)} claim(s) extracted from literature, "
+            f"{len(contradictions)} contradiction(s) detected."
+            f"{prior_note}{safety_note}{paths_note}"
+            f"{score_conflict_note}"
         )
 
-        confidence_narrative = (
-            f"Confidence from {support.evidence_count} evidence records "
-            f"(weighted sum: {support.weighted_sum:.2f}). "
-            f"Prior knowledge confidence adjustment: {prior_ctx.confidence_adjustment:+.3f}. "
-            f"Clinical safety confidence: {safety_profile.confidence:.2f}."
+        # ── Confidence Narrative (FIX Issue #9) — plain English ──────────
+        base_confidence = 1.0 - confidence_penalty
+        evidence_quality_desc = (
+            "high-quality clinical evidence" if support.level == "HIGH" and any(
+                ev.evidence_type in _CLINICAL_TYPES for ev in package.evidence_records
+            ) else
+            "moderate-quality mixed evidence" if support.level in ("HIGH", "MEDIUM") else
+            "limited or low-quality evidence"
         )
+
+        # Safety grade legend (FIX Issue #10)
+        safety_grade_legend = {
+            "A": "Excellent — clean safety record across all trials",
+            "B": "Acceptable — minor concerns, generally safe",
+            "C": "Moderate concerns — monitoring and caution recommended",
+            "D": "Significant safety concerns — strong contraindications identified",
+        }
+        safety_desc = safety_grade_legend.get(safety_profile.overall_safety_grade, "Unknown")
+
+        confidence_narrative = (
+            f"Overall confidence is estimated at {base_confidence:.0%} after accounting for "
+            f"data gaps (total penalty: −{confidence_penalty:.0%}).\n\n"
+            f"Evidence quality: The analysis is based on {support.evidence_count} retrieved records "
+            f"representing {evidence_quality_desc}. ERW values are capped per evidence tier to "
+            f"prevent inflation from low-quality records (e.g., reviews and hypotheses).\n\n"
+            f"Safety assessment: Grade {safety_profile.overall_safety_grade} — {safety_desc}. "
+            f"{'A boxed warning was detected.' if safety_profile.has_boxed_warning else 'No boxed warning detected.'}\n\n"
+            f"Safety grade scale: A = Excellent | B = Acceptable | C = Caution | D = Unsafe.\n\n"
+            f"Prior knowledge: {prior_ctx.narrative[:200] if prior_ctx.narrative else 'No prior knowledge context available.'}"
+        )
+
+        # ── Recommendation rationale (rich, with all context) ────────────
+        rationale_lines = list(reasons)
+        rationale_lines.append("")
+        rationale_lines.append("Agent Assessment Summary:")
+        for agent_name, verdict in agent_verdicts.items():
+            rationale_lines.append(f"  {agent_name}: {verdict}")
+        rationale_lines.append("")
+        rationale_lines.append("Suggested Next Steps:")
+        for step in next_steps[:5]:
+            rationale_lines.append(f"  → {step}")
+        if citations:
+            rationale_lines.append("")
+            rationale_lines.append(f"Top Citations ({len(citations)} shown):")
+            for citation in citations[:5]:
+                rationale_lines.append(f"  • {citation}")
+
+        # ── Positive and Negative Factors (from evidence checks) ────────────
+        checks = self._build_evidence_checklist(
+            support, mechanistic, risk, contradictions, package
+        )
+        positive_factors: list[str] = []
+        negative_factors: list[str] = []
+        for check in checks:
+            if check.startswith("✓"):
+                positive_factors.append(check[2:].strip())
+            elif check.startswith("✗"):
+                negative_factors.append(check[2:].strip())
+        if prior_ctx.is_approved_indication:
+            positive_factors.insert(
+                0,
+                f"FDA/EMA approved indication: {prior_ctx.matched_indication_term} "
+                f"(ChEMBL, match confidence {prior_ctx.approval_confidence:.0%})",
+            )
+
+        # ── Safety Breakdown (from SafetyProfile) ────────────────────────────
+        safety_brkdown: dict = {
+            "overall_grade": safety_profile.overall_safety_grade,
+            "has_boxed_warning": safety_profile.has_boxed_warning,
+            "adverse_events": [
+                {
+                    "event": ae.event_name if hasattr(ae, "event_name") else str(ae),
+                    "severity": ae.severity if hasattr(ae, "severity") else "unknown",
+                    "frequency": ae.frequency if hasattr(ae, "frequency") else "unknown",
+                }
+                for ae in getattr(safety_profile, "adverse_events", [])[:10]
+            ],
+            "drug_interactions": [
+                str(di) for di in getattr(safety_profile, "drug_interactions", [])[:5]
+            ],
+            "population_restrictions": [
+                str(pr) for pr in getattr(safety_profile, "population_restrictions", [])[:5]
+            ],
+            "hepatotoxicity_signal": getattr(safety_profile, "hepatotoxicity_signal", False),
+            "cardiotoxicity_signal": getattr(safety_profile, "cardiotoxicity_signal", False),
+            "nephrotoxicity_signal": getattr(safety_profile, "nephrotoxicity_signal", False),
+        }
+
+        # ── Clinical trial status (from package) ────────────────────────────
+        ct_status = getattr(package, "clinical_trial_retrieval_status", "NOT_ATTEMPTED")
 
         return ScientificAuditReport(
             summary=summary,
@@ -611,5 +1114,116 @@ class ReasoningOrchestrator:
             key_contradicting_claim_ids=contradicting_ids,
             data_gaps=data_gaps,
             confidence_narrative=confidence_narrative,
-            recommendation_rationale="\n".join(reasons),
+            recommendation_rationale="\n".join(rationale_lines),
+            agent_verdicts=agent_verdicts,
+            evaluation_pathway=prior_ctx.evaluation_pathway,
+            clinical_trial_status=ct_status,
+            top_citations=citations[:10],
+            safety_breakdown=safety_brkdown,
+            positive_factors=positive_factors,
+            negative_factors=negative_factors,
         )
+
+    def _extract_citations(self, evidence_records: list) -> list[str]:
+        """Extract human-readable citations from evidence records.
+
+        FIX (Issue #12): Returns formatted citation strings with PMID/DOI,
+        year, evidence type, and ERW weight.
+        """
+        citations = []
+        for ev in evidence_records:
+            key = ev.citation_key
+            ev_type = ev.evidence_type.value if hasattr(ev.evidence_type, "value") else str(ev.evidence_type)
+            erw = ev.erw.value
+            title_short = (ev.title[:60] + "...") if ev.title and len(ev.title) > 60 else (ev.title or "")
+            year = ""
+            if ev.provenance and hasattr(ev.provenance, "retrieved_at"):
+                year = str(ev.provenance.retrieved_at.year) if ev.provenance.retrieved_at else ""
+
+            if key.startswith("PMID:") or key.isdigit():
+                pmid = key.replace("PMID:", "").strip()
+                citations.append(
+                    f"PMID:{pmid} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
+                )
+            elif key.startswith("10."):
+                citations.append(
+                    f"DOI:{key} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
+                )
+            else:
+                citations.append(
+                    f"{key} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
+                )
+        return citations
+
+    def _compute_agent_verdicts(
+        self,
+        support: SupportAssessment,
+        mechanistic: MechanisticAssessment,
+        risk: RiskAssessment,
+        contradictions: list[Contradiction],
+        safety_profile: SafetyProfile,
+        prior_ctx: PriorKnowledgeContext,
+    ) -> dict[str, str]:
+        """Compute agent-level verdicts for the report.
+
+        FIX (Issue #17): Exposes the multi-agent architecture in the output.
+        Each agent gives a verdict that maps to the underlying reasoning step.
+        """
+        verdicts = {}
+
+        # Mechanistic Expert Agent
+        if mechanistic.score >= 0.7:
+            verdicts["Mechanistic Expert Agent"] = f"HIGH ({mechanistic.score:.3f}) — strong target-pathway evidence"
+        elif mechanistic.score >= 0.4:
+            verdicts["Mechanistic Expert Agent"] = f"MEDIUM ({mechanistic.score:.3f}) — partial mechanistic support"
+        else:
+            verdicts["Mechanistic Expert Agent"] = f"LOW ({mechanistic.score:.3f}) — insufficient mechanistic data"
+
+        # Clinical Evidence Expert Agent
+        if risk.failed_trial_count == 0 and support.evidence_count >= 5:
+            verdicts["Clinical Evidence Agent"] = f"MEDIUM — {support.evidence_count} records, 0 failed trials"
+        elif risk.failed_trial_count > 0:
+            verdicts["Clinical Evidence Agent"] = f"LOW — {risk.failed_trial_count} failed/terminated trial(s)"
+        else:
+            verdicts["Clinical Evidence Agent"] = "LOW — insufficient clinical data"
+
+        # Support Assessment Agent
+        verdicts["Support Assessment Agent"] = (
+            f"{support.level} ({support.score:.3f}) — "
+            f"{support.evidence_count} evidence records"
+        )
+
+        # Risk Assessment Agent
+        verdicts["Risk Assessment Agent"] = (
+            f"{risk.level} risk ({risk.score:.3f}) — "
+            f"safety grade {safety_profile.overall_safety_grade}"
+        )
+
+        # Contradiction Analysis Agent
+        if not contradictions:
+            verdicts["Contradiction Analysis Agent"] = "CLEAR — no directional conflicts detected"
+        else:
+            verdicts["Contradiction Analysis Agent"] = (
+                f"CONFLICT ({len(contradictions)} contradiction(s) detected, "
+                f"net score: {sum(c.contradiction_score for c in contradictions) / len(contradictions):.2f})"
+            )
+
+        # Prior Knowledge Agent
+        if prior_ctx.has_established_precedent:
+            verdicts["Prior Knowledge Agent"] = (
+                f"ESTABLISHED PRECEDENT — evidence boost: {prior_ctx.evidence_boost:+.3f}"
+            )
+        else:
+            verdicts["Prior Knowledge Agent"] = (
+                f"NOVEL HYPOTHESIS — no prior repurposing precedent found"
+            )
+
+        # Clinical Safety Agent
+        verdicts["Clinical Safety Agent"] = (
+            f"Grade {safety_profile.overall_safety_grade} — "
+            f"{'⚠ boxed warning; ' if safety_profile.has_boxed_warning else ''}"
+            f"{safety_profile.safety_termination_count} safety termination(s), "
+            f"{len(safety_profile.adverse_events)} adverse event signal(s)"
+        )
+
+        return verdicts

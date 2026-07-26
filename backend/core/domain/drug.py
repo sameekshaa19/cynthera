@@ -30,7 +30,16 @@ class Drug(BaseModel):
     identifiers: ResolvedIdentifierSet = Field(..., description="Resolved cross-database identifiers.")
     approved_indications: list[str] = Field(
         default_factory=list,
-        description="Known approved therapeutic indications.",
+        description="Known approved therapeutic indications (populated from ChEMBL retrieval).",
+    )
+    max_phase: int = Field(
+        default=0,
+        ge=0,
+        le=4,
+        description=(
+            "Highest global clinical phase from ChEMBL (0=preclinical, 4=approved). "
+            "Populated during retrieval. Never hardcoded."
+        ),
     )
     molecular_formula: str | None = Field(None, description="Chemical molecular formula.")
     smiles: str | None = Field(None, description="SMILES notation.")

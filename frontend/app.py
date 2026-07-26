@@ -616,11 +616,122 @@ elif page == "📊 Results":
             </div>
             """, unsafe_allow_html=True)
 
-        # ── Phase 2: Prior Knowledge Indicator ────────────────────────
-        if "established precedent" in audit.summary.lower():
-            st.success("✅ **Prior Knowledge:** Established repurposing precedent found in the knowledge base.")
-        elif "novel hypothesis" in audit.summary.lower() or "Prior knowledge" in audit.summary:
-            st.info("💡 **Prior Knowledge:** Novel repurposing hypothesis — no established precedent found.")
+        # ── Evaluation Pathway Banner (evidence-driven, from retrieved ChEMBL data) ────────
+        audit = result.audit_report
+        evaluation_pathway = getattr(audit, "evaluation_pathway", "NOVEL_HYPOTHESIS")
+        ct_status = getattr(audit, "clinical_trial_status", "NOT_ATTEMPTED")
+
+        _PATHWAY_CONFIG = {
+            "APPROVED_INDICATION": {
+                "icon": "✅",
+                "label": "FDA / EMA APPROVED INDICATION",
+                "color": "#10b981",
+                "bg": "rgba(16,185,129,0.1)",
+                "desc": "This drug-disease pair represents an established approved therapy, "
+                        "as detected from ChEMBL drug indication data (max_phase_for_ind = 4).",
+            },
+            "PHASE_III_INVESTIGATION": {
+                "icon": "🧪",
+                "label": "PHASE III CLINICAL INVESTIGATION",
+                "color": "#3b82f6",
+                "bg": "rgba(59,130,246,0.1)",
+                "desc": "This drug is in Phase III trials for this indication (ChEMBL max_phase_for_ind = 3).",
+            },
+            "PHASE_II_INVESTIGATION": {
+                "icon": "🔬",
+                "label": "PHASE II CLINICAL INVESTIGATION",
+                "color": "#8b5cf6",
+                "bg": "rgba(139,92,246,0.1)",
+                "desc": "This drug is in Phase II trials for this indication (ChEMBL max_phase_for_ind = 2).",
+            },
+            "PHASE_I_INVESTIGATION": {
+                "icon": "🔬",
+                "label": "PHASE I CLINICAL INVESTIGATION",
+                "color": "#f59e0b",
+                "bg": "rgba(245,158,11,0.1)",
+                "desc": "This drug has Phase I safety data for this indication (ChEMBL max_phase_for_ind = 1).",
+            },
+            "NOVEL_HYPOTHESIS": {
+                "icon": "🔬",
+                "label": "REPURPOSING HYPOTHESIS",
+                "color": "#64748b",
+                "bg": "rgba(100,116,139,0.1)",
+                "desc": "No prior approved indication match found in ChEMBL for this drug-disease pair. "
+                        "Evidence is evaluated as a novel repurposing hypothesis.",
+            },
+        }
+        pw_cfg = _PATHWAY_CONFIG.get(evaluation_pathway, _PATHWAY_CONFIG["NOVEL_HYPOTHESIS"])
+        st.markdown(f"""
+        <div style="border-left: 4px solid {pw_cfg['color']}; background: {pw_cfg['bg']};
+                    padding: 1rem 1.25rem; border-radius: 8px; margin-bottom: 1rem;">
+            <div style="font-size: 1rem; font-weight: 700; color: {pw_cfg['color']}; letter-spacing: 0.05em;">
+                {pw_cfg['icon']} {pw_cfg['label']}
+            </div>
+            <div style="color: #cbd5e1; font-size: 0.85rem; margin-top: 0.4rem;">{pw_cfg['desc']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Multi-Agent Consensus Panel ────────────────────────────────────────────
+        agent_verdicts = getattr(audit, "agent_verdicts", {})
+        if agent_verdicts:
+            st.markdown("### 🤖 Multi-Agent Consensus")
+            _VERDICT_COLORS = {
+                "HIGH": "#10b981", "VERY HIGH": "#10b981", "MEDIUM": "#f59e0b",
+                "LOW": "#ef4444", "NONE": "#64748b", "CLEAR": "#10b981",
+                "APPROVED": "#10b981", "ESTABLISHED": "#10b981",
+            }
+            verdict_rows = ""
+            for agent, verdict in agent_verdicts.items():
+                first_word = verdict.split()[0].upper() if verdict else ""
+                color = _VERDICT_COLORS.get(first_word, "#94a3b8")
+                verdict_rows += f"""
+                <tr>
+                    <td style="padding: 0.5rem 0.75rem; color: #94a3b8; font-size: 0.85rem;">{agent}</td>
+                    <td style="padding: 0.5rem 0.75rem; color: {color}; font-size: 0.85rem; font-weight: 600;">{verdict}</td>
+                </tr>"""
+            st.markdown(f"""
+            <div class="info-panel" style="padding: 0;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <thead>
+                    <tr style="border-bottom: 1px solid #2a3a55;">
+                        <th style="padding: 0.5rem 0.75rem; text-align: left; color: #64748b; font-size: 0.75rem;">AGENT</th>
+                        <th style="padding: 0.5rem 0.75rem; text-align: left; color: #64748b; font-size: 0.75rem;">VERDICT</th>
+                    </tr>
+                </thead>
+                <tbody>{verdict_rows}</tbody>
+            </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Clinical Trial Status ──────────────────────────────────────────────
+        _CT_STATUS_CONFIG = {
+            "RETRIEVED": ("🟢", f"{len(pkg.clinical_trials)} trial(s) retrieved", "#10b981"),
+            "NOT_FOUND": ("🟡", "ClinicalTrials.gov queried — 0 trials found for this pair", "#f59e0b"),
+            "API_FAILURE": ("🔴", "ClinicalTrials.gov API error — trial count unknown (not 0)", "#ef4444"),
+            "NOT_ATTEMPTED": ("⚪", "Clinical trial query not attempted", "#64748b"),
+        }
+        ct_icon, ct_label, ct_color = _CT_STATUS_CONFIG.get(ct_status, ("⚪", ct_status, "#64748b"))
+
+        # Positive / Negative factors
+        positive_factors = getattr(audit, "positive_factors", [])
+        negative_factors = getattr(audit, "negative_factors", [])
+        if positive_factors or negative_factors:
+            st.markdown("### ⚖️ Decision Factors")
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                st.markdown("✅ **Supporting Factors**")
+                for f in positive_factors[:6]:
+                    st.markdown(f"- {f}")
+                if not positive_factors:
+                    st.caption("_None identified_")
+            with fc2:
+                st.markdown("❌ **Limiting Factors**")
+                for f in negative_factors[:6]:
+                    st.markdown(f"- {f}")
+                if not negative_factors:
+                    st.caption("_None identified_")
+
+        st.markdown("---")
 
 
 # ─────────────────────────────────────────────
@@ -645,6 +756,38 @@ elif page == "📋 Audit Report":
         </div>
         """, unsafe_allow_html=True)
 
+        # Evaluation pathway and clinical trial status
+        audit_pathway = getattr(audit, "evaluation_pathway", "NOVEL_HYPOTHESIS")
+        audit_ct_status = getattr(audit, "clinical_trial_status", "NOT_ATTEMPTED")
+        _audit_pw_cfg = _PATHWAY_CONFIG if "_PATHWAY_CONFIG" in dir() else {
+            "APPROVED_INDICATION": {"icon": "✅", "label": "FDA/EMA Approved Indication", "color": "#10b981", "bg": "rgba(16,185,129,0.1)", "desc": ""},
+            "NOVEL_HYPOTHESIS": {"icon": "🔬", "label": "Repurposing Hypothesis", "color": "#64748b", "bg": "rgba(100,116,139,0.1)", "desc": ""},
+        }
+        _pw_info = _audit_pw_cfg.get(audit_pathway, {"icon": "🔬", "label": audit_pathway, "color": "#64748b", "bg": "#1a2235", "desc": ""})
+        _ct_status_labels = {
+            "RETRIEVED": ("🟢", f"Retrieved ({len(r['package'].clinical_trials) if 'package' in r and hasattr(r['package'], 'clinical_trials') else '?'} trials)", "#10b981"),
+            "NOT_FOUND": ("🟡", "Query succeeded — 0 trials found", "#f59e0b"),
+            "API_FAILURE": ("🔴", "ClinicalTrials.gov API error (trial count unknown)", "#ef4444"),
+            "NOT_ATTEMPTED": ("⚪", "Not attempted", "#64748b"),
+        }
+        _ct_icon2, _ct_lbl2, _ct_col2 = _ct_status_labels.get(audit_ct_status, ("⚪", audit_ct_status, "#64748b"))
+
+        col_ap, col_ct = st.columns(2)
+        with col_ap:
+            st.markdown(f"""
+            <div style="background: {_pw_info['bg']}; border-left: 3px solid {_pw_info['color']};
+                        padding: 0.75rem 1rem; border-radius: 6px;">
+                <b style="color: {_pw_info['color']};">{_pw_info['icon']} {_pw_info['label']}</b>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_ct:
+            st.markdown(f"""
+            <div style="background: rgba(30,40,60,0.5); border-left: 3px solid {_ct_col2};
+                        padding: 0.75rem 1rem; border-radius: 6px;">
+                <b style="color: {_ct_col2};">{_ct_icon2} Clinical Trials: {_ct_lbl2}</b>
+            </div>
+            """, unsafe_allow_html=True)
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("### ✅ Key Supporting Claims")
@@ -666,6 +809,58 @@ elif page == "📋 Audit Report":
             st.markdown("### 🔍 Data Gaps Identified")
             for gap in audit.data_gaps:
                 st.warning(f"⚠️ {gap}")
+
+        # Agent verdicts in audit report
+        audit_verdicts = getattr(audit, "agent_verdicts", {})
+        if audit_verdicts:
+            st.markdown("### 🤖 Expert Agent Assessments")
+            for agent, verdict in audit_verdicts.items():
+                st.markdown(f"**{agent}:** {verdict}")
+
+        # Positive / negative factors in audit
+        pos_f = getattr(audit, "positive_factors", [])
+        neg_f = getattr(audit, "negative_factors", [])
+        if pos_f or neg_f:
+            st.markdown("### ⚖️ Recommendation Factors")
+            fca, fcb = st.columns(2)
+            with fca:
+                st.markdown("✅ **Supporting**")
+                for f in pos_f[:8]: st.markdown(f"- {f}")
+            with fcb:
+                st.markdown("❌ **Limiting**")
+                for f in neg_f[:8]: st.markdown(f"- {f}")
+
+        # Safety breakdown in audit
+        safety_bd = getattr(audit, "safety_breakdown", {})
+        if safety_bd:
+            st.markdown("### 🛡️ Safety Profile Breakdown")
+            grade = safety_bd.get("overall_grade", "?")
+            grade_color = {"A": "#10b981", "B": "#3b82f6", "C": "#f59e0b", "D": "#ef4444"}.get(grade, "#64748b")
+            boxed = safety_bd.get("has_boxed_warning", False)
+            st.markdown(f"""
+            <div class="info-panel" style="border-left: 4px solid {grade_color};">
+                <span style="font-size: 1.5rem; font-weight: 700; color: {grade_color};">Grade {grade}</span>
+                {'<span style="color: #ef4444; margin-left: 1rem;"> ⚠ Boxed Warning</span>' if boxed else ''}
+            </div>
+            """, unsafe_allow_html=True)
+            aes = safety_bd.get("adverse_events", [])
+            if aes:
+                st.markdown("**Adverse Events:**")
+                for ae in aes[:5]:
+                    ev_name = ae.get("event", str(ae))
+                    sev = ae.get("severity", "")
+                    st.markdown(f"- {ev_name} ({sev})" if sev and sev != "unknown" else f"- {ev_name}")
+            dis = safety_bd.get("drug_interactions", [])
+            if dis:
+                st.markdown(f"**Drug Interactions:** {', '.join(str(d) for d in dis[:3])}")
+
+        # Citations
+        top_cits = getattr(audit, "top_citations", [])
+        if top_cits:
+            st.markdown("### 📚 Evidence Citations")
+            with st.expander(f"{len(top_cits)} Citation(s) — click to expand"):
+                for cit in top_cits:
+                    st.markdown(f"- {cit}")
 
         with st.expander("📜 Recommendation Rule Trace"):
             st.markdown(f"""
@@ -756,7 +951,7 @@ elif page == "🕐 History":
             }
             return colors.get(val, "")
 
-        styled = df.style.applymap(color_rec, subset=["Recommendation"])
+        styled = df.style.map(color_rec, subset=["Recommendation"])
         st.dataframe(styled, use_container_width=True)
 
         st.caption(f"Showing {len(rows)} evaluation(s) from persistent storage.")

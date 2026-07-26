@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -18,6 +19,7 @@ from backend.core.domain.pathway import Pathway
 from backend.core.domain.evidence import Evidence
 from backend.core.domain.clinical_trial import ClinicalTrial
 from backend.core.domain.retrieval_package import RetrievalPackage
+from backend.core.domain.approval_signal import ApprovalSignal
 from backend.core.enums.evidence_type import EvidenceType
 from backend.core.enums.trial_outcome import TrialOutcomeStatus
 from backend.core.value_objects.erw import ERW
@@ -95,7 +97,7 @@ class RetrievalPipeline:
         evidence_records: list[Evidence] = []
         clinical_trials: list[ClinicalTrial] = []
 
-        # --- Phase 1: Sequential Fetch (ChEMBL) ---
+        # --- Phase 1: Sequential Fetch (ChEMBL — bioactivities + indications + molecule details) ---
         try:
             chembl_data = await self._fetch_chembl(chembl_id)
             sources_queried.append("chembl")
@@ -181,7 +183,24 @@ class RetrievalPipeline:
             disgenet_evidence = self._parse_disgenet_data(disgenet_data, drug, disease)
             evidence_records.extend(disgenet_evidence)
 
-        # Determine retrieval confidence
+        # --- Determine approval signal from retrieved indication data ---
+        approval_signal = self._parse_indication_data(
+            chembl_data.get("indications", {}),
+            chembl_data.get("molecule_details", {}),
+            disease.name,
+        )
+
+        # --- Determine clinical trial retrieval status (not just count) ---
+        if "clinicaltrials" in sources_failed:
+            ct_status = "API_FAILURE"
+        elif "clinicaltrials" in sources_queried and len(clinical_trials) == 0:
+            ct_status = "NOT_FOUND"
+        elif len(clinical_trials) > 0:
+            ct_status = "RETRIEVED"
+        else:
+            ct_status = "NOT_ATTEMPTED"
+
+        # --- Determine retrieval confidence ---
         confidence = self._compute_confidence(
             targets, evidence_records, pathways, clinical_trials, sources_failed
         )
@@ -199,6 +218,8 @@ class RetrievalPipeline:
             sources_queried=sources_queried,
             sources_failed=sources_failed,
             sealed_at=datetime.utcnow(),
+            approval_signal=approval_signal,
+            clinical_trial_retrieval_status=ct_status,
         )
 
         logger.info(
@@ -218,7 +239,20 @@ class RetrievalPipeline:
         async with ChEMBLConnector() as conn:
             bioactivities = await conn.fetch(chembl_id)
             mechanisms = await conn.fetch_targets(chembl_id)
-            
+
+            # Fetch molecule details (max_phase, synonyms) and indications in parallel
+            mol_details, ind_data = await asyncio.gather(
+                conn.fetch_molecule_details(chembl_id),
+                conn.fetch_indications(chembl_id),
+                return_exceptions=True,
+            )
+            if isinstance(mol_details, Exception):
+                logger.debug("chembl_mol_details_failed", extra={"error": str(mol_details)})
+                mol_details = {}
+            if isinstance(ind_data, Exception):
+                logger.debug("chembl_ind_data_failed", extra={"error": str(ind_data)})
+                ind_data = {"indications": []}
+
             # Extract up to 10 unique target ChEMBL IDs to query their details
             activities = bioactivities.get("activities", [])
             target_ids = list(set(act.get("target_chembl_id") for act in activities if act.get("target_chembl_id")))
@@ -238,7 +272,9 @@ class RetrievalPipeline:
             return {
                 "bioactivities": bioactivities,
                 "mechanisms": mechanisms,
-                "target_details": target_details_dict
+                "target_details": target_details_dict,
+                "molecule_details": mol_details,
+                "indications": ind_data,
             }
 
     async def _fetch_uniprot(self, uniprot_ids: list[str]) -> dict[str, Any]:
@@ -294,6 +330,121 @@ class RetrievalPipeline:
         except Exception as exc:
             logger.debug("disgenet_fetch_failed", extra={"error": str(exc)})
             return {}
+
+    def _parse_indication_data(
+        self,
+        indication_data: dict[str, Any],
+        molecule_data: dict[str, Any],
+        disease_name: str,
+    ) -> ApprovalSignal | None:
+        """Infer approval status from ChEMBL retrieved indication data.
+
+        Uses fuzzy token matching to compare the queried disease_name against
+        every EFO/MeSH indication term returned by ChEMBL. No drug names,
+        disease names, or approval facts are hardcoded — the result is
+        computed purely from retrieved data.
+
+        Matching algorithm:
+        1. Tokenize both the queried disease and the indication term
+        2. Compute token overlap ratio (Jaccard-like similarity)
+        3. Consider a match if similarity > 0.35 or queried name is substring
+        4. Select the best-matching indication
+        5. Return ApprovalSignal based on max_phase_for_ind of best match
+
+        Args:
+            indication_data: Raw ChEMBL indication response dict.
+            molecule_data: Raw ChEMBL molecule details dict.
+            disease_name: The queried disease name (from user input).
+
+        Returns:
+            ApprovalSignal built from retrieved data, or None if no ChEMBL data.
+        """
+        indications = indication_data.get("indications", [])
+        if not indications and not molecule_data:
+            return None
+
+        # Count total approved indications for this drug (informational)
+        approved_count = sum(
+            1 for ind in indications
+            if int(ind.get("max_phase_for_ind") or 0) == 4
+        )
+
+        # Tokenize queried disease name
+        query_tokens = set(
+            re.sub(r"[^a-z0-9]", " ", disease_name.lower()).split()
+        ) - {"the", "a", "an", "of", "and", "or", "for", "in", "to"}
+
+        best_match_phase = 0
+        best_match_term = ""
+        best_match_confidence = 0.0
+
+        for ind in indications:
+            efo_term = str(ind.get("efo_term") or "").lower()
+            mesh_heading = str(ind.get("mesh_heading") or "").lower()
+            max_phase = int(ind.get("max_phase_for_ind") or 0)
+
+            # Try both EFO term and MeSH heading
+            for term in (efo_term, mesh_heading):
+                if not term:
+                    continue
+                term_tokens = set(
+                    re.sub(r"[^a-z0-9]", " ", term).split()
+                ) - {"the", "a", "an", "of", "and", "or", "for", "in", "to"}
+
+                # Jaccard-like similarity on tokens
+                union = query_tokens | term_tokens
+                if not union:
+                    continue
+                intersection = query_tokens & term_tokens
+                sim = len(intersection) / len(union)
+
+                # Substring containment boost
+                q_clean = disease_name.lower().replace(" ", "")
+                t_clean = term.replace(" ", "")
+                if q_clean in t_clean or t_clean in q_clean:
+                    sim = max(sim, 0.6)
+
+                if sim > best_match_confidence:
+                    best_match_confidence = sim
+                    best_match_term = term
+                    best_match_phase = max_phase
+
+        # Require minimum similarity to accept a match (prevents false positives)
+        _MIN_MATCH_CONFIDENCE = 0.30
+        if best_match_confidence < _MIN_MATCH_CONFIDENCE:
+            # No meaningful match found — use global max_phase from molecule data
+            global_max_phase = int(molecule_data.get("max_phase") or 0)
+            if global_max_phase > 0:
+                logger.info(
+                    "approval_signal_global_phase_fallback",
+                    extra={
+                        "disease": disease_name,
+                        "global_max_phase": global_max_phase,
+                    },
+                )
+                return ApprovalSignal.from_chembl_indication_match(
+                    max_phase=0,  # No indication match → treat as novel hypothesis
+                    matched_term="",
+                    match_confidence=0.0,
+                    approved_count=approved_count,
+                )
+            return ApprovalSignal.no_data()
+
+        logger.info(
+            "approval_signal_match",
+            extra={
+                "disease": disease_name,
+                "matched_term": best_match_term,
+                "max_phase": best_match_phase,
+                "confidence": round(best_match_confidence, 3),
+            },
+        )
+        return ApprovalSignal.from_chembl_indication_match(
+            max_phase=best_match_phase,
+            matched_term=best_match_term,
+            match_confidence=best_match_confidence,
+            approved_count=approved_count,
+        )
 
     def _parse_chembl_data(
         self,

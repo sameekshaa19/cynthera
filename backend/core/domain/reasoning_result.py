@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 from pydantic import BaseModel, Field
 
 from backend.core.enums.recommendation import RecommendationStatus
@@ -83,22 +84,70 @@ class ScientificAuditReport(BaseModel):
     """Complete audit trail of the reasoning process.
 
     Attributes:
-        summary: LLM-generated executive summary.
+        summary: Executive summary of the evaluation.
         key_supporting_claim_ids: Claim IDs supporting the recommendation.
         key_contradicting_claim_ids: Claim IDs contradicting the hypothesis.
         data_gaps: Identified gaps in evidence.
         confidence_narrative: Text explaining the confidence calculation.
         recommendation_rationale: Step-by-step rule application trace.
+        agent_verdicts: Per-agent assessment verdicts (typed dict, not buried in text).
+        evaluation_pathway: Drug-disease relationship classification from retrieved data.
+        clinical_trial_status: Retrieval outcome — RETRIEVED, NOT_FOUND, or API_FAILURE.
+        top_citations: Formatted citation strings with PMID/DOI, title, type, ERW.
+        safety_breakdown: Safety signals by category (adverse events, interactions, etc.).
+        positive_factors: Explicit factors supporting the recommendation.
+        negative_factors: Explicit factors against or limiting the recommendation.
     """
 
     model_config = {"frozen": True}
 
-    summary: str = Field(..., description="LLM-generated executive summary.")
+    summary: str = Field(..., description="Executive summary of the evaluation.")
     key_supporting_claim_ids: list[str] = Field(default_factory=list)
     key_contradicting_claim_ids: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
     confidence_narrative: str = Field(default="")
     recommendation_rationale: str = Field(default="")
+    agent_verdicts: dict[str, str] = Field(
+        default_factory=dict,
+        description="Per-agent assessment verdicts keyed by agent name.",
+    )
+    evaluation_pathway: str = Field(
+        default="NOVEL_HYPOTHESIS",
+        description=(
+            "Classification inferred from retrieved ChEMBL indication data: "
+            "APPROVED_INDICATION | PHASE_III_INVESTIGATION | "
+            "PHASE_II_INVESTIGATION | PHASE_I_INVESTIGATION | NOVEL_HYPOTHESIS"
+        ),
+    )
+    clinical_trial_status: str = Field(
+        default="NOT_ATTEMPTED",
+        description=(
+            "Clinical trial data retrieval outcome: "
+            "RETRIEVED (trials found), NOT_FOUND (query succeeded, 0 results), "
+            "API_FAILURE (endpoint error), NOT_ATTEMPTED."
+        ),
+    )
+    top_citations: list[str] = Field(
+        default_factory=list,
+        description="Formatted citation strings: PMID/DOI, title, evidence type, ERW.",
+    )
+    safety_breakdown: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Safety signals by category from ClinicalSafetyAgent: "
+            "adverse_events, drug_interactions, population_restrictions, "
+            "hepatotoxicity, cardiotoxicity, nephrotoxicity signals."
+        ),
+    )
+    positive_factors: list[str] = Field(
+        default_factory=list,
+        description="Factors explicitly supporting the recommendation.",
+    )
+    negative_factors: list[str] = Field(
+        default_factory=list,
+        description="Factors against or limiting the recommendation.",
+    )
+
 
 
 class ReasoningResult(BaseModel):
