@@ -1,5 +1,9 @@
 """MasterOrchestrator — top-level coordinator of the CYNTHERA pipeline.
 
+Phase 3 enhanced with:
+- EvaluationCache: returns cached results for identical drug-disease-policy combos
+- KnowledgeStore shared instance passed to ReasoningOrchestrator
+
 Reference: 01_SYSTEM_ARCHITECTURE.md §3.3, 08_IMPLEMENTATION_GUIDE.md
 """
 from __future__ import annotations
@@ -7,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Optional
 
 from backend.core.domain.hypothesis import Hypothesis
 from backend.core.domain.drug import Drug
@@ -25,6 +28,7 @@ from backend.engineering.identity.resolution_service import IdentifierResolution
 from backend.engineering.retrieval.pipeline import RetrievalPipeline
 from backend.reasoning.orchestrator.reasoning_orchestrator import ReasoningOrchestrator
 from backend.storage.repository import StorageRepository
+from backend.infrastructure.cache.evaluation_cache import EvaluationCache
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +36,23 @@ logger = logging.getLogger(__name__)
 class MasterOrchestrator:
     """Top-level coordinator that manages the 10-step evaluation pipeline.
 
+    Phase 3 enhancements:
+    - Result caching: identical evaluations return cached results instantly
+    - KnowledgeStore shared through to ReasoningOrchestrator
+
     Coordinates:
-    1. Input validation
-    2. Identifier resolution
-    3. Parallel data retrieval
-    4. Data normalization (within retrieval pipeline)
-    5. Canonical domain model creation
-    6. Claim extraction (delegated to ReasoningOrchestrator)
-    7. Contradiction detection
-    8. 3D score computation
-    9. Recommendation rules
-    10. Report assembly
+    1. Cache lookup
+    2. Input validation
+    3. Identifier resolution
+    4. Parallel data retrieval
+    5. Data normalization (within retrieval pipeline)
+    6. Canonical domain model creation
+    7. Claim extraction (delegated to ReasoningOrchestrator)
+    8. Contradiction detection
+    9. 3D score computation
+    10. Recommendation rules
+    11. Report assembly
+    12. Cache storage
 
     Raises:
         DrugNotResolvedException: If drug name cannot be mapped to a standard ID.
@@ -56,6 +66,8 @@ class MasterOrchestrator:
         llm_api_key: str | None = None,
         llm_model: str = "gemini-1.5-flash",
         db_path: str = "data/cynthera.db",
+        cache_ttl_seconds: int = 86400,
+        use_cache: bool = True,
     ) -> None:
         """Initialize the MasterOrchestrator with all subsystem components.
 
@@ -63,15 +75,20 @@ class MasterOrchestrator:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
             llm_api_key: LLM API key for claim extraction.
             llm_model: LLM model name (default 'gemini-1.5-flash').
-            db_path: Path to SQLite database file for persisting evaluations.
+            db_path: Path to SQLite database file.
+            cache_ttl_seconds: Cache TTL in seconds (default 86400 = 24h).
+            use_cache: Whether to use the evaluation cache (default True).
         """
         self._resolver = IdentifierResolutionService(ncbi_api_key=ncbi_api_key)
         self._retrieval = RetrievalPipeline(ncbi_api_key=ncbi_api_key)
         self._reasoning = ReasoningOrchestrator(
             llm_api_key=llm_api_key,
             llm_model=llm_model,
+            db_path=db_path,
         )
         self._storage = StorageRepository(db_path=db_path)
+        self._cache = EvaluationCache(db_path=db_path, ttl_seconds=cache_ttl_seconds)
+        self._use_cache = use_cache
 
     async def evaluate(
         self,
@@ -79,14 +96,16 @@ class MasterOrchestrator:
         disease_name: str,
         policy: RetrievalPolicy = RetrievalPolicy.STANDARD,
         trace_id: uuid.UUID | None = None,
+        bypass_cache: bool = False,
     ) -> tuple[Hypothesis, RetrievalPackage, ReasoningResult]:
-        """Execute the full 10-step CYNTHERA evaluation pipeline.
+        """Execute the full CYNTHERA evaluation pipeline.
 
         Args:
             drug_name: Drug common name (e.g., 'Sildenafil').
             disease_name: Disease common name (e.g., 'Pulmonary Arterial Hypertension').
             policy: RetrievalPolicy controlling depth of data retrieval.
             trace_id: Optional trace ID for log correlation.
+            bypass_cache: If True, skip cache lookup (force re-evaluation).
 
         Returns:
             Tuple of (Hypothesis, RetrievalPackage, ReasoningResult).
@@ -108,7 +127,43 @@ class MasterOrchestrator:
             },
         )
 
-        # Step 1: Initialize Hypothesis
+        # ── Step 1: Cache lookup ──────────────────────────────────────────
+        if self._use_cache and not bypass_cache:
+            cached_result = self._cache.get(drug_name, disease_name, policy.value)
+            if cached_result is not None:
+                logger.info(
+                    "evaluation_cache_hit",
+                    extra={
+                        "drug": drug_name,
+                        "disease": disease_name,
+                        "hypothesis_id": str(cached_result.hypothesis_id),
+                    },
+                )
+                # Reconstruct a minimal Hypothesis and empty package for the cached result
+                hypothesis = Hypothesis(
+                    drug_name=drug_name,
+                    disease_name=disease_name,
+                    retrieval_policy=policy,
+                    trace_id=trace_id,
+                )
+                # Override with cached hypothesis ID
+                hypothesis = hypothesis.model_copy(
+                    update={"id": cached_result.hypothesis_id}
+                )
+                # Return minimal package — not re-retrieved
+                package = self._storage.get_retrieval_package(
+                    str(cached_result.hypothesis_id)
+                )
+                if package is None:
+                    # Cache hit but no package — proceed normally
+                    logger.info(
+                        "cache_hit_no_package",
+                        extra={"hypothesis_id": str(cached_result.hypothesis_id)},
+                    )
+                else:
+                    return hypothesis, package, cached_result
+
+        # ── Step 2: Initialize Hypothesis ────────────────────────────────
         hypothesis = Hypothesis(
             drug_name=drug_name,
             disease_name=disease_name,
@@ -117,7 +172,7 @@ class MasterOrchestrator:
         )
 
         try:
-            # Step 2: Identifier Resolution
+            # ── Step 3: Identifier Resolution ────────────────────────────
             logger.info("step_id_resolution", extra={"trace_id": str(trace_id)})
             drug_ids, disease_ids = await asyncio.gather(
                 self._resolver.resolve_drug(drug_name, trace_id),
@@ -130,17 +185,17 @@ class MasterOrchestrator:
             hypothesis.transition_to(HypothesisLifecycleState.ID_RESOLVED)
             self._storage.save_hypothesis(hypothesis)
 
-            # Step 3: Parallel Data Retrieval
+            # ── Step 4: Parallel Data Retrieval ──────────────────────────
             logger.info("step_retrieval", extra={"trace_id": str(trace_id)})
             package = await self._retrieval.execute(drug, disease, hypothesis.id)
             hypothesis.transition_to(HypothesisLifecycleState.DATA_RETRIEVED)
             self._storage.save_hypothesis(hypothesis)
             self._storage.save_retrieval_package(package)
 
-            # Step 4–5: Normalization is embedded in the retrieval pipeline
+            # ── Step 5–6: Normalization embedded in retrieval pipeline ────
             hypothesis.transition_to(HypothesisLifecycleState.NORMALIZED)
 
-            # Steps 6–9: Full reasoning pipeline
+            # ── Steps 7–11: Full reasoning pipeline ──────────────────────
             logger.info("step_reasoning", extra={"trace_id": str(trace_id)})
             result = await self._reasoning.reason(package)
             hypothesis.transition_to(HypothesisLifecycleState.EVALUATED)
@@ -148,6 +203,10 @@ class MasterOrchestrator:
 
             hypothesis.transition_to(HypothesisLifecycleState.COMPLETED)
             self._storage.save_hypothesis(hypothesis)
+
+            # ── Step 12: Cache the result ─────────────────────────────────
+            if self._use_cache:
+                self._cache.set(drug_name, disease_name, result, policy.value)
 
             logger.info(
                 "evaluation_complete",

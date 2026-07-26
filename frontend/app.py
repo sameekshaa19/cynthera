@@ -1,7 +1,9 @@
-"""CYNTHERA — Streamlit MVP Frontend.
+"""CYNTHERA — Streamlit Frontend (Phase 2 & 3 Enhanced).
 
-Provides the main interactive UI for drug repurposing hypothesis evaluation.
-Pages: Evaluate, Results, Audit Report, History.
+Phase 2 additions: Safety profile display, prior knowledge indicator,
+                   mechanistic path visualization.
+Phase 3 additions: API key configuration, bypass_cache option,
+                   PDF download button, cache stats display.
 """
 import asyncio
 import sys
@@ -337,7 +339,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigation",
-        ["🔬 Evaluate", "📊 Results", "📋 Audit Report", "🕐 History"],
+        ["🔬 Evaluate", "📊 Results", "📋 Audit Report", "🕐 History", "⚡ Batch"],
         index=0,
         label_visibility="collapsed",
     )
@@ -348,9 +350,25 @@ with st.sidebar:
         ["STANDARD", "FAST", "COMPREHENSIVE"],
         help="Controls depth and scope of data retrieval",
     )
+    bypass_cache = st.checkbox(
+        "Bypass Cache",
+        value=False,
+        help="Force a fresh evaluation, ignoring any cached results",
+    )
+    st.markdown("---")
+    st.markdown("**API Key**")
+    api_key_input = st.text_input(
+        "LLM API Key",
+        type="password",
+        value=os.environ.get("LLM_API_KEY", "") or os.environ.get("GEMINI_API_KEY", ""),
+        help="Gemini or LLM API key for claim extraction",
+        key="sidebar_api_key",
+    )
+    if api_key_input:
+        os.environ["LLM_API_KEY"] = api_key_input
     st.markdown("---")
     st.markdown(
-        "<small style='color: #64748b;'>CYNTHERA v1.0 | Rule Set v1.0</small>",
+        "<small style='color: #64748b;'>CYNTHERA v2.0 | Rule Set v2.0</small>",
         unsafe_allow_html=True,
     )
 
@@ -421,6 +439,7 @@ if page == "🔬 Evaluate":
                             drug_name,
                             disease_name,
                             policy=policy_map.get(policy, RetrievalPolicy.STANDARD),
+                            bypass_cache=bypass_cache,
                         )
                     )
                     loop.close()
@@ -566,6 +585,44 @@ elif page == "📊 Results":
                 </div>
                 """, unsafe_allow_html=True)
 
+        # ── Phase 2: Safety Profile Display ──────────────────────────
+        result_obj = r["result"]
+        audit = result_obj.audit_report
+        safety_grade_in_summary = ""
+        for marker in ["Safety grade: A", "Safety grade: B", "Safety grade: C", "Safety grade: D"]:
+            if marker in audit.summary:
+                safety_grade_in_summary = marker.split(": ")[1]
+                break
+
+        if safety_grade_in_summary:
+            st.markdown("### 🛡️ Clinical Safety Profile")
+            grade = safety_grade_in_summary
+            grade_color = {"A": "#10b981", "B": "#3b82f6", "C": "#f59e0b", "D": "#ef4444"}.get(grade, "#64748b")
+            grade_desc = {
+                "A": "Strong clean safety record",
+                "B": "Acceptable safety profile",
+                "C": "Moderate concerns — monitoring recommended",
+                "D": "Significant safety concerns",
+            }.get(grade, "Unknown")
+            st.markdown(f"""
+            <div class="info-panel" style="border-left: 4px solid {grade_color};">
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <div style="font-size: 2rem; font-weight: 700; color: {grade_color}; font-family: 'Space Grotesk', sans-serif;">Grade {grade}</div>
+                    <div>
+                        <div style="font-weight: 600; color: {grade_color};">{grade_desc}</div>
+                        <div style="color: #94a3b8; font-size: 0.85rem; margin-top: 0.25rem;">Safety grade from ClinicalSafetyAgent analysis</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Phase 2: Prior Knowledge Indicator ────────────────────────
+        if "established precedent" in audit.summary.lower():
+            st.success("✅ **Prior Knowledge:** Established repurposing precedent found in the knowledge base.")
+        elif "novel hypothesis" in audit.summary.lower() or "Prior knowledge" in audit.summary:
+            st.info("💡 **Prior Knowledge:** Novel repurposing hypothesis — no established precedent found.")
+
+
 # ─────────────────────────────────────────────
 # Page: Audit Report
 # ─────────────────────────────────────────────
@@ -629,6 +686,37 @@ elif page == "📋 Audit Report":
         with col_c:
             st.metric("Completed At", result.completed_at.strftime("%Y-%m-%d %H:%M UTC"))
 
+        # ── Phase 3: PDF Download ─────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📄 Export Report")
+        col_pdf, col_txt = st.columns(2)
+
+        with col_pdf:
+            try:
+                from backend.reporting.pdf_exporter import PDFReporter
+                reporter = PDFReporter(
+                    drug_name=r['drug'],
+                    disease_name=r['disease'],
+                )
+                pdf_bytes = reporter.generate(result)
+                is_pdf = pdf_bytes[:4] == b"%PDF"
+                mime = "application/pdf" if is_pdf else "text/plain"
+                ext = "pdf" if is_pdf else "txt"
+                filename = f"CYNTHERA_{r['drug']}_{r['disease']}.{ext}".replace(" ", "_")
+
+                st.download_button(
+                    label=f"{'📄 Download PDF Report' if is_pdf else '📝 Download Text Report'}",
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime=mime,
+                    use_container_width=True,
+                )
+                if not is_pdf:
+                    st.caption("Install `reportlab` for full PDF support: `pip install reportlab`")
+            except Exception as exc:
+                st.warning(f"Report export unavailable: {exc}")
+
+
 # ─────────────────────────────────────────────
 # Page: History
 # ─────────────────────────────────────────────
@@ -682,3 +770,83 @@ elif page == "🕐 History":
                 file_name="cynthera_history.csv",
                 mime="text/csv",
             )
+
+# ─────────────────────────────────────────────
+# Page: Batch Evaluation (Phase 3)
+# ─────────────────────────────────────────────
+elif page == "⚡ Batch":
+    st.markdown("## ⚡ Batch Evaluation")
+    st.markdown(
+        "<p style='color: #94a3b8;'>Submit multiple drug-disease pairs for parallel evaluation. "
+        "Results are processed asynchronously in the background.</p>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### 📝 Enter Batch Items")
+    st.markdown("One item per line, format: `DrugName | DiseaseName`")
+
+    batch_input = st.text_area(
+        "Drug-Disease Pairs",
+        height=200,
+        placeholder="Sildenafil | Pulmonary Arterial Hypertension\nMetformin | Cancer\nAspirin | Colorectal Cancer",
+        label_visibility="collapsed",
+    )
+
+    col_b1, col_b2, _ = st.columns([1, 1, 2])
+    with col_b1:
+        batch_policy = st.selectbox("Policy", ["STANDARD", "FAST", "COMPREHENSIVE"], key="batch_policy")
+    with col_b2:
+        submit_batch_btn = st.button("🚀 Submit Batch", use_container_width=True)
+
+    if submit_batch_btn:
+        if not batch_input.strip():
+            st.error("Please enter at least one drug-disease pair.")
+        else:
+            items = []
+            errors = []
+            for line in batch_input.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if "|" not in line:
+                    errors.append(f"Invalid format: '{line}' (expected 'Drug | Disease')")
+                    continue
+                parts = line.split("|", 1)
+                drug = parts[0].strip()
+                disease = parts[1].strip()
+                if drug and disease:
+                    items.append({"drug_name": drug, "disease_name": disease, "retrieval_policy": batch_policy})
+
+            if errors:
+                for err in errors:
+                    st.warning(err)
+
+            if items:
+                try:
+                    from backend.storage.batch_repository import BatchRepository
+                    repo = BatchRepository(db_path="data/cynthera.db")
+                    batch_id = repo.create_batch(items)
+                    st.success(f"✅ Batch submitted! **Batch ID:** `{batch_id}`")
+                    st.info(
+                        f"Processing {len(items)} item(s) in the background. "
+                        f"Use the API endpoint `GET /api/v1/batch/{batch_id}` to check progress, "
+                        f"or poll `GET /api/v1/batch/{batch_id}/results` for results."
+                    )
+                    st.code(f"Batch ID: {batch_id}", language="text")
+                except Exception as exc:
+                    st.error(f"Failed to submit batch: {exc}")
+
+    st.markdown("---")
+    st.markdown("### 📋 Recent Batches")
+    try:
+        from backend.storage.batch_repository import BatchRepository
+        repo = BatchRepository(db_path="data/cynthera.db")
+        batches = repo.list_batches(limit=10)
+        if batches:
+            import pandas as pd
+            batch_df = pd.DataFrame(batches)
+            st.dataframe(batch_df[["batch_id", "status", "total_items", "completed_items", "failed_items", "created_at"]], use_container_width=True)
+        else:
+            st.info("No batch jobs yet.")
+    except Exception as exc:
+        st.warning(f"Could not load batch history: {exc}")

@@ -315,26 +315,55 @@ class DiseaseRelevanceAgent:
         self,
         pathways: List,
         disease_genes: List[str],
-        drug_targets: List[str]
+        drug_targets: List[str],
+        literature_count: int = 0,
     ) -> float:
-        """Calculate overall relevance score."""
-        if not pathways:
-            return 0.3  # Low baseline if no pathways
-        
-        # Average pathway relevance scores
-        pathway_scores = [p.relevance_score for p in pathways if p.relevance_score is not None]
-        
+        """Calculate overall relevance score using multiple signals.
+
+        Scoring contributions:
+        - Gene overlap (drug targets ∩ disease genes): up to 0.50
+        - Pathway relevance average: up to 0.30
+        - Literature signal (PubMed hits): up to 0.20
+
+        Falls back to literature-only score when no pathway/gene data is available.
+        """
+        score = 0.0
+
+        # Signal 1: Gene overlap — drug targets that appear in disease genes (most reliable)
+        if disease_genes and drug_targets:
+            disease_gene_set = {g.upper() for g in disease_genes}
+            drug_target_set = {t.upper() for t in drug_targets if t}
+            overlap = disease_gene_set & drug_target_set
+            # Jaccard-style: overlap / union, capped at 0.50
+            if drug_target_set:
+                gene_overlap_score = min(len(overlap) / len(drug_target_set), 1.0) * 0.50
+                score += gene_overlap_score
+                if overlap:
+                    logger.info(
+                        f"Gene overlap: {len(overlap)} shared genes "
+                        f"({', '.join(list(overlap)[:5])}) → +{gene_overlap_score:.2f}"
+                    )
+
+        # Signal 2: Pathway relevance
+        pathway_scores = [
+            p.relevance_score for p in pathways
+            if p.relevance_score is not None and p.relevance_score > 0
+        ]
         if pathway_scores:
-            avg_score = sum(pathway_scores) / len(pathway_scores)
-        else:
-            avg_score = 0.3
-        
-        # Boost if we have disease genes
-        if disease_genes:
-            avg_score = min(avg_score * 1.2, 1.0)
-        
-        return round(avg_score, 2)
-    
+            avg_pathway_score = (sum(pathway_scores) / len(pathway_scores)) * 0.30
+            score += avg_pathway_score
+
+        # Signal 3: Literature signal — PubMed hits for drug+disease (up to 0.20)
+        if literature_count > 0:
+            lit_score = min(literature_count / 10.0, 1.0) * 0.20
+            score += lit_score
+
+        # Minimum floor: 0.10 if any data was retrieved at all
+        if (disease_genes or drug_targets or literature_count > 0) and score < 0.10:
+            score = 0.10
+
+        return round(min(score, 1.0), 2)
+
     def _generate_rationale(
         self,
         disease_name: str,

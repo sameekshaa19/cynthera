@@ -376,43 +376,55 @@ class MoAEnumerationAgent:
     
     def _map_targets_to_pathways(self, targets: List[Target]) -> List[Pathway]:
         """Map drug targets to biological pathways.
-        
-        Strategy:
-        1. If target has UniProt accession -> use get_pathways_by_uniprot (most reliable)
-        2. Else if target has gene_symbol -> use get_pathways_by_gene (search fallback)
-        3. Else skip
+
+        Strategy (in order of reliability):
+        1. If target has gene_symbol → use get_pathways_by_gene (proven to work)
+        2. If target has uniprot_id but no gene_symbol → try get_pathways_by_uniprot
+        3. If neither → SKIP (target.name is a mechanism description, not an ID)
+
+        The /pathways/low/entity/{uniprot}/allForms endpoint 404s reliably in
+        the current Reactome API. Gene search is the working primary path.
         """
         pathways = []
-        
+
         for target in targets:
-            gene_symbol = target.gene_symbol or target.name
-            uniprot_id = target.uniprot_id
-            
+            gene_symbol = target.gene_symbol   # e.g. "ADRB1", "PDE5A"
+            uniprot_id = target.uniprot_id     # e.g. "P08588"
+
+            # GUARD: Never pass mechanism descriptions to Reactome
+            if not gene_symbol and not uniprot_id:
+                logger.warning(
+                    f"Skipping Reactome lookup for '{target.name}': "
+                    f"no gene_symbol or uniprot_id available"
+                )
+                continue
+
             try:
                 pathway_data = []
-                
-                # Primary: UniProt accession (Reactome entity endpoint)
-                if uniprot_id:
+
+                # Primary: gene symbol search (confirmed working)
+                if gene_symbol:
                     logger.info(
-                        f"Looking up Reactome pathways via UniProt: {uniprot_id} "
-                        f"(target: {target.name}, gene: {gene_symbol})"
+                        f"Looking up Reactome pathways via gene symbol: {gene_symbol} "
+                        f"(target: {target.name})"
+                    )
+                    pathway_data = self.reactome.get_pathways_by_gene(gene_symbol)
+
+                # Fallback: UniProt entity lookup (may 404, handled gracefully)
+                if not pathway_data and uniprot_id:
+                    logger.info(
+                        f"Gene search empty, trying UniProt entity: {uniprot_id} "
+                        f"(target: {target.name})"
                     )
                     pathway_data = self.reactome.get_pathways_by_uniprot(uniprot_id)
-                
-                # Fallback: gene symbol search
-                if not pathway_data and target.gene_symbol:
-                    logger.info(
-                        f"UniProt lookup empty, falling back to gene search: {target.gene_symbol}"
-                    )
-                    pathway_data = self.reactome.get_pathways_by_gene(target.gene_symbol)
-                
+
                 if not pathway_data:
                     logger.warning(
                         f"No Reactome pathways found for target '{target.name}' "
-                        f"(uniprot={uniprot_id}, gene={target.gene_symbol})"
+                        f"(gene={gene_symbol}, uniprot={uniprot_id})"
                     )
                     continue
-                
+
                 for pw_item in pathway_data:
                     pathway = Pathway(
                         name=pw_item.get('displayName', 'Unknown pathway'),
@@ -422,21 +434,21 @@ class MoAEnumerationAgent:
                             pw_item.get('summation', [{}])[0].get('text', '')
                             if pw_item.get('summation') else ''
                         ),
-                        genes=[target.gene_symbol or target.name]
+                        genes=[gene_symbol or uniprot_id]
                     )
                     pathways.append(pathway)
-                
+
                 logger.info(
                     f"Found {len(pathway_data)} pathways for {target.name} "
-                    f"(gene={target.gene_symbol}, uniprot={uniprot_id})"
+                    f"(gene={gene_symbol}, uniprot={uniprot_id})"
                 )
-            
+
             except Exception as e:
                 logger.error(
                     f"Error mapping target {target.name} "
-                    f"(gene={target.gene_symbol}, uniprot={uniprot_id}) to pathways: {e}"
+                    f"(gene={gene_symbol}, uniprot={uniprot_id}) to pathways: {e}"
                 )
-        
+
         # Deduplicate pathways by pathway_id
         unique_pathways: Dict[str, Pathway] = {}
         for pw in pathways:
@@ -448,11 +460,11 @@ class MoAEnumerationAgent:
                 existing_genes = set(unique_pathways[key].genes)
                 existing_genes.update(pw.genes)
                 unique_pathways[key].genes = list(existing_genes)
-        
+
         result = list(unique_pathways.values())
         logger.info(f"Total unique pathways mapped: {len(result)}")
         return result
-    
+
     def _generate_moa_chains(
         self,
         drug_name: str,

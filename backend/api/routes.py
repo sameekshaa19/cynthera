@@ -43,10 +43,14 @@ class EvaluationRequest(BaseModel):
         pattern="^(STANDARD|FAST|COMPREHENSIVE)$",
         description="Retrieval depth: STANDARD, FAST, or COMPREHENSIVE.",
     )
+    bypass_cache: bool = Field(
+        default=False,
+        description="If true, skip cache lookup and force a fresh evaluation.",
+    )
 
 
 class EvaluationSummaryResponse(BaseModel):
-    """Lightweight response returned immediately after submitting an evaluation."""
+    """Lightweight response returned after submitting an evaluation."""
     hypothesis_id: str
     drug_name: str
     disease_name: str
@@ -59,6 +63,8 @@ class EvaluationSummaryResponse(BaseModel):
     sources_failed: list[str]
     summary: str
     duration_ms: float
+    from_cache: bool = False
+    rule_set_version: str = "2.0"
 
 
 class HealthResponse(BaseModel):
@@ -66,6 +72,8 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     db_path: str
+    phase: str = "Phase 2 & 3"
+    features: list[str] = []
 
 
 # ─────────────────────────────────────────────
@@ -103,6 +111,7 @@ async def evaluate(request: EvaluationRequest) -> EvaluationSummaryResponse:
             drug_name=request.drug_name,
             disease_name=request.disease_name,
             policy=policy_map.get(request.retrieval_policy, RetrievalPolicy.STANDARD),
+            bypass_cache=request.bypass_cache,
         )
     except Exception as exc:
         logger.error("evaluate_endpoint_failed", extra={"error": str(exc)}, exc_info=True)
@@ -116,11 +125,12 @@ async def evaluate(request: EvaluationRequest) -> EvaluationSummaryResponse:
         support_score=result.support_assessment.score,
         mechanistic_score=result.mechanistic_assessment.score,
         risk_score=result.risk_assessment.score,
-        retrieval_confidence=package.retrieval_confidence,
-        sources_queried=package.sources_queried,
-        sources_failed=package.sources_failed,
+        retrieval_confidence=package.retrieval_confidence if package else "CACHED",
+        sources_queried=package.sources_queried if package else [],
+        sources_failed=package.sources_failed if package else [],
         summary=result.audit_report.summary,
         duration_ms=result.reasoning_duration_ms,
+        rule_set_version=result.rule_set_version,
     )
 
 

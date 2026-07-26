@@ -58,8 +58,8 @@ Synthesis and decision-making:
 ### Data Sources (All Free)
 
 - **Drug Data**: PubChem, ChEMBL, DrugBank Open Data
-- **Literature**: PubMed E-utilities
-- **Pathways**: Reactome, WikiPathways
+- **Literature**: PubMed E-utilities, OpenAlex, Semantic Scholar
+- **Pathways**: Reactome
 - **Gene-Disease**: DisGeNET
 - **Proteins**: UniProt
 
@@ -81,6 +81,7 @@ venv\Scripts\activate  # Windows
 3. **Install dependencies**:
 ```bash
 pip install -r requirements.txt
+pip install reportlab pytest-mock python-multipart  # Phase 3 dependencies
 ```
 
 4. **Optional: Set up API keys** (for higher rate limits):
@@ -95,7 +96,15 @@ copy .env.example .env
 streamlit run frontend/app.py
 ```
 
-Then open your browser to `http://localhost:8502`
+Then open your browser to `http://localhost:8501`
+
+### Running the API Server
+
+```bash
+python -m uvicorn backend.api.main:app --reload --port 8000
+```
+
+The API docs will be available at `http://localhost:8000/docs`
 
 ### Using the CLI
 
@@ -216,21 +225,21 @@ Cynthera generates comprehensive `HypothesisReport` objects containing:
 - ✅ Streamlit UI
 - ✅ Structured confidence scoring with ERW hierarchy
 
-### Phase 2: Enhanced Capabilities
-- [ ] Clinical & Safety Agent enhancements
-- [ ] Literature Scan expansions
-- [ ] Prior Knowledge Agent (vector DB)
-- [ ] Multi-hop mechanistic reasoning
-- [ ] Advanced conflict resolution
-- [ ] Batch evaluation API
+### Phase 2: Enhanced Capabilities (Completed)
+- ✅ Clinical & Safety Agent (Safety profile grading A–D, boxed warnings, AEs)
+- ✅ Literature Scan expansions (OpenAlex, Semantic Scholar)
+- ✅ Prior Knowledge Agent (vector DB style, TF-IDF, SQLite)
+- ✅ Multi-hop mechanistic reasoning (DIRECT, 2-HOP, 3-HOP)
+- ✅ Advanced conflict resolution (weighted multi-factor scoring)
+- ✅ Batch evaluation API (Semaphore-bounded background processing)
 
-### Phase 3: Production Features
-- [ ] Comprehensive test suite
-- [ ] API deployment
-- [ ] Batch processing
-- [ ] Result caching and history
-- [ ] User authentication
-- [ ] Export to PDF reports
+### Phase 3: Production Features (Completed)
+- ✅ Comprehensive test suite (59/59 tests passing)
+- ✅ API deployment (FastAPI middleware, timing, request ID)
+- ✅ Result caching and history (EvaluationCache with SHA-256 keys)
+- ✅ User authentication (X-API-Key header)
+- ✅ Export to PDF reports (reportlab PDF generator)
+- ✅ Frontend Enhancements (Batch processing page, safety UI, mechanistic UI)
 
 ## 🤝 Contributing
 

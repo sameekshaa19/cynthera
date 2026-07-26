@@ -28,6 +28,13 @@ from backend.engineering.retrieval.connectors.pubmed import PubMedConnector
 from backend.engineering.retrieval.connectors.reactome import ReactomeConnector
 from backend.engineering.retrieval.connectors.clinicaltrials import ClinicalTrialsConnector
 from backend.engineering.retrieval.connectors.disgenet import DisGeNETConnector
+# Phase 2: Extended literature sources
+try:
+    from backend.engineering.retrieval.connectors.openalex import OpenAlexConnector
+    from backend.engineering.retrieval.connectors.semantic_scholar import SemanticScholarConnector
+    _EXTENDED_SOURCES_AVAILABLE = True
+except ImportError:
+    _EXTENDED_SOURCES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +109,7 @@ class RetrievalPipeline:
         # Extract unique UniProt IDs from targets to fetch in Phase 2
         uniprot_ids = list(set(t.protein_uniprot for t in targets if t.protein_uniprot))
 
-        # --- Phase 2: Parallel Fetch ---
+        # --- Phase 2: Parallel Fetch (core sources) ---
         results = await asyncio.gather(
             self._fetch_uniprot(uniprot_ids),
             self._fetch_pubmed(drug.name, disease.name),
@@ -113,6 +120,25 @@ class RetrievalPipeline:
         )
 
         uniprot_data, pubmed_data, reactome_data, trials_data, disgenet_data = results
+
+        # --- Phase 2 Extended: OpenAlex + Semantic Scholar (non-critical) ---
+        if _EXTENDED_SOURCES_AVAILABLE:
+            ext_results = await asyncio.gather(
+                self._fetch_openalex(drug.name, disease.name, hypothesis_id),
+                self._fetch_semantic_scholar(drug.name, disease.name, hypothesis_id),
+                return_exceptions=True,
+            )
+            openalex_ev, s2_ev = ext_results
+            if isinstance(openalex_ev, list) and openalex_ev:
+                sources_queried.append("openalex")
+                evidence_records.extend(openalex_ev)
+            elif isinstance(openalex_ev, Exception):
+                logger.debug("openalex_failed", extra={"error": str(openalex_ev)})
+            if isinstance(s2_ev, list) and s2_ev:
+                sources_queried.append("semantic_scholar")
+                evidence_records.extend(s2_ev)
+            elif isinstance(s2_ev, Exception):
+                logger.debug("semantic_scholar_failed", extra={"error": str(s2_ev)})
 
         # Process UniProt proteins
         if isinstance(uniprot_data, Exception):
@@ -557,6 +583,30 @@ class RetrievalPipeline:
                 logger.debug("disgenet_parse_error", extra={"error": str(exc)})
                 continue
         return evidence
+
+    async def _fetch_openalex(
+        self,
+        drug_name: str,
+        disease_name: str,
+        hypothesis_id: uuid.UUID,
+    ) -> list[Evidence]:
+        """Fetch literature from OpenAlex (Phase 2 extended source)."""
+        if not _EXTENDED_SOURCES_AVAILABLE:
+            return []
+        connector = OpenAlexConnector()
+        return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
+
+    async def _fetch_semantic_scholar(
+        self,
+        drug_name: str,
+        disease_name: str,
+        hypothesis_id: uuid.UUID,
+    ) -> list[Evidence]:
+        """Fetch literature from Semantic Scholar (Phase 2 extended source)."""
+        if not _EXTENDED_SOURCES_AVAILABLE:
+            return []
+        connector = SemanticScholarConnector()
+        return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
 
     def _compute_confidence(
         self,

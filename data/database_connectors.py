@@ -82,22 +82,58 @@ class PubChemConnector(BaseConnector):
     
     def get_compound_targets(self, cid: int) -> List[Dict[str, Any]]:
         """
-        Get protein targets for a compound.
-        
+        Get protein targets for a compound via PubChem BioAssay API.
+
+        NOTE: The old /targets/ProteinGI,ProteinName/JSON endpoint was
+        deprecated and returns 400. We now use the BioAssay search endpoint
+        to find assays that mention this CID, then extract ProteinName
+        annotations from those assays.
+
         Args:
             cid: PubChem Compound ID
-        
+
         Returns:
-            List of target data
+            List of target dicts with keys 'ProteinName', 'GeneSymbol'
         """
-        url = f"{self.base_url}/compound/cid/{cid}/targets/ProteinGI,ProteinName/JSON"
         logger.info(f"Fetching targets for PubChem CID: {cid}")
-        data = self._make_request(url)
-        
-        if data and 'InformationList' in data:
-            return data['InformationList'].get('Information', [])
-        return []
-    
+
+        # Step 1: Find assay IDs that contain this CID (active results)
+        assay_url = f"{self.base_url}/compound/cid/{cid}/assaysummary/JSON"
+        assay_data = self._make_request(assay_url, rate_limit=2)
+
+        targets = []
+        if not assay_data or 'Table' not in assay_data:
+            logger.info(f"No PubChem bioassay data for CID {cid}")
+            return []
+
+        table = assay_data['Table']
+        columns = table.get('Columns', {}).get('Column', [])
+        rows = table.get('Row', [])
+
+        # Find column indices
+        try:
+            target_gi_col = columns.index('ProteinTargetGIList') if 'ProteinTargetGIList' in columns else None
+            target_name_col = columns.index('ProteinTargetList') if 'ProteinTargetList' in columns else None
+            outcome_col = columns.index('ActivityOutcomeMethod') if 'ActivityOutcomeMethod' in columns else None
+        except (ValueError, AttributeError):
+            logger.info(f"No protein target columns in PubChem assay table for CID {cid}")
+            return []
+
+        seen_proteins = set()
+        for row in rows[:50]:  # Limit to first 50 assays
+            cells = row.get('Cell', [])
+            if target_name_col is not None and target_name_col < len(cells):
+                protein_name = cells[target_name_col]
+                if protein_name and protein_name not in seen_proteins:
+                    seen_proteins.add(protein_name)
+                    targets.append({'ProteinName': protein_name})
+
+        if targets:
+            logger.info(f"Found {len(targets)} targets from PubChem BioAssay for CID {cid}")
+        else:
+            logger.info(f"No protein targets in PubChem BioAssay for CID {cid}")
+        return targets
+
     def get_compound_properties(self, cid: int) -> Optional[Dict[str, Any]]:
         """
         Get compound properties (molecular weight, SMILES, etc.).

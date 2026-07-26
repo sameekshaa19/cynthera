@@ -1,5 +1,5 @@
 # CYNTHERA — Python Dependencies
-# Aligned to 08_IMPLEMENTATION_GUIDE.md §2.1
+# Phase 2 & 3 Enhanced — aligned to 08_IMPLEMENTATION_GUIDE.md
 
 # Core
 pydantic>=2.0.0
@@ -13,6 +13,7 @@ httpx>=0.27.0
 # Web Framework
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # Form data support for FastAPI
 
 # LLM (Google Gemini)
 google-generativeai>=0.5.0
@@ -28,14 +29,21 @@ tenacity>=8.2.0
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
 
 # Utilities
 tqdm>=4.66.0
 
-# Optional (future phases):
-# sqlalchemy>=2.0.0        # Phase 3: Database layer
-# asyncpg>=0.29.0          # Phase 3: PostgreSQL async driver
-# alembic>=1.13.0          # Phase 3: Migrations
-# redis>=5.0.0             # Phase 2: Distributed cache
-# structlog>=24.0.0        # Production: structured logging
+# Phase 3: PDF Report Generation
+# Install with: pip install reportlab
+reportlab>=4.0.0
+
+# Phase 3: Structured logging (optional, improves log readability)
+# structlog>=24.0.0
+
+# Future / Optional:
+# sqlalchemy>=2.0.0        # Future: PostgreSQL migration
+# asyncpg>=0.29.0          # Future: PostgreSQL async driver
+# alembic>=1.13.0          # Future: Migrations
+# redis>=5.0.0             # Future: Distributed cache
 # prometheus-client>=0.20.0 # Production: metrics
