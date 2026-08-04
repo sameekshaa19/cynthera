@@ -15,12 +15,15 @@ import logging
 import os
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.engineering.orchestrator.master_orchestrator import MasterOrchestrator
 from backend.core.enums.retrieval_policy import RetrievalPolicy
 from backend.storage.batch_repository import BatchRepository
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,8 @@ async def _process_batch(batch_id: str, items: list[BatchItem]) -> None:
             try:
                 orchestrator = MasterOrchestrator(
                     llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
+                    ncbi_api_key=os.environ.get("NCBI_API_KEY"),
+                    disgenet_api_key=os.environ.get("DISGENET_API_KEY"),
                     db_path=_DB_PATH,
                 )
                 policy = policy_map.get(item_data["retrieval_policy"], RetrievalPolicy.STANDARD)

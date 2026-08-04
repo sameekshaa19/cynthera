@@ -26,10 +26,12 @@ def _make_target(uniprot_id: str = "P12345", name: str = "TestTarget", conf: flo
     return t
 
 
-def _make_protein(uniprot_id: str = "P12345", gene_symbol: str = "TGENE"):
+def _make_protein(uniprot_id: str = "P12345", gene_symbol: str = "TGENE", organism: str = "Homo sapiens", is_reviewed: bool = True):
     p = MagicMock()
     p.uniprot_accession = uniprot_id
     p.gene_symbol = gene_symbol
+    p.organism = organism
+    p.is_reviewed = is_reviewed
     return p
 
 
@@ -37,6 +39,7 @@ def _make_pathway(reactome_id: str = "R-HSA-001", name: str = "TestPathway"):
     pw = MagicMock()
     pw.reactome_id = reactome_id
     pw.name = name
+    pw.participant_uniprot_ids = []
     return pw
 
 
@@ -53,7 +56,10 @@ def _make_package(
     package.disease.name = disease_name
     package.targets = targets or []
     package.pathways = pathways or []
+    if proteins is None and targets:
+        proteins = [_make_protein(uniprot_id=t.protein_uniprot) for t in targets]
     package.proteins = proteins or []
+    package.evidence_records = []
     return package
 
 

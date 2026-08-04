@@ -9,8 +9,12 @@ import asyncio
 import sys
 import os
 
+from dotenv import load_dotenv
+
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+load_dotenv()
 
 import streamlit as st
 
@@ -273,6 +277,7 @@ def render_score_card(
     level: str,
     color: str,
     icon: str,
+    degraded: bool = False,
 ) -> None:
     """Render a score card widget.
 
@@ -282,12 +287,22 @@ def render_score_card(
         level: Categorical level string.
         color: Hex color for the score value.
         icon: Emoji icon.
+        degraded: If True, show a warning that this score is based on
+            incomplete input due to retrieval failures. The score is
+            still displayed -- it is not suppressed -- but the user is
+            explicitly told it may not reflect the full evidence picture.
     """
     level_colors = {
         "HIGH": "#10b981", "MEDIUM": "#f59e0b",
         "LOW": "#ef4444", "NONE": "#64748b",
     }
     badge_color = level_colors.get(level.upper(), "#64748b")
+    degraded_html = (
+        '<div style="margin-top: 0.5rem; font-size: 0.7rem; color: #f59e0b; '
+        'border: 1px solid #f59e0b44; background: #f59e0b11; padding: 0.2rem 0.4rem; '
+        'border-radius: 4px; text-align: center;">'
+        '⚠ DATA DEGRADED — retrieval failures above</div>'
+    ) if degraded else ""
     st.markdown(f"""
     <div class="score-card">
         <div style="font-size: 1.5rem; margin-bottom: 0.5rem;">{icon}</div>
@@ -296,6 +311,7 @@ def render_score_card(
         <div class="score-level" style="background: {badge_color}22; color: {badge_color}; border: 1px solid {badge_color}55;">
             {level}
         </div>
+        {degraded_html}
     </div>
     """, unsafe_allow_html=True)
 
@@ -355,17 +371,6 @@ with st.sidebar:
         value=False,
         help="Force a fresh evaluation, ignoring any cached results",
     )
-    st.markdown("---")
-    st.markdown("**API Key**")
-    api_key_input = st.text_input(
-        "LLM API Key",
-        type="password",
-        value=os.environ.get("LLM_API_KEY", "") or os.environ.get("GEMINI_API_KEY", ""),
-        help="Gemini or LLM API key for claim extraction",
-        key="sidebar_api_key",
-    )
-    if api_key_input:
-        os.environ["LLM_API_KEY"] = api_key_input
     st.markdown("---")
     st.markdown(
         "<small style='color: #64748b;'>CYNTHERA v2.0 | Rule Set v2.0</small>",
@@ -430,6 +435,8 @@ if page == "🔬 Evaluate":
 
                     orchestrator = MasterOrchestrator(
                         llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
+                        ncbi_api_key=os.environ.get("NCBI_API_KEY"),
+                        disgenet_api_key=os.environ.get("DISGENET_API_KEY"),
                     )
 
                     loop = asyncio.new_event_loop()
@@ -501,7 +508,63 @@ elif page == "📊 Results":
         # Recommendation badge
         render_recommendation_badge(result.recommendation_status.value)
 
-        # Score cards
+        # -- Retrieval Errors panel (rendered BEFORE scores so the user
+        # sees the context before interpreting numbers) ------------------
+        failures = getattr(result, "data_source_failures", [])
+        extraction_method = getattr(result, "claim_extraction_method", "unknown")
+
+        if failures:
+            st.markdown("### ⚠️ Retrieval Errors — Scores Are Based on Incomplete Data")
+            st.markdown(
+                '<div style="border: 1px solid #ef4444; border-radius: 8px; '
+                'padding: 1rem; background: #ef444408; margin-bottom: 1rem;">'
+                '<div style="color: #ef4444; font-weight: 700; margin-bottom: 0.75rem; font-size: 0.95rem;">'
+                'The following data sources failed during retrieval. '
+                'Each failure is listed with its impact on scoring. '
+                'Scores reflect whatever data WAS retrieved — they are NOT averages or defaults.</div>',
+                unsafe_allow_html=True,
+            )
+            for failure in failures:
+                source_name, _, rest = failure.partition(" -- ")
+                st.markdown(
+                    f'<div style="display: flex; gap: 0.75rem; align-items: flex-start; '
+                    f'margin-bottom: 0.5rem; padding: 0.5rem; background: #1a1a2e; '
+                    f'border-radius: 6px; border-left: 3px solid #ef4444;">'
+                    f'<span style="color: #ef4444; font-size: 1rem; flex-shrink: 0;">✗</span>'
+                    f'<div><span style="color: #fca5a5; font-weight: 600;">{source_name}</span>'
+                    f'<span style="color: #94a3b8; font-size: 0.85rem;"> — {rest}</span></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # -- Claim extraction method badge --------------------------------
+        _extraction_badge = {
+            "llm": ("#10b981", "🧠 LLM Extraction", "Claims extracted by Gemini (scientific reasoning)"),
+            "rule_based_fallback": ("#ef4444", "⚠ Keyword Fallback", "LLM unavailable — claims are keyword-matched, not scientifically extracted"),
+            "mixed": ("#f59e0b", "⚠ Mixed Extraction", "Some claims used LLM; some used keyword fallback"),
+            "none": ("#64748b", "— No Claims", "No literature evidence was available for claim extraction"),
+            "unknown": ("#64748b", "— Unknown", "Extraction method not recorded"),
+        }
+        _badge_color, _badge_label, _badge_desc = _extraction_badge.get(
+            extraction_method, ("#64748b", f"— {extraction_method}", "")
+        )
+        st.markdown(
+            f'<div style="margin-bottom: 1rem;">'
+            f'<span style="display: inline-flex; align-items: center; gap: 0.4rem; '
+            f'padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.8rem; font-weight: 600; '
+            f'background: {_badge_color}22; color: {_badge_color}; border: 1px solid {_badge_color}55;">'
+            f'{_badge_label}</span> '
+            f'<span style="color: #64748b; font-size: 0.8rem;">{_badge_desc}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Score cards — degraded flag fires when that score's input sources failed
+        _ss_degraded = any(s in pkg.sources_failed for s in ("pubmed", "openalex", "semantic_scholar"))
+        _ms_degraded = any(s in pkg.sources_failed for s in ("chembl", "uniprot", "reactome"))
+        _rs_degraded = "clinicaltrials" in pkg.sources_failed
+
         st.markdown("### 📐 Three-Dimensional Scores")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -511,6 +574,7 @@ elif page == "📊 Results":
                 result.support_assessment.level,
                 "#3b82f6",
                 "📚",
+                degraded=_ss_degraded,
             )
         with col2:
             render_score_card(
@@ -519,6 +583,7 @@ elif page == "📊 Results":
                 result.mechanistic_assessment.level,
                 "#8b5cf6",
                 "🔗",
+                degraded=_ms_degraded,
             )
         with col3:
             render_score_card(
@@ -527,6 +592,7 @@ elif page == "📊 Results":
                 result.risk_assessment.level,
                 "#ef4444",
                 "⚠️",
+                degraded=_rs_degraded,
             )
 
         st.markdown("---")

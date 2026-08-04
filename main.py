@@ -7,9 +7,12 @@ import asyncio
 import os
 import sys
 
+from dotenv import load_dotenv
 from backend.engineering.orchestrator.master_orchestrator import MasterOrchestrator
 from backend.core.enums.retrieval_policy import RetrievalPolicy
 from utils.logger import get_logger
+
+load_dotenv()
 
 logger = get_logger(__name__)
 
@@ -54,7 +57,9 @@ def main():
     logger.info(f"Processing: {args.drug} -> {args.disease} (policy: {args.policy})")
     
     orchestrator = MasterOrchestrator(
-        llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
+        ncbi_api_key=os.environ.get("NCBI_API_KEY"),
+        disgenet_api_key=os.environ.get("DISGENET_API_KEY"),
     )
     
     policy_map = {

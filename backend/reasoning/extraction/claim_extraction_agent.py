@@ -4,6 +4,7 @@ Reference: 04_REASONING_SPECIFICATION.md, 05_AGENT_SPECIFICATIONS.md
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -44,27 +45,32 @@ class ClaimExtractionAgent:
     All other components must be deterministic.
 
     Attributes:
-        _model: LLM model name (default 'gemini-1.5-flash').
+        _model: LLM model name (default 'gemini-2.0-flash').
         _api_key: LLM API key from environment.
         _prompt_version: Version string of the extraction prompt used.
+        _last_extraction_method: Tracks whether the last call used LLM or rule-based fallback.
+            Set per call to 'llm' or 'rule_based_fallback'. Used for audit disclosure.
     """
 
     PROMPT_VERSION = "v1"
 
     def __init__(
         self,
-        model: str = "gemini-1.5-flash",
+        model: str = "gemini-2.0-flash",
         api_key: str | None = None,
     ) -> None:
         """Initialize the ClaimExtractionAgent.
 
         Args:
             model: LLM model identifier.
-            api_key: LLM API key (falls back to LLM_API_KEY environment variable).
+            api_key: LLM API key (falls back to LLM_API_KEY / GEMINI_API_KEY environment variable).
         """
         self._model = model
         self._api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self._prompt_version = self.PROMPT_VERSION
+        # Tracks extraction path per call — set before every return in _call_llm.
+        # 'llm' = LLM succeeded. 'rule_based_fallback' = LLM unavailable or failed.
+        self._last_extraction_method: str = "llm"
 
     async def extract_claims(
         self,
@@ -94,7 +100,11 @@ class ClaimExtractionAgent:
         claims: list[Claim] = []
         for raw in raw_claims:
             try:
-                claim = self._parse_raw_claim(raw, evidence)
+                claim = self._parse_raw_claim(
+                    raw,
+                    evidence,
+                    extraction_method=self._last_extraction_method,
+                )
                 claims.append(claim)
             except Exception as exc:
                 logger.debug("claim_parse_error", extra={"error": str(exc), "raw": raw})
@@ -107,6 +117,7 @@ class ClaimExtractionAgent:
                 "claims_extracted": len(claims),
                 "model": self._model,
                 "prompt_version": self._prompt_version,
+                "extraction_method": self._last_extraction_method,
             },
         )
         return claims
@@ -123,25 +134,53 @@ class ClaimExtractionAgent:
             List of raw claim dicts from LLM output.
         """
         if not self._api_key:
-            logger.warning("llm_api_key_not_set", extra={"model": self._model})
+            logger.warning(
+                "llm_api_key_not_set",
+                extra={"model": self._model, "fallback": "rule_based_fallback"},
+            )
+            self._last_extraction_method = "rule_based_fallback"
             return self._rule_based_fallback(text, drug_name, disease_name)
 
         prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])  # cap at 3000 chars
 
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self._api_key)
-            model = genai.GenerativeModel(self._model)
-            response = await model.generate_content_async(
-                prompt,
-                generation_config={"temperature": 0.0, "max_output_tokens": 1000},
+            from google import genai as google_genai
+            from google.genai import types as genai_types
+
+            client = google_genai.Client(api_key=self._api_key)
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=self._model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=1000,
+                ),
             )
+            self._last_extraction_method = "llm"
             return self._parse_llm_response(response.text)
+
         except ImportError:
-            logger.warning("google_genai_not_installed", extra={"fallback": "rule_based"})
+            logger.warning(
+                "google_genai_not_installed",
+                extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
+            )
+            self._last_extraction_method = "rule_based_fallback"
             return self._rule_based_fallback(text, drug_name, disease_name)
+
         except Exception as exc:
-            logger.error("llm_call_failed", extra={"error": str(exc)})
+            # Distinguish API-level failures (rate limit, bad key) from SDK-level failures.
+            # Both are logged with the error class for debuggability.
+            logger.error(
+                "llm_call_failed",
+                extra={
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "model": self._model,
+                    "fallback": "rule_based_fallback",
+                },
+            )
+            self._last_extraction_method = "rule_based_fallback"
             return self._rule_based_fallback(text, drug_name, disease_name)
 
     def _parse_llm_response(self, response_text: str) -> list[dict[str, Any]]:
@@ -182,13 +221,18 @@ class ClaimExtractionAgent:
         Uses drug and disease names from context to produce meaningful claims
         rather than generic placeholders.
 
+        IMPORTANT: Claims produced by this method are low-confidence (0.25) keyword-matched
+        guesses, not LLM-verified biological assertions. They must be disclosed as such in
+        the audit report. The _last_extraction_method field on the agent is set to
+        'rule_based_fallback' before this method is called, enabling upstream disclosure.
+
         Args:
             text: Abstract text to scan.
             drug_name: Drug name for subject/object labeling.
             disease_name: Disease name for object labeling.
 
         Returns:
-            List of raw claim dicts detected by pattern matching.
+            List of raw claim dicts detected by pattern matching. At most one claim per call.
         """
         claims = []
         text_lower = text.lower()
@@ -225,12 +269,14 @@ class ClaimExtractionAgent:
         self,
         raw: dict[str, Any],
         evidence: Evidence,
+        extraction_method: str = "llm",
     ) -> Claim:
         """Parse a raw claim dict into a validated Claim entity.
 
         Args:
             raw: Dict with subject, predicate, object, confidence keys.
             evidence: Parent Evidence record.
+            extraction_method: 'llm' or 'rule_based_fallback'. Disclosed in raw_text prefix.
 
         Returns:
             Validated Claim entity.
@@ -244,6 +290,14 @@ class ClaimExtractionAgent:
         confidence = float(raw.get("confidence", 0.5))
         confidence = max(0.0, min(1.0, confidence))
 
+        # Disclose extraction method in raw_text so audit reports can surface it.
+        # Rule-based claims are prefixed to distinguish them from LLM-verified claims.
+        abstract_snippet = evidence.abstract[:500] if evidence.abstract else None
+        if extraction_method == "rule_based_fallback" and abstract_snippet:
+            raw_text = f"[keyword-extracted — LLM unavailable] {abstract_snippet}"
+        else:
+            raw_text = abstract_snippet
+
         return Claim(
             subject=str(raw.get("subject", "unknown"))[:100],
             predicate=predicate,
@@ -252,6 +306,6 @@ class ClaimExtractionAgent:
             erw=evidence.erw,
             evidence_ids=[evidence.id],
             provenance=evidence.provenance,
-            raw_text=evidence.abstract[:500] if evidence.abstract else None,
+            raw_text=raw_text,
             is_validated=False,
         )

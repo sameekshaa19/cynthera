@@ -63,6 +63,7 @@ class MasterOrchestrator:
     def __init__(
         self,
         ncbi_api_key: str | None = None,
+        disgenet_api_key: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str = "gemini-1.5-flash",
         db_path: str = "data/cynthera.db",
@@ -73,6 +74,7 @@ class MasterOrchestrator:
 
         Args:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
+            disgenet_api_key: Optional DisGeNET API key for gene-disease associations.
             llm_api_key: LLM API key for claim extraction.
             llm_model: LLM model name (default 'gemini-1.5-flash').
             db_path: Path to SQLite database file.
@@ -80,7 +82,7 @@ class MasterOrchestrator:
             use_cache: Whether to use the evaluation cache (default True).
         """
         self._resolver = IdentifierResolutionService(ncbi_api_key=ncbi_api_key)
-        self._retrieval = RetrievalPipeline(ncbi_api_key=ncbi_api_key)
+        self._retrieval = RetrievalPipeline(ncbi_api_key=ncbi_api_key, disgenet_api_key=disgenet_api_key)
         self._reasoning = ReasoningOrchestrator(
             llm_api_key=llm_api_key,
             llm_model=llm_model,

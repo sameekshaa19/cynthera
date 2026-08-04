@@ -156,14 +156,22 @@ class IdentifierResolutionService:
         client: httpx.AsyncClient,
         drug_name: str,
     ) -> str | None:
-        """Look up ChEMBL ID for a drug name.
+        """Look up ChEMBL ID for a drug name using generic candidate scoring.
+
+        Instead of naively picking molecules[0] (which can land on obscure, unnamed
+        compounds returned first by ChEMBL text indexing), scores all returned
+        candidates by:
+        1. Exact preferred name match (case-insensitive)
+        2. Presence of a preferred name (pref_name is not empty/null)
+        3. Highest clinical development stage (max_phase)
+        4. Parent compound status (molecule_chembl_id == parent_chembl_id)
 
         Args:
             client: Active httpx async client.
             drug_name: Drug name to search.
 
         Returns:
-            ChEMBL compound ID string, or None if not found.
+            ChEMBL compound ID string of the highest-scoring candidate, or None.
         """
         try:
             resp = await client.get(
@@ -173,8 +181,36 @@ class IdentifierResolutionService:
             resp.raise_for_status()
             data = resp.json()
             molecules = data.get("molecules", [])
-            if molecules:
-                return molecules[0].get("molecule_chembl_id")
+            if not molecules:
+                return None
+
+            clean_query = drug_name.strip().lower()
+
+            def _score(m: dict[str, Any]) -> tuple[bool, bool, int, bool]:
+                pref_name = (m.get("pref_name") or "").strip().lower()
+                exact_match = pref_name == clean_query
+                has_pref_name = bool(pref_name)
+                max_phase = int(float(m.get("max_phase") or 0))
+                is_parent = (
+                    m.get("molecule_hierarchy", {}).get("parent_chembl_id")
+                    == m.get("molecule_chembl_id")
+                )
+                return (exact_match, has_pref_name, max_phase, is_parent)
+
+            best = max(molecules, key=_score)
+            chosen_id = best.get("molecule_chembl_id")
+
+            logger.info(
+                "chembl_resolved",
+                extra={
+                    "drug_name": drug_name,
+                    "chosen_id": chosen_id,
+                    "chosen_pref_name": best.get("pref_name"),
+                    "chosen_max_phase": best.get("max_phase"),
+                    "candidates_considered": len(molecules),
+                },
+            )
+            return chosen_id
         except Exception as exc:
             logger.warning("chembl_resolve_failed", extra={"drug": drug_name, "error": str(exc)})
         return None
@@ -232,7 +268,9 @@ class IdentifierResolutionService:
             resp.raise_for_status()
             data = resp.json()
             if data:
-                return data[0].get("descriptor", {}).get("ui")
+                resource = data[0].get("resource", "")
+                if resource:
+                    return resource.rstrip("/").split("/")[-1]
         except Exception as exc:
             logger.warning("mesh_resolve_failed", extra={"disease": disease_name, "error": str(exc)})
         return None

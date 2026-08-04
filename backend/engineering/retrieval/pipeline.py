@@ -117,7 +117,7 @@ class RetrievalPipeline:
             self._fetch_pubmed(drug.name, disease.name),
             self._fetch_reactome(uniprot_ids),
             self._fetch_clinicaltrials(drug.name, disease.name),
-            self._fetch_disgenet(disease.name),
+            self._fetch_disgenet(disease),
             return_exceptions=True,
         )
 
@@ -134,13 +134,17 @@ class RetrievalPipeline:
             if isinstance(openalex_ev, list) and openalex_ev:
                 sources_queried.append("openalex")
                 evidence_records.extend(openalex_ev)
-            elif isinstance(openalex_ev, Exception):
-                logger.debug("openalex_failed", extra={"error": str(openalex_ev)})
+            else:
+                sources_failed.append("openalex")
+                if isinstance(openalex_ev, Exception):
+                    logger.debug("openalex_failed", extra={"error": str(openalex_ev)})
             if isinstance(s2_ev, list) and s2_ev:
                 sources_queried.append("semantic_scholar")
                 evidence_records.extend(s2_ev)
-            elif isinstance(s2_ev, Exception):
-                logger.debug("semantic_scholar_failed", extra={"error": str(s2_ev)})
+            else:
+                sources_failed.append("semantic_scholar")
+                if isinstance(s2_ev, Exception):
+                    logger.debug("semantic_scholar_failed", extra={"error": str(s2_ev)})
 
         # Process UniProt proteins
         if isinstance(uniprot_data, Exception):
@@ -253,10 +257,32 @@ class RetrievalPipeline:
                 logger.debug("chembl_ind_data_failed", extra={"error": str(ind_data)})
                 ind_data = {"indications": []}
 
-            # Extract up to 10 unique target ChEMBL IDs to query their details
-            activities = bioactivities.get("activities", [])
-            target_ids = list(set(act.get("target_chembl_id") for act in activities if act.get("target_chembl_id")))
-            target_details_dict = {}
+            # Prioritize target ChEMBL IDs from curated mechanism records FIRST,
+            # falling back to frequency-ranked targets from bioactivities.
+            mech_list = mechanisms.get("mechanisms", []) if isinstance(mechanisms, dict) else []
+            mech_target_ids = [
+                m.get("target_chembl_id")
+                for m in mech_list
+                if m.get("target_chembl_id")
+            ]
+
+            activities = bioactivities.get("activities", []) if isinstance(bioactivities, dict) else []
+            activities_to_parse = activities[:50]
+            target_id_counts: dict[str, int] = {}
+            for act in activities_to_parse:
+                tid = act.get("target_chembl_id")
+                if tid:
+                    target_id_counts[tid] = target_id_counts.get(tid, 0) + 1
+
+            # Combined list: curated mechanism targets first, then top bioactivity targets up to 15 total
+            bioactivity_target_ids = sorted(target_id_counts, key=target_id_counts.get, reverse=True)
+            combined_target_ids: list[str] = []
+            for tid in mech_target_ids + bioactivity_target_ids:
+                if tid not in combined_target_ids:
+                    combined_target_ids.append(tid)
+            target_ids_to_fetch = combined_target_ids[:15]
+
+            target_details_dict: dict[str, Any] = {}
 
             async def fetch_target_details(tid: str):
                 try:
@@ -266,8 +292,8 @@ class RetrievalPipeline:
                 except Exception as e:
                     logger.debug("target_detail_fetch_failed", extra={"target_id": tid, "error": str(e)})
 
-            if target_ids:
-                await asyncio.gather(*(fetch_target_details(tid) for tid in target_ids[:10]))
+            if target_ids_to_fetch:
+                await asyncio.gather(*(fetch_target_details(tid) for tid in target_ids_to_fetch))
 
             return {
                 "bioactivities": bioactivities,
@@ -297,35 +323,79 @@ class RetrievalPipeline:
             return await conn.fetch(drug_name, disease_name, max_results=50)
 
     async def _fetch_reactome(self, uniprot_ids: list[str]) -> dict[str, Any]:
-        """Fetch biological pathways from Reactome in parallel."""
+        """Fetch biological pathways from Reactome and their UniProt participant lists.
+
+        Two-phase retrieval:
+          Phase 1 (forward): For each target UniProt ID, fetch which pathways contain it.
+          Phase 2 (reverse): For each unique pathway, fetch which UniProt proteins participate.
+
+        Phase 2 is bounded by a semaphore (max 3 concurrent requests) to avoid hammering
+        Reactome's public ContentService, while still running concurrently.
+
+        Args:
+            uniprot_ids: Target UniProt accessions from ChEMBL retrieval.
+
+        Returns:
+            Dict with 'pathways': list of raw pathway dicts, each augmented with
+            '_participant_uniprot_ids' key populated by phase 2.
+        """
         if not uniprot_ids:
             return {"pathways": []}
         async with ReactomeConnector() as conn:
-            pathways = []
-            async def fetch_one(uid: str):
+            # Phase 1: forward direction — which pathways contain each protein?
+            raw_pathways: list[dict] = []
+
+            async def fetch_pathways_for_protein(uid: str) -> None:
                 try:
                     res = await conn.fetch(uid)
-                    pathways.extend(res.get("pathways", []))
+                    raw_pathways.extend(res.get("pathways", []))
                 except Exception as e:
-                    logger.debug("reactome_fetch_one_failed", extra={"uniprot_id": uid, "error": str(e)})
-            await asyncio.gather(*(fetch_one(uid) for uid in uniprot_ids[:5]))
-            return {"pathways": pathways}
+                    logger.debug(
+                        "reactome_fetch_one_failed",
+                        extra={"uniprot_id": uid, "error": str(e)},
+                    )
+
+            await asyncio.gather(*(fetch_pathways_for_protein(uid) for uid in uniprot_ids[:5]))
+
+            # Deduplicate pathways by stId, preserving insertion order.
+            seen_stids: dict[str, dict] = {}
+            for pw in raw_pathways:
+                stid = pw.get("stId")
+                if stid and stid not in seen_stids:
+                    seen_stids[stid] = pw
+
+            # Phase 2: reverse direction — for each unique pathway, who are the participants?
+            # Cap to 10 pathways to limit network load. Semaphore bounds concurrency to 3.
+            participant_map: dict[str, list[str]] = {}
+            sem = asyncio.Semaphore(3)
+
+            async def fetch_participants_for_pathway(stid: str) -> None:
+                async with sem:
+                    res = await conn.fetch_participants(stid)
+                    participant_map[stid] = res.get("uniprot_ids", [])
+
+            await asyncio.gather(*(fetch_participants_for_pathway(stid) for stid in list(seen_stids.keys())[:10]))
+
+            # Attach participant lists to raw pathway dicts before parsing.
+            for stid, pw in seen_stids.items():
+                pw["_participant_uniprot_ids"] = participant_map.get(stid, [])
+
+            return {"pathways": list(seen_stids.values())}
 
     async def _fetch_clinicaltrials(self, drug_name: str, disease_name: str) -> dict[str, Any]:
         async with ClinicalTrialsConnector() as conn:
             return await conn.fetch(drug_name, disease_name)
 
-    async def _fetch_disgenet(self, disease_name: str) -> dict[str, Any]:
+    async def _fetch_disgenet(self, disease: Disease) -> dict[str, Any]:
         """Fetch disease-gene associations from DisGeNET.
 
-        DisGeNET requires an API key for full access. Without one the connector
-        returns an empty payload rather than raising, so this method degrades
-        gracefully when the key is absent.
+        Queries by the resolved MeSH ID when available (ontology-grounded),
+        falling back to the disease name string.
         """
+        disease_id = disease.mesh_id or disease.name.lower().replace(" ", "+")
         try:
             async with DisGeNETConnector(api_key=self._disgenet_api_key) as conn:
-                # Use the disease name as the query identifier (may return empty if unauthenticated)
-                result = await conn.fetch(disease_id=disease_name.lower().replace(" ", "+"))
+                result = await conn.fetch(disease_id=disease_id)
                 return result
         except Exception as exc:
             logger.debug("disgenet_fetch_failed", extra={"error": str(exc)})
@@ -451,14 +521,20 @@ class RetrievalPipeline:
         data: dict[str, Any],
         drug: Drug,
     ) -> tuple[list[Target], list[Evidence]]:
-        """Parse ChEMBL bioactivity data into Target and Evidence objects."""
+        """Parse ChEMBL mechanism and bioactivity data into Target and Evidence objects.
+
+        Prioritizes curated mechanism data from /mechanism.json as the primary path.
+        Only falls back to mining raw bioactivities if no curated mechanisms produce
+        validated targets.
+        """
         targets: list[Target] = []
         evidence: list[Evidence] = []
         activities = data.get("bioactivities", {}).get("activities", [])
+        mechanisms = data.get("mechanisms", {}).get("mechanisms", [])
         target_details = data.get("target_details", {})
 
         # Build mapping from target ChEMBL ID to the first UniProt accession found
-        uniprot_map = {}
+        uniprot_map: dict[str, str] = {}
         for tid, tdata in target_details.items():
             components = tdata.get("target_components", [])
             for comp in components:
@@ -469,18 +545,66 @@ class RetrievalPipeline:
                 if tid in uniprot_map:
                     break
 
+        # ── Primary Path: Curated Mechanism of Action Data ───────────────────
+        seen_uniprots: set[str] = set()
+        for mech in mechanisms:
+            target_chembl = mech.get("target_chembl_id", "")
+            target_uniprot = uniprot_map.get(target_chembl, "")
+            if not target_uniprot or target_uniprot in seen_uniprots:
+                continue
+            seen_uniprots.add(target_uniprot)
+
+            action_type = mech.get("action_type") or "MODULATOR"
+            mech_desc = mech.get("mechanism_of_action") or action_type
+            prov = ProvenanceReference(
+                source_name="ChEMBL-Mechanism",
+                source_version="v33",
+                record_id=str(mech.get("mec_id", target_chembl)),
+                url=f"https://www.ebi.ac.uk/chembl/target_report_card/{target_chembl}",
+            )
+            # High-affinity default (1.0 nM) for curated mechanism targets
+            erw = ERW.from_base(base_weight=EvidenceType.IN_VITRO.base_erw)
+            target = Target(
+                drug_chembl_id=drug.chembl_id or drug.name,
+                protein_uniprot=target_uniprot,
+                affinity_nm=1.0,
+                affinity_type="IC50",
+                mechanism=str(action_type).upper()[:20],
+                erw=erw,
+                provenance=prov,
+            )
+            targets.append(target)
+            ev = Evidence(
+                evidence_type=EvidenceType.IN_VITRO,
+                erw=erw,
+                citation_key=f"chembl_mech_{target_chembl}",
+                title=f"ChEMBL curated mechanism: {drug.name} - {mech_desc}",
+                provenance=prov,
+                drug_chembl_id=drug.chembl_id,
+                target_uniprot=target_uniprot,
+            )
+            evidence.append(ev)
+
+        if targets:
+            logger.info(
+                "chembl_targets_from_curated_mechanisms",
+                extra={"drug": drug.name, "target_count": len(targets)},
+            )
+
+        # ── Secondary/Fallback Path: Raw Bioactivity Mining ──────────────────
+        # Runs if mechanisms produced no targets, or to supplement curated mechanisms.
         for act in activities[:50]:  # cap at 50
             try:
                 standard_value = float(act.get("standard_value") or 0)
                 affinity_type = act.get("standard_type", "IC50")
                 target_chembl = act.get("target_chembl_id", "")
-                
-                # Retrieve UniProt from our mapped dictionary or fallback to act's target_accession
+
                 target_uniprot = uniprot_map.get(target_chembl) or act.get("target_accession", "")
                 mechanism = act.get("mechanism_of_action", "UNKNOWN")
 
-                if not target_uniprot or standard_value <= 0:
+                if not target_uniprot or standard_value <= 0 or target_uniprot in seen_uniprots:
                     continue
+                seen_uniprots.add(target_uniprot)
 
                 erw = ERW.from_base(
                     base_weight=EvidenceType.IN_VITRO.base_erw,
@@ -511,6 +635,7 @@ class RetrievalPipeline:
                     title=f"ChEMBL bioactivity: {drug.name} vs {target_uniprot}",
                     provenance=prov,
                     drug_chembl_id=drug.chembl_id,
+                    target_uniprot=target_uniprot,
                 )
                 evidence.append(ev)
             except Exception as exc:
@@ -539,11 +664,16 @@ class RetrievalPipeline:
                 if rec_name:
                     name = rec_name.get("fullName", {}).get("value", "Unknown protein")
 
+                # Parse review status: "UniProtKB reviewed (Swiss-Prot)" or "unreviewed (TrEMBL)"
+                entry_type = raw.get("entryType", "")
+                is_reviewed = "reviewed" in entry_type.lower() and "unreviewed" not in entry_type.lower()
+
                 protein = Protein(
                     uniprot_accession=acc,
                     gene_symbol=gene_symbol.upper(),
                     name=name,
                     organism=raw.get("organism", {}).get("scientificName", "Homo sapiens"),
+                    is_reviewed=is_reviewed,
                 )
                 proteins.append(protein)
             except Exception as e:
@@ -588,7 +718,14 @@ class RetrievalPipeline:
         return evidence
 
     def _parse_reactome_data(self, data: dict[str, Any]) -> list[Pathway]:
-        """Parse Reactome data into Pathway objects."""
+        """Parse Reactome data into Pathway objects.
+
+        Populates Pathway.participant_uniprot_ids from the '_participant_uniprot_ids'
+        key injected by _fetch_reactome's Phase 2 participant lookup.
+        When the participant fetch failed for a pathway, this field will be [] —
+        the multi-hop reasoner's guard is designed to skip the membership check
+        (not reject the path) in that case, degrading gracefully to pre-B behaviour.
+        """
         pathways = []
         raw_pathways = data.get("pathways", [])
         seen = set()
@@ -613,6 +750,7 @@ class RetrievalPipeline:
                     name=raw.get("displayName", "Unnamed pathway"),
                     description=raw.get("displayName", "Unnamed pathway"),
                     provenance=prov,
+                    participant_uniprot_ids=raw.get("_participant_uniprot_ids", []),
                 )
                 pathways.append(pathway)
             except Exception as e:
@@ -744,8 +882,8 @@ class RetrievalPipeline:
         """Fetch literature from OpenAlex (Phase 2 extended source)."""
         if not _EXTENDED_SOURCES_AVAILABLE:
             return []
-        connector = OpenAlexConnector()
-        return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
+        async with OpenAlexConnector() as connector:
+            return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
 
     async def _fetch_semantic_scholar(
         self,
@@ -756,8 +894,8 @@ class RetrievalPipeline:
         """Fetch literature from Semantic Scholar (Phase 2 extended source)."""
         if not _EXTENDED_SOURCES_AVAILABLE:
             return []
-        connector = SemanticScholarConnector()
-        return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
+        async with SemanticScholarConnector() as connector:
+            return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
 
     def _compute_confidence(
         self,

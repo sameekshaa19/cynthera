@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from backend.core.domain.evidence import Evidence
-from backend.core.enums.evidence_type import EvidenceType
+from backend.core.enums.evidence_type import EvidenceType, ERW_BASE_WEIGHTS
 from backend.core.value_objects.erw import ERW
 from backend.core.value_objects.provenance import ProvenanceReference
 from backend.engineering.retrieval.connectors.base import BaseConnector
@@ -155,6 +155,7 @@ class OpenAlexConnector(BaseConnector):
         try:
             title = work.get("title") or "Untitled"
             doi = work.get("doi") or ""
+            openalex_id = work.get("id") or ""
             pub_year = work.get("publication_year") or 2000
             cited_by = work.get("cited_by_count") or 0
 
@@ -163,34 +164,30 @@ class OpenAlexConnector(BaseConnector):
                 work.get("abstract_inverted_index") or {}
             )
 
-            # Extract venue
-            venue = ""
-            primary_loc = work.get("primary_location") or {}
-            source = primary_loc.get("source") or {}
-            venue = source.get("display_name") or "Unknown Venue"
-
-            # Compute ERW based on citation count and recency
-            erw_value = self._compute_erw(cited_by, pub_year)
-
-            # Determine evidence type from citation patterns
-            ev_type = EvidenceType.LITERATURE
+            # citation_key is required (min_length=1) — prefer DOI, fall back to OpenAlex ID
+            if doi:
+                citation_key = doi.replace("https://doi.org/", "doi:")
+            elif openalex_id:
+                citation_key = f"openalex:{openalex_id}"
+            else:
+                return None  # no usable identifier at all — drop the record
 
             provenance = ProvenanceReference(
                 source_name="openalex",
-                source_url=f"https://doi.org/{doi}" if doi else f"https://api.openalex.org/works/{work.get('id', '')}",
+                source_version="v1",
+                record_id=openalex_id or citation_key,
+                url=openalex_id or None,
                 retrieved_at=datetime.utcnow(),
-                raw_id=work.get("id") or "",
             )
 
+            erw = ERW.from_base(base_weight=ERW_BASE_WEIGHTS["LITERATURE"])
+
             return Evidence(
-                hypothesis_id=hypothesis_id,
+                evidence_type=EvidenceType.LITERATURE,
+                erw=erw,
+                citation_key=citation_key,
                 title=title[:500],
-                abstract=abstract[:2000] if abstract else "",
-                evidence_type=ev_type,
-                erw=ERW(value=erw_value),
-                source="openalex",
-                doi=doi[:200] if doi else None,
-                publication_year=pub_year,
+                abstract=abstract[:2000] if abstract else None,
                 provenance=provenance,
             )
 

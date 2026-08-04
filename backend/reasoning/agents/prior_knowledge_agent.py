@@ -115,6 +115,7 @@ class PriorKnowledgeContext:
             "evidence_boost": self.evidence_boost,
             "confidence_adjustment": self.confidence_adjustment,
             "narrative": self.narrative,
+            "top_entries": self.top_entries,
             "approved_indications_count": self.approved_indications_count,
         }
 

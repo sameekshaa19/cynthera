@@ -14,6 +14,7 @@ ERW_BASE_WEIGHTS: dict[str, float] = {
     "IN_VIVO": 0.50,
     "IN_VITRO": 0.30,
     "COMPUTATIONAL": 0.15,
+    "LITERATURE": 0.65,
 }
 
 
@@ -46,6 +47,9 @@ class EvidenceType(str, Enum):
 
     COMPUTATIONAL = "COMPUTATIONAL"
     """Machine learning binding predictions, graph network proximity scoring, or homology modeling."""
+
+    LITERATURE = "LITERATURE"
+    """OpenAlex / Semantic Scholar literature search results (citation-backed, not controlled study)."""
 
     @property
     def base_erw(self) -> float:

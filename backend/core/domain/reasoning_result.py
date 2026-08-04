@@ -168,6 +168,15 @@ class ReasoningResult(BaseModel):
         rule_set_version: Version of the RuleEngine rule set used.
         reasoning_duration_ms: Total reasoning pipeline duration.
         completed_at: UTC timestamp of completion.
+        data_source_failures: Explicit list of named retrieval failures propagated
+            from the retrieval package. Each entry is a human-readable statement of
+            what failed and what data it would have contributed. These are displayed
+            verbatim in the frontend report — they are NOT absorbed into scores.
+        claim_extraction_method: The extraction method used for all claims:
+            'llm' (full LLM extraction), 'rule_based_fallback' (keyword-matching
+            because LLM was unavailable), or 'mixed' (some records used LLM,
+            some used fallback). Displayed in the report so the user knows the
+            claim quality.
     """
 
     model_config = {"frozen": True}
@@ -187,3 +196,19 @@ class ReasoningResult(BaseModel):
     rule_set_version: str = Field(default="1.0", description="RuleEngine rule set version used.")
     reasoning_duration_ms: float = Field(default=0.0, ge=0.0, description="Total reasoning duration ms.")
     completed_at: datetime = Field(default_factory=datetime.utcnow, description="UTC completion timestamp.")
+    data_source_failures: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit retrieval failure statements propagated from the retrieval package. "
+            "Each entry names the source, what it would have contributed, and the impact "
+            "on scoring. Displayed verbatim in the frontend — not absorbed into scores."
+        ),
+    )
+    claim_extraction_method: str = Field(
+        default="unknown",
+        description=(
+            "Extraction method for all claims: 'llm' | 'rule_based_fallback' | 'mixed' | 'none'. "
+            "'rule_based_fallback' means LLM was unavailable; claims are keyword-matched, "
+            "not scientifically extracted. Displayed in the report."
+        ),
+    )

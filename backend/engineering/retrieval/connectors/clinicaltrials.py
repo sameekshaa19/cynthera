@@ -27,6 +27,16 @@ class ClinicalTrialsConnector(BaseConnector):
     base_url = CLINICALTRIALS_BASE
     timeout_seconds = 30.0
 
+    def _build_headers(self) -> dict[str, str]:
+        """Build headers override for ClinicalTrials.gov API.
+
+        ClinicalTrials.gov WAF returns 403 Forbidden for custom 'CYNTHERA' User-Agent headers.
+        Removing the User-Agent header allows requests to succeed cleanly.
+        """
+        headers = super()._build_headers()
+        headers.pop("User-Agent", None)
+        return headers
+
     async def fetch(
         self,
         drug_name: str,

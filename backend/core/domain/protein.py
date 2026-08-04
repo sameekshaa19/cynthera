@@ -15,11 +15,12 @@ class Protein(BaseModel):
 
     Attributes:
         id: Internal UUID.
-        uniprot_accession: UniProt accession number (e.g., 'O76074'). Required.
+        uniprot_accession: UniProt accession (e.g., 'O76074'). Required.
         gene_symbol: HGNC gene symbol in uppercase (e.g., 'PDE5A'). Required.
         name: Full protein name.
         organism: Source organism (e.g., 'Homo sapiens').
         pathway_ids: Reactome pathway IDs this protein participates in.
+        is_reviewed: True for Swiss-Prot (reviewed), False for TrEMBL (unreviewed).
     """
 
     model_config = {"frozen": True}
@@ -32,6 +33,10 @@ class Protein(BaseModel):
     pathway_ids: list[str] = Field(
         default_factory=list,
         description="Reactome pathway IDs this protein participates in.",
+    )
+    is_reviewed: bool = Field(
+        default=True,
+        description="True if Swiss-Prot (reviewed), False if TrEMBL (unreviewed).",
     )
 
     @field_validator("uniprot_accession")

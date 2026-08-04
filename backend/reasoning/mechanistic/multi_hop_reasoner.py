@@ -13,6 +13,7 @@ Reference: Phase 2 — Multi-hop mechanistic reasoning
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +69,106 @@ class MechanisticPath:
         }
 
 
+def _compute_target_confidence(
+    target: "Target",
+    evidence_records: list,
+) -> float:
+    """Derive a confidence score for a target from retrieved evidence.
+
+    Uses two signals:
+    1. Binding affinity strength (nM) mapped via log10 scale.
+    2. Volume of evidence records mentioning this target, weighted by ERW.
+
+    Args:
+        target: A Target domain model with affinity_nm and protein_uniprot.
+        evidence_records: All Evidence records from the RetrievalPackage.
+
+    Returns:
+        Confidence in [0.1, 1.0].
+    """
+    # 1. Binding strength component: sub-100nM = strong, >10uM = weak
+    affinity_component = 0.5
+    try:
+        affinity_nm = target.affinity_nm
+        if isinstance(affinity_nm, (int, float)) and affinity_nm > 0:
+            affinity_component = max(0.1, min(1.0, 1.0 - (math.log10(affinity_nm) / 5.0)))
+    except (TypeError, ValueError):
+        pass
+
+    # 2. Evidence volume component: ERW-weighted sum of records mentioning this target
+    target_uniprot = getattr(target, "protein_uniprot", None)
+    if target_uniprot and isinstance(evidence_records, list):
+        target_evidence = [
+            e for e in evidence_records
+            if getattr(e, "target_uniprot", None) == target_uniprot
+            and hasattr(e, "erw") and hasattr(e.erw, "value")
+        ]
+        erw_sum = sum(e.erw.value for e in target_evidence if isinstance(e.erw.value, (int, float)))
+        evidence_component = min(1.0, erw_sum / 3.0) if target_evidence else 0.2
+    else:
+        evidence_component = 0.2
+
+    return round(0.6 * affinity_component + 0.4 * evidence_component, 4)
+
+
+def _build_validated_gene_set(package: RetrievalPackage) -> set[str]:
+    """Build set of gene symbols with DisGeNET evidence matching the disease MeSH ID.
+
+    Only genes that appear in DisGeNET evidence records whose disease_identifier
+    matches the resolved MeSH ID of the queried disease are included. This ensures
+    that pathway/gene hops in multi-hop paths are grounded in ontology-backed
+    gene-disease association data rather than free-text disease name matching.
+    """
+    validated: set[str] = set()
+    disease_mesh = getattr(package.disease, "mesh_id", None)
+    if not disease_mesh:
+        return validated
+    for ev in getattr(package, "evidence_records", []):
+        prov = getattr(ev, "provenance", None)
+        if prov and getattr(prov, "source_name", "") == "DisGeNET":
+            if getattr(ev, "disease_identifier", None) == disease_mesh:
+                title = ev.title or ""
+                if "DisGeNET association:" in title:
+                    parts = title.split(":")
+                    if len(parts) > 1:
+                        gene = parts[1].split("—")[0].strip()
+                        if gene:
+                            validated.add(gene)
+    return validated
+
+
+# ─────────────────────────────────────────────
+# Organism validation
+# ─────────────────────────────────────────────
+
+_HUMAN_ORGANISM_MARKERS: frozenset[str] = frozenset({
+    "homo sapiens",
+    "human",
+})
+
+
+def _is_human_protein(protein: Any) -> bool:
+    """Return True only if the protein's organism is confirmed Homo sapiens.
+
+    Errs on the side of exclusion: a protein with an unknown or missing organism
+    field is NOT trusted as a human mechanism. Only explicitly Homo sapiens records
+    are accepted. This prevents bacterial, viral, or yeast proteins from ChEMBL
+    cross-references contributing to a human-disease mechanistic hypothesis.
+
+    Args:
+        protein: A Protein domain model, or None.
+
+    Returns:
+        True if organism is Homo sapiens, False for None / unknown / non-human.
+    """
+    if protein is None:
+        return False
+    organism = getattr(protein, "organism", None)
+    if not organism:
+        return False
+    return organism.strip().lower() in _HUMAN_ORGANISM_MARKERS
+
+
 class MultiHopReasoner:
     """Traces multi-hop mechanistic paths from Drug to Disease.
 
@@ -119,23 +220,49 @@ class MultiHopReasoner:
             p.uniprot_accession: p for p in proteins
         }
 
+        # Build set of gene symbols validated by DisGeNET for this disease
+        validated_genes = _build_validated_gene_set(package)
+
         for target in targets[:6]:  # cap at 6 targets
             uniprot_id = target.protein_uniprot
 
             # Resolve protein label
             protein = protein_by_uniprot.get(uniprot_id)
+
+            # ── Organism guard (Fix C) ───────────────────────────────────────────
+            # Reject any target whose protein is not confirmed Homo sapiens.
+            # This is the primary guard preventing bacterial/viral/non-human
+            # proteins from appearing as "mechanisms" in human-disease hypotheses.
+            # Note: if protein is None (target outside the UniProt fetch cap of 5),
+            # the target is also excluded — this is safe but means RC-06 (UniProt
+            # cap) can incidentally exclude legitimate human targets 6+.
+            if not _is_human_protein(protein):
+                logger.info(
+                    "mechanistic_target_skipped_non_human",
+                    extra={
+                        "uniprot_id": uniprot_id,
+                        "organism": (
+                            getattr(protein, "organism", "unknown")
+                            if protein else "no_protein_record"
+                        ),
+                    },
+                )
+                continue
+
             target_label = (
                 f"{protein.gene_symbol} ({uniprot_id})"
                 if protein and protein.gene_symbol
                 else uniprot_id or target.name
             )
 
-            # Base confidence from target evidence score
-            base_conf = getattr(target, "confidence_score", 0.7)
-            if isinstance(base_conf, float) and 0.0 <= base_conf <= 1.0:
-                base_conf = base_conf
-            else:
-                base_conf = 0.7
+            # Base confidence from retrieved evidence (affinity + literature volume)
+            base_conf = _compute_target_confidence(target, package.evidence_records)
+            # Penalize unreviewed (TrEMBL) proteins — an antibody fragment is not a mechanism
+            if protein and not protein.is_reviewed:
+                base_conf = round(base_conf * 0.3, 4)
+            # Penalize targets whose gene has no DisGeNET evidence linking it to this disease
+            if validated_genes and protein and protein.gene_symbol not in validated_genes:
+                base_conf = round(base_conf * 0.5, 4)
 
             # ── Path Type 1: Drug → Target → Disease (DIRECT)
             direct_conf = round(base_conf, 4)
@@ -158,6 +285,17 @@ class MultiHopReasoner:
 
             # ── Path Type 2: Drug → Target → Pathway → Disease (2-HOP)
             for pathway in pathways[:4]:
+                # ── Pathway membership guard (Fix B3) ───────────────────────────
+                # Only proceed if this target's protein is a known participant in
+                # this pathway. If participant_uniprot_ids is [] (participant fetch
+                # failed or not yet populated), the guard is skipped to degrade
+                # gracefully to pre-Fix-B behaviour rather than blocking all paths.
+                if pathway.participant_uniprot_ids and uniprot_id not in pathway.participant_uniprot_ids:
+                    logger.debug(
+                        "mechanistic_2hop_skipped_non_participant",
+                        extra={"uniprot_id": uniprot_id, "pathway": pathway.reactome_id},
+                    )
+                    continue
                 two_hop_conf = round(base_conf * _HOP_DECAY, 4)
                 if two_hop_conf >= _MIN_CONFIDENCE:
                     path = MechanisticPath(
@@ -181,13 +319,36 @@ class MultiHopReasoner:
             # ── Path Type 3: Drug → Target → Pathway → Protein2 → Disease (3-HOP)
             if proteins and pathways:
                 for pathway in pathways[:2]:
-                    # Use secondary proteins as downstream effectors
+                    # ── Pathway membership guard — primary target (Fix B3) ───────
+                    if pathway.participant_uniprot_ids and uniprot_id not in pathway.participant_uniprot_ids:
+                        continue
+
+                    # Use secondary proteins as downstream effectors.
+                    # Restrict to human proteins only (Gap 1 fix).
                     secondary_proteins = [
                         p for p in proteins
                         if p.uniprot_accession != uniprot_id
+                        and _is_human_protein(p)  # Gap 1: organism filter on effector
                     ][:2]
 
                     for sec_protein in secondary_proteins:
+                        # ── Pathway membership guard — effector protein (Gap 2 fix) ─
+                        # Both hops in a 3-HOP chain need grounding. The effector
+                        # must also participate in the same pathway — not just the
+                        # primary target.
+                        if (
+                            pathway.participant_uniprot_ids
+                            and sec_protein.uniprot_accession not in pathway.participant_uniprot_ids
+                        ):
+                            logger.debug(
+                                "mechanistic_3hop_skipped_effector_non_participant",
+                                extra={
+                                    "effector_uniprot": sec_protein.uniprot_accession,
+                                    "pathway": pathway.reactome_id,
+                                },
+                            )
+                            continue
+
                         three_hop_conf = round(base_conf * (_HOP_DECAY ** 2), 4)
                         if three_hop_conf >= _MIN_CONFIDENCE:
                             sec_label = (

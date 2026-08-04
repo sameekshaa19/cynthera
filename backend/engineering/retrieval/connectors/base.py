@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,31 @@ class BaseConnector(abc.ABC):
         """
         raise NotImplementedError
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+        reraise=True,
+    )
+    async def _get_with_retry(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute a GET request with tenacity retry logic.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s)
+        for RequestError and HTTPStatusError.
+
+        Args:
+            url: Full URL to request.
+            params: Optional query parameters.
+
+        Returns:
+            Parsed JSON response as dict.
+        """
+        response = await self._client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Execute a GET request and return parsed JSON.
+        """Execute a GET request with retry and return parsed JSON.
 
         Args:
             url: Full URL to request.
@@ -97,9 +121,7 @@ class BaseConnector(abc.ABC):
                 f"{self.__class__.__name__} must be used as an async context manager."
             )
         try:
-            response = await self._client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+            return await self._get_with_retry(url, params)
         except httpx.HTTPStatusError as exc:
             logger.warning(
                 "http_error",
@@ -111,14 +133,14 @@ class BaseConnector(abc.ABC):
             )
             raise SourceUnavailableError(
                 source_name=self.source_name,
-                retry_count=0,
+                retry_count=3,
             ) from exc
         except httpx.RequestError as exc:
             logger.error(
                 "request_error",
-                extra={"source": self.source_name, "url": url, "error": str(exc)},
+                extra={"source": self.source_name, "url": url},
             )
             raise SourceUnavailableError(
                 source_name=self.source_name,
-                retry_count=0,
+                retry_count=3,
             ) from exc

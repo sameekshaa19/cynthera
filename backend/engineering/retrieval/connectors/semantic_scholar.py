@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from backend.core.domain.evidence import Evidence
-from backend.core.enums.evidence_type import EvidenceType
+from backend.core.enums.evidence_type import EvidenceType, ERW_BASE_WEIGHTS
 from backend.core.value_objects.erw import ERW
 from backend.core.value_objects.provenance import ProvenanceReference
 from backend.engineering.retrieval.connectors.base import BaseConnector
@@ -39,16 +39,26 @@ class SemanticScholarConnector(BaseConnector):
     No API key required for basic use (100 req/5min limit).
     """
 
+    source_name = "semantic_scholar"
+    base_url = _S2_BASE
+    timeout_seconds = _DEFAULT_TIMEOUT
+
     def __init__(self, api_key: str | None = None) -> None:
         """Initialize the Semantic Scholar connector.
 
         Args:
             api_key: Optional Semantic Scholar API key for higher rate limits.
         """
-        self._api_key = api_key
-        self._headers: dict[str, str] = {}
-        if api_key:
-            self._headers["x-api-key"] = api_key
+        import os
+        key = api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+        super().__init__(api_key=key)
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build default headers override to set x-api-key if key is provided."""
+        headers = super()._build_headers()
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        return headers
 
     async def fetch(self, **kwargs: Any) -> dict[str, Any]:
         """Fetch raw data from the Semantic Scholar API.
@@ -71,12 +81,8 @@ class SemanticScholarConnector(BaseConnector):
             ),
             "limit": min(int(kwargs.get("limit", _MAX_RESULTS)), 20),
         }
-        async with httpx.AsyncClient(
-            timeout=_DEFAULT_TIMEOUT, headers=self._headers
-        ) as client:
-            resp = await client.get(f"{_S2_BASE}/paper/search", params=params)
-            resp.raise_for_status()
-            return resp.json()
+        url = f"{self.base_url}/paper/search"
+        return await self._get(url, params=params)
 
     async def fetch_literature(
         self,
@@ -96,8 +102,9 @@ class SemanticScholarConnector(BaseConnector):
         Returns:
             List of Evidence records.
         """
-        query = f"{drug_name} {disease_name}"
+        from backend.core.exceptions import SourceUnavailableError
 
+        query = f"{drug_name} {disease_name}"
         params: dict[str, Any] = {
             "query": query,
             "fields": (
@@ -106,32 +113,25 @@ class SemanticScholarConnector(BaseConnector):
             ),
             "limit": min(max_results, 20),
         }
+        url = f"{self.base_url}/paper/search"
 
         try:
-            async with httpx.AsyncClient(
-                timeout=_DEFAULT_TIMEOUT, headers=self._headers
-            ) as client:
-                resp = await client.get(
-                    f"{_S2_BASE}/paper/search",
-                    params=params,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.TimeoutException:
+            data = await self._get(url, params=params)
+        except SourceUnavailableError:
             logger.warning(
-                "semantic_scholar_timeout",
+                "semantic_scholar_unavailable",
                 extra={"drug": drug_name, "disease": disease_name},
             )
-            return []
-        except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "semantic_scholar_http_error",
-                extra={"status": exc.response.status_code},
-            )
-            return []
+            raise
         except Exception as exc:
-            logger.warning("semantic_scholar_fetch_error", extra={"error": str(exc)})
-            return []
+            logger.warning(
+                "semantic_scholar_fetch_error",
+                extra={"drug": drug_name, "disease": disease_name, "error": str(exc)},
+            )
+            raise SourceUnavailableError(
+                source_name=self.source_name,
+                retry_count=3,
+            ) from exc
 
         papers = data.get("data") or []
         evidence_records: list[Evidence] = []
@@ -165,38 +165,36 @@ class SemanticScholarConnector(BaseConnector):
             pub_year = paper.get("year") or 2000
             citation_count = paper.get("citationCount") or 0
             influential_count = paper.get("influentialCitationCount") or 0
+            paper_id = paper.get("paperId") or ""
 
             # Extract DOI if available
             external_ids = paper.get("externalIds") or {}
             doi = external_ids.get("DOI") or external_ids.get("doi") or ""
 
-            # Compute ERW with influential citation boost
-            erw_value = self._compute_erw(
-                citation_count=citation_count,
-                influential_count=influential_count,
-                pub_year=pub_year,
-            )
+            # citation_key is required (min_length=1) — prefer DOI, fall back to S2 paperId
+            if doi:
+                citation_key = f"doi:{doi}"
+            elif paper_id:
+                citation_key = f"s2:{paper_id}"
+            else:
+                return None  # no usable identifier at all — drop the record
 
             provenance = ProvenanceReference(
                 source_name="semantic_scholar",
-                source_url=(
-                    f"https://doi.org/{doi}"
-                    if doi
-                    else f"https://www.semanticscholar.org/paper/{paper.get('paperId', '')}"
-                ),
+                source_version="graph/v1",
+                record_id=paper_id or citation_key,
+                url=f"https://www.semanticscholar.org/paper/{paper_id}" if paper_id else None,
                 retrieved_at=datetime.utcnow(),
-                raw_id=paper.get("paperId") or "",
             )
 
+            erw = ERW.from_base(base_weight=ERW_BASE_WEIGHTS["LITERATURE"])
+
             return Evidence(
-                hypothesis_id=hypothesis_id,
-                title=title[:500],
-                abstract=abstract[:2000],
                 evidence_type=EvidenceType.LITERATURE,
-                erw=ERW(value=erw_value),
-                source="semantic_scholar",
-                doi=doi[:200] if doi else None,
-                publication_year=pub_year,
+                erw=erw,
+                citation_key=citation_key,
+                title=title[:500],
+                abstract=abstract[:2000] if abstract else None,
                 provenance=provenance,
             )
 

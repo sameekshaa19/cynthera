@@ -165,6 +165,85 @@ class ReasoningOrchestrator:
         # ── Step 1: Extract claims from literature evidence ──────────────
         all_claims = await self._extract_all_claims(package)
 
+        # ── Classify claim extraction method for transparency ------------
+        # Inspect claim raw_text for the keyword-extraction prefix inserted
+        # by _rule_based_fallback.  This is the only reliable per-record signal
+        # available after asyncio.gather has collected all results.
+        if not package.literature_evidence:
+            claim_extraction_method = "none"
+        else:
+            has_fallback = any(
+                "[keyword-extracted" in (c.raw_text or "")
+                for c in all_claims
+            )
+            has_llm = any(
+                "[keyword-extracted" not in (c.raw_text or "")
+                for c in all_claims
+            ) if all_claims else False
+            if has_llm and has_fallback:
+                claim_extraction_method = "mixed"
+            elif has_fallback:
+                claim_extraction_method = "rule_based_fallback"
+            elif has_llm:
+                claim_extraction_method = "llm"
+            else:
+                claim_extraction_method = "none"
+
+        # ── Build data_source_failures from retrieval failures -----------
+        # Each entry is a human-readable statement naming the source,
+        # what it would have contributed, and the scoring impact.
+        # These are forwarded verbatim to the frontend -- never absorbed
+        # into scores.
+        _SOURCE_DESCRIPTIONS: dict[str, str] = {
+            "chembl": (
+                "ChEMBL -- drug-target mechanism and bioactivity data. "
+                "Targets and mechanistic paths may be absent or degraded."
+            ),
+            "uniprot": (
+                "UniProt -- protein organism and annotation data. "
+                "Organism validation could not run; non-human proteins may have "
+                "passed undetected into the mechanistic chain."
+            ),
+            "pubmed": (
+                "PubMed -- primary literature evidence. "
+                "Support Score is based on reduced or absent literature."
+            ),
+            "openalex": (
+                "OpenAlex -- supplementary literature evidence. "
+                "Literature coverage is reduced."
+            ),
+            "semantic_scholar": (
+                "Semantic Scholar -- citation-weighted literature evidence. "
+                "Literature coverage is reduced."
+            ),
+            "reactome": (
+                "Reactome -- biological pathway data. "
+                "Mechanistic Score pathway component is absent; multi-hop paths "
+                "could not be validated against pathway membership."
+            ),
+            "clinicaltrials": (
+                "ClinicalTrials.gov -- human clinical trial safety data. "
+                "Risk Score cannot incorporate trial failure signals."
+            ),
+            "disgenet": (
+                "DisGeNET -- gene-disease association evidence. "
+                "Gene-disease penalty on unvalidated targets did not run."
+            ),
+        }
+        data_source_failures: list[str] = [
+            _SOURCE_DESCRIPTIONS.get(
+                src,
+                f"{src} -- retrieval failed (no further description available).",
+            )
+            for src in package.sources_failed
+        ]
+        if claim_extraction_method in ("rule_based_fallback", "none") and package.literature_evidence:
+            data_source_failures.append(
+                "LLM Claim Extraction -- Gemini API was unavailable (quota exhausted or "
+                "API key invalid). Claims were extracted using keyword matching, not "
+                "scientific reasoning. Claim quality and Support Score accuracy are degraded."
+            )
+
         # ── Step 2: Build and seal the ClaimGraph ───────────────────────
         graph = self._build_claim_graph(all_claims, package.hypothesis_id)
         graph.seal()
@@ -235,6 +314,8 @@ class ReasoningOrchestrator:
             rule_set_version="2.0",
             reasoning_duration_ms=round(duration_ms, 2),
             completed_at=datetime.utcnow(),
+            data_source_failures=data_source_failures,
+            claim_extraction_method=claim_extraction_method,
         )
 
         logger.info(
@@ -476,24 +557,46 @@ class ReasoningOrchestrator:
                 rationale="No drug targets found — mechanistic chain cannot be traced.",
             )
 
-        # ── Compute base score from multi-hop paths ─────────────────────
+        # -- Compute base score from multi-hop paths ---------------------
         if paths:
             ms_from_paths = self._multi_hop_reasoner.compute_mechanistic_score(paths)
         else:
-            target_score = min(1.0, target_count / 5) * 0.55
-            pathway_score = min(1.0, pathway_count / 3) * 0.40
-            ms_from_paths = target_score + pathway_score
+            # Targets exist but no multi-hop paths were traced.
+            # Per constitution §Placeholder-Logic: temporary heuristics are forbidden.
+            # Do NOT fabricate a score from target_count.
+            # Return MS=0.0 NONE with explicit rationale naming what is missing.
+            failed_src = ", ".join(package.sources_failed) if package.sources_failed else "none logged"
+            return MechanisticAssessment(
+                score=0.0,
+                level="NONE",
+                pathway_count=pathway_count,
+                mechanistic_chain=[],
+                rationale=(
+                    f"Mechanistic Score (MS) = 0.0 (NONE). "
+                    f"{target_count} target(s) were retrieved but no multi-hop mechanistic "
+                    "path could be traced to the queried disease. "
+                    f"Pathway count: {pathway_count}. "
+                    f"Failed retrieval sources: [{failed_src}]. "
+                    "A non-zero MS requires at least one traceable Drug->Target->Disease path. "
+                    "This is NOT a scientific negative -- it is a data absence."
+                ),
+            )
 
-        # ── FIX: Cap score at MEDIUM if no pathway data ─────────────────
+        # -- Cap score at MEDIUM if no pathway data ----------------------
         if not has_pathways:
             ms_from_paths = min(ms_from_paths, 0.55)
 
-        # ── Prior knowledge mechanistic hints boost ──────────────────────
+        # -- Prior knowledge mechanistic hints boost ---------------------
         if prior_ctx.mechanistic_hints and ms_from_paths < 0.9:
             hint_boost = min(0.10, len(prior_ctx.mechanistic_hints) * 0.03)
             ms_from_paths = min(1.0, ms_from_paths + hint_boost)
 
+        # Re-apply pathway cap as final clamp -- hint boost must not bypass it
+        if not has_pathways:
+            ms_from_paths = min(ms_from_paths, 0.55)
+
         score = round(min(1.0, ms_from_paths), 4)
+
 
         # Level assignment — cannot be HIGH without pathway evidence
         if has_pathways:
@@ -733,15 +836,17 @@ class ReasoningOrchestrator:
     ) -> tuple[RecommendationStatus, list[str]]:
         """Apply deterministic recommendation rules over (SS, MS, RS).
 
-        Rule Set v3.0 — Retrieval-First Architecture:
+        Rule Set v3.1 — Evidence-First Architecture:
+        Evidence-based rules (3, 1) fire before the data-availability lock (Rule 4).
+        This prevents a missing data source from burying strong, low-risk evidence.
+
         - Rule -1 (APPROVED INDICATION): ChEMBL signals approved for this disease
             → PROMISING, bypass ClinicalTrials safety lock (Rule 4)
             → Safety veto still applies (Rules 0 and 3)
         - Rule 0 (SAFETY_VETO): Boxed warning + HIGH risk → NOT_RECOMMENDED
-        - Rule 4 (SAFETY_LOCK): ClinicalTrials failed AND not approved → cap at UNCERTAIN
         - Rule 3 (SAFETY_VETO): RS >= 0.70 → NOT_RECOMMENDED
-        - Rule 2 (NOT_RECOMMENDED): SS <= LOW AND MS <= LOW AND RS >= HIGH
         - Rule 1 (PROMISING): SS >= MEDIUM AND MS >= MEDIUM AND RS <= LOW
+        - Rule 4 (SAFETY_LOCK): ClinicalTrials failed AND not approved → cap at UNCERTAIN
         - Rule 5 (UNCERTAIN): default
 
         Critically: Rule -1 is triggered ONLY by the retrieved ApprovalSignal
@@ -793,18 +898,7 @@ class ReasoningOrchestrator:
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
-        # Rule 4: Safety lock — clinical trials data unavailable (NOT for approved drugs)
-        if "clinicaltrials" in package.sources_failed:
-            reasons.append(
-                "Rule 4 (SAFETY LOCK): ClinicalTrials.gov data unavailable. "
-                "Without human clinical evidence, the maximum confidence level is UNCERTAIN. "
-                "This is a conservative safety constraint for repurposing hypotheses, "
-                "not a scientific negative."
-            )
-            reasons.extend(checks)
-            return RecommendationStatus.UNCERTAIN, reasons
-
-        # Rule 3: Safety veto — high risk score
+        # Rule 3: Safety veto — high risk score (evidence-based, fires before data-lock)
         if risk.score >= 0.7:
             reasons.append(
                 f"Rule 3 (SAFETY VETO): Risk Score is HIGH ({risk.score:.3f}). "
@@ -815,17 +909,7 @@ class ReasoningOrchestrator:
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
-        # Rule 2: Strong negative evidence
-        if support.score <= 0.39 and mechanistic.score <= 0.39 and risk.score >= 0.7:
-            reasons.append(
-                f"Rule 2 (NOT_RECOMMENDED): Support ({support.score:.3f}) and "
-                f"Mechanistic ({mechanistic.score:.3f}) scores are LOW, "
-                f"Risk ({risk.score:.3f}) is HIGH."
-            )
-            reasons.extend(checks)
-            return RecommendationStatus.NOT_RECOMMENDED, reasons
-
-        # Rule 1: Promising criteria
+        # Rule 1: Promising criteria (evidence-based, fires before data-lock)
         if support.score >= 0.4 and mechanistic.score >= 0.4 and risk.score <= 0.39:
             reasons.append(
                 f"Rule 1 (PROMISING): SS = {support.score:.3f} (≥ 0.40), "
@@ -835,6 +919,17 @@ class ReasoningOrchestrator:
             )
             reasons.extend(checks)
             return RecommendationStatus.PROMISING, reasons
+
+        # Rule 4: Safety lock — clinical trials data unavailable (fallback, after evidence)
+        if "clinicaltrials" in package.sources_failed:
+            reasons.append(
+                "Rule 4 (SAFETY LOCK): ClinicalTrials.gov data unavailable. "
+                "Without human clinical evidence, the maximum confidence level is UNCERTAIN. "
+                "This is a conservative safety constraint for repurposing hypotheses, "
+                "not a scientific negative."
+            )
+            reasons.extend(checks)
+            return RecommendationStatus.UNCERTAIN, reasons
 
         # Rule 5: Default uncertain
         reasons.append(
@@ -1065,7 +1160,7 @@ class ReasoningOrchestrator:
                 rationale_lines.append(f"  • {citation}")
 
         # ── Positive and Negative Factors (from evidence checks) ────────────
-        checks = self._build_evidence_checklist(
+        checks = self._build_evidence_checks(
             support, mechanistic, risk, contradictions, package
         )
         positive_factors: list[str] = []
