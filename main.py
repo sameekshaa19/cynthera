@@ -50,11 +50,17 @@ def main():
         type=str,
         help="Output file path for JSON report (optional)"
     )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass evaluation and raw response caches (force fresh API calls)"
+    )
     
     args = parser.parse_args()
     
     # Process
-    logger.info(f"Processing: {args.drug} -> {args.disease} (policy: {args.policy})")
+    logger.info(f"Processing: {args.drug} -> {args.disease} (policy: {args.policy}) [bypass_cache={args.no_cache}]")
     
     orchestrator = MasterOrchestrator(
         llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
@@ -71,7 +77,7 @@ def main():
     
     try:
         hypothesis, package, result = asyncio.run(
-            orchestrator.evaluate(args.drug, args.disease, policy=policy)
+            orchestrator.evaluate(args.drug, args.disease, policy=policy, bypass_cache=args.no_cache)
         )
     except Exception as exc:
         logger.critical(f"Pipeline execution failed: {exc}", exc_info=True)
@@ -87,7 +93,14 @@ def main():
     print(f"Support Score (SS): {result.support_assessment.score:.3f} ({result.support_assessment.level})")
     print(f"Mechanistic Score (MS): {result.mechanistic_assessment.score:.3f} ({result.mechanistic_assessment.level})")
     print(f"Risk Score (RS): {result.risk_assessment.score:.3f} ({result.risk_assessment.level})")
-    print(f"\nSummary:\n{result.audit_report.summary}")
+    summary_text = str(result.audit_report.summary).encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8')
+    print(f"\nSummary:\n{summary_text}")
+
+    if result.audit_report.claims_by_source:
+        print("\nClaims Breakdown by Source:")
+        for src, count in result.audit_report.claims_by_source.items():
+            print(f"  • {src.upper()}: {count} claim(s)")
+
     print("="*60)
     
     # Save to file if requested

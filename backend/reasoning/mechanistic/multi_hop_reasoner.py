@@ -112,14 +112,26 @@ def _compute_target_confidence(
 
 
 def _build_validated_gene_set(package: RetrievalPackage) -> set[str]:
-    """Build set of gene symbols with DisGeNET evidence matching the disease MeSH ID.
+    """Build set of gene symbols / UniProt accessions with Open Targets or DisGeNET association.
 
-    Only genes that appear in DisGeNET evidence records whose disease_identifier
-    matches the resolved MeSH ID of the queried disease are included. This ensures
-    that pathway/gene hops in multi-hop paths are grounded in ontology-backed
-    gene-disease association data rather than free-text disease name matching.
+    Gap 1 Fix: Reads from package.validated_disease_genes (populated by Open Targets
+    as primary, or DisGeNET as fallback). Stores both gene symbols and UniProt IDs
+    that have a positive association score with the target disease.
+
+    Falls back to legacy string parsing of evidence_records if validated_disease_genes
+    is empty (for backwards compatibility with cached packages created before Phase 4).
     """
     validated: set[str] = set()
+
+    # Primary path: read structured validated_disease_genes from package
+    val_genes = getattr(package, "validated_disease_genes", {})
+    if val_genes:
+        for k, score in val_genes.items():
+            if score > 0:
+                validated.add(k)
+        return validated
+
+    # Legacy fallback path: string-parse evidence_records if DisGeNET evidence is present
     disease_mesh = getattr(package.disease, "mesh_id", None)
     if not disease_mesh:
         return validated

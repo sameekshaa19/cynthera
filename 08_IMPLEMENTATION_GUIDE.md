@@ -68,7 +68,9 @@ The codebase uses the vocabulary of `02_DOMAIN_MODEL.md` exactly. Class names, f
 | **SQLAlchemy 2.0 (async)** | Database ORM and query builder | Native async support; declarative models; compatible with Alembic |
 | **asyncpg** | PostgreSQL async driver | Highest-throughput Python async PostgreSQL driver; SQLAlchemy 2.0 native support |
 | **Alembic** | Database migrations | Tight SQLAlchemy integration; auto-generation of migration scripts from model diffs |
-| **httpx** | Async HTTP client | All external API calls (ChEMBL, UniProt, PubMed, etc.) use httpx with async context managers |
+| **httpx** | Async HTTP client | All external API calls (ChEMBL, UniProt, PubMed, Europe PMC, Open Targets, ClinicalTrials.gov, etc.) and Groq API calls use httpx with async context managers |
+| **Groq / Gemini API** | LLM Claim Extraction | Groq API (`llama-3.3-70b-versatile`) via zero-dependency async `httpx` and Google Gemini (`gemini-2.0-flash`) via `google-genai` with automatic weighted rule-based fallback |
+| **SQLite (`data/cynthera.db`)** | Raw-Response Cache Store | High-performance local key-value raw response cache with tiered TTLs (30d structural, 14d associations, 7d literature, 1d clinical trials) and `--no-cache` bypass |
 | **asyncio** | Concurrency model | Phase 2 (parallel evidence retrieval) and Phase 4 (parallel Expert Agents) use asyncio gather |
 | **tenacity** | Retry logic | Configurable retry policies with exponential backoff for all Source connectors and LLM calls |
 | **structlog** | Structured logging | JSON-formatted log events consumable by ELK/Datadog; trace ID propagation |

@@ -384,9 +384,11 @@ The LLM is a claim extraction tool, not a reasoning participant. Its authority i
 *   Every extraction run is logged with the LLM model version, temperature setting, and prompt template version.
 *   The agent logs the count of evidence records processed, claims extracted, and claims flagged as low-confidence.
 
-**Failure Handling**: If the LLM API is unavailable, the agent retries up to 3 times with exponential backoff. If all retries fail and no claims are extracted, the agent returns an empty list with status `EXTRACTION_FAILED`. The Orchestrator terminates the reasoning session.
-
-**Future Extensions**: Structured data extraction from ChEMBL assay narratives; multi-language abstract processing; extraction confidence calibration using a held-out benchmark.
+**LLM Provider Engine & Fallback Handling**:
+*   **LLM Providers**: Supported LLM providers include **Groq API** (`llama-3.3-70b-versatile`) via zero-dependency async `httpx` and **Google Gemini** (`gemini-2.0-flash`) via `google-genai`.
+*   **Rule-Based Fallback**: If LLM API keys are unconfigured or APIs fail, the agent seamlessly falls back to `rule_based_fallback` (keyword pattern matching).
+*   **ERW Weight Discounting**: To prevent unverified keyword claims from over-inflating Support Scores or driving false contradictions, fallback claims receive a `0.5x` ERW discount multiplier (`ERW.from_base(base_weight, replication_modifier=0.5)`).
+*   **Log Spam Suppression**: Unconfigured key warnings log at most once per evaluation session (`INFO` level).
 
 ---
 

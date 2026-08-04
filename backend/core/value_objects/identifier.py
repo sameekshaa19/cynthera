@@ -85,3 +85,13 @@ class ResolvedIdentifierSet(BaseModel):
     def uniprot_id(self) -> str | None:
         """Convenience accessor for UniProt accession."""
         return self.get("uniprot")
+
+    @property
+    def mondo_id(self) -> str | None:
+        """Convenience accessor for Open Targets MONDO disease ID.
+
+        Populated by IdentifierResolutionService when the Open Targets
+        search endpoint successfully resolves the disease name.
+        Returns None if not yet resolved or if OT was unavailable.
+        """
+        return self.get("mondo")

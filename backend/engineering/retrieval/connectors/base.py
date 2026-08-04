@@ -47,6 +47,7 @@ class BaseConnector(abc.ABC):
         self._client = httpx.AsyncClient(
             timeout=self.timeout_seconds,
             headers=self._build_headers(),
+            follow_redirects=True,
         )
         return self
 
@@ -124,7 +125,7 @@ class BaseConnector(abc.ABC):
             return await self._get_with_retry(url, params)
         except httpx.HTTPStatusError as exc:
             logger.warning(
-                "http_error",
+                f"http_error: source={self.source_name} url={url} status={exc.response.status_code}",
                 extra={
                     "source": self.source_name,
                     "url": url,
@@ -137,10 +138,85 @@ class BaseConnector(abc.ABC):
             ) from exc
         except httpx.RequestError as exc:
             logger.error(
-                "request_error",
-                extra={"source": self.source_name, "url": url},
+                f"request_error: source={self.source_name} url={url} error={exc}",
+                extra={"source": self.source_name, "url": url, "error": str(exc)},
             )
             raise SourceUnavailableError(
                 source_name=self.source_name,
                 retry_count=3,
             ) from exc
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+        reraise=True,
+    )
+    async def _post_with_retry(
+        self, url: str, json_body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute a POST request with JSON body and tenacity retry logic.
+
+        Identical retry configuration to _get_with_retry (3 attempts,
+        exponential backoff 1s→2s→4s).
+
+        Args:
+            url: Full URL to POST to.
+            json_body: JSON-serialisable request body dict.
+
+        Returns:
+            Parsed JSON response as dict.
+        """
+        response = await self._client.post(url, json=json_body)
+        response.raise_for_status()
+        return response.json()
+
+    async def _post(
+        self, url: str, json_body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute a POST request with retry and return parsed JSON.
+
+        Used by connectors that require POST (e.g. GraphQL endpoints).
+        Follows the identical error-handling pattern as _get().
+
+        Args:
+            url: Full URL to POST to.
+            json_body: JSON-serialisable request body dict.
+
+        Returns:
+            Parsed JSON response as dict.
+
+        Raises:
+            SourceUnavailableError: If the request fails after retries.
+        """
+        from backend.core.exceptions import SourceUnavailableError
+
+        if not self._client:
+            raise RuntimeError(
+                f"{self.__class__.__name__} must be used as an async context manager."
+            )
+        try:
+            return await self._post_with_retry(url, json_body)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                f"http_error: source={self.source_name} url={url} status={exc.response.status_code}",
+                extra={
+                    "source": self.source_name,
+                    "url": url,
+                    "status_code": exc.response.status_code,
+                },
+            )
+            raise SourceUnavailableError(
+                source_name=self.source_name,
+                retry_count=3,
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error(
+                f"request_error: source={self.source_name} url={url} error={exc}",
+                extra={"source": self.source_name, "url": url, "error": str(exc)},
+            )
+            raise SourceUnavailableError(
+                source_name=self.source_name,
+                retry_count=3,
+            ) from exc
+

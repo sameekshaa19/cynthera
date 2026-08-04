@@ -979,3 +979,9 @@ For high-throughput batch processing scenarios where HTTP/JSON overhead is unacc
 ### 11.5 SDK Generation
 
 OpenAPI schema auto-generated from the FastAPI application will be used to generate client SDKs in Python, TypeScript, and R for computational biology workbench integration.
+
+### 11.6 Controlled Vocabularies & Enum Schemas
+
+*   **`RecommendationStatus`**: `PROMISING` | `UNCERTAIN` | `NOT_RECOMMENDED` | `RESOLUTION_FAILED` (Hard gate triggered when drug and disease IDs cannot be resolved).
+*   **`TrialOutcomeStatus`**: `COMPLETED_SUCCESS` | `COMPLETED_FAILURE` | `TERMINATED_LACK_OF_EFFICACY` | `TERMINATED_SAFETY` | `TERMINATED_ADMINISTRATIVE` (Non-clinical terminations, 0.0 risk burden) | `ACTIVE` | `UNKNOWN`.
+*   **`ScientificAuditReport`**: Contains `claims_by_source: dict[str, int]` mapping literature source names (e.g., `pubmed`, `europepmc`) to extracted claim counts.

@@ -124,7 +124,7 @@ SEQUENTIAL | DETERMINISTIC
 ### Failure Handling
 | Error Type | Behavior |
 | :--- | :--- |
-| ID Resolution failure | Fatal. Return `400 Bad Request` with resolution error detail. |
+| ID Resolution failure | Fatal. Short-circuit execution and return `RecommendationStatus.RESOLUTION_FAILED` with zeroed scores (`SS=0.0`, `MS=0.0`, `RS=0.0`). |
 | All core retrieval sources fail | Fatal. Return `503 Service Unavailable`. |
 | Reasoning Orchestrator failure | Fatal. Return `500 Internal Server Error`. |
 | Single non-core source failure | Recoverable. Log, continue, flag in RetrievalManifest. |

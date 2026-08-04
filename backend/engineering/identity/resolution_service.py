@@ -1,9 +1,15 @@
 """IdentifierResolutionService — maps drug/disease names to canonical IDs.
 
 Reference: 01_SYSTEM_ARCHITECTURE.md §3.4, 03_RETRIEVAL_SPECIFICATION.md
+
+Phase 4 addition: resolve_disease() now also resolves Open Targets MONDO IDs
+concurrently with MeSH resolution. OT unavailability is gracefully degraded —
+a missing MONDO ID delays Open Targets association fetch but does NOT raise
+DiseaseNotResolvedException or block the pipeline.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -18,6 +24,15 @@ logger = logging.getLogger(__name__)
 CHEMBL_SEARCH_URL = "https://www.ebi.ac.uk/chembl/api/data/molecule/search.json"
 PUBCHEM_SEARCH_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{name}/JSON"
 MESH_SEARCH_URL = "https://id.nlm.nih.gov/mesh/lookup/descriptor"
+OPEN_TARGETS_GQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
+
+_GQL_DISEASE_SEARCH = (
+    'query SearchDisease($name: String!) {'
+    '  search(queryString: $name, entityNames: ["disease"], page: {index: 0, size: 5}) {'
+    '    hits { id name }'
+    '  }'
+    '}'
+)
 
 
 class IdentifierResolutionService:
@@ -108,14 +123,21 @@ class IdentifierResolutionService:
     ) -> ResolvedIdentifierSet:
         """Resolve a disease name to a canonical identifier set.
 
-        Attempts NLM MeSH lookup.
+        Attempts NLM MeSH lookup and Open Targets MONDO ID resolution
+        concurrently. Both run in parallel to avoid serial latency.
+
+        OT availability is NOT required: a missing MONDO ID is gracefully
+        degraded (warning logged) but does NOT raise DiseaseNotResolvedException.
+        The MONDO ID is stored as a 'mondo' namespace identifier so it is
+        accessible via disease.mondo_id and used as the stable cache key
+        for Open Targets association queries.
 
         Args:
             disease_name: Common disease name (e.g., 'Pulmonary Arterial Hypertension').
             trace_id: Optional trace ID for logging.
 
         Returns:
-            ResolvedIdentifierSet with resolved MeSH identifier.
+            ResolvedIdentifierSet with MeSH and MONDO identifiers where available.
 
         Raises:
             DiseaseNotResolvedException: If no identifier can be resolved.
@@ -123,9 +145,22 @@ class IdentifierResolutionService:
         identifiers: list[CanonicalIdentifier] = []
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            mesh_id = await self._resolve_mesh(client, disease_name)
-            if mesh_id:
-                identifiers.append(CanonicalIdentifier(namespace="mesh", value=mesh_id))
+            # Run MeSH and MONDO resolution concurrently
+            mesh_id, mondo_id = await asyncio.gather(
+                self._resolve_mesh(client, disease_name),
+                self._resolve_opentargets_mondo(client, disease_name),
+                return_exceptions=False,
+            )
+
+        if mesh_id:
+            identifiers.append(CanonicalIdentifier(namespace="mesh", value=mesh_id))
+
+        if mondo_id:
+            identifiers.append(CanonicalIdentifier(namespace="mondo", value=mondo_id))
+            logger.info(
+                "mondo_resolved",
+                extra={"disease_name": disease_name, "mondo_id": mondo_id},
+            )
 
         if not identifiers:
             # Graceful degradation: create a synthetic identifier from the name
@@ -133,12 +168,19 @@ class IdentifierResolutionService:
                 "disease_mesh_not_found",
                 extra={"disease_name": disease_name},
             )
-            # Use the name itself as a low-confidence synthetic ID
             identifiers.append(
                 CanonicalIdentifier(namespace="name", value=disease_name.lower().replace(" ", "_"))
             )
 
-        confidence = 1.0 if any(i.namespace == "mesh" for i in identifiers) else 0.3
+        has_mesh = any(i.namespace == "mesh" for i in identifiers)
+        has_mondo = any(i.namespace == "mondo" for i in identifiers)
+        if has_mesh and has_mondo:
+            confidence = 1.0
+        elif has_mesh or has_mondo:
+            confidence = 0.8
+        else:
+            confidence = 0.3
+
         resolved = ResolvedIdentifierSet(
             entity_name=disease_name,
             entity_type="disease",
@@ -147,7 +189,12 @@ class IdentifierResolutionService:
         )
         logger.info(
             "disease_resolved",
-            extra={"disease_name": disease_name, "confidence": confidence},
+            extra={
+                "disease_name": disease_name,
+                "confidence": confidence,
+                "mesh_found": has_mesh,
+                "mondo_found": has_mondo,
+            },
         )
         return resolved
 
@@ -253,6 +300,9 @@ class IdentifierResolutionService:
     ) -> str | None:
         """Look up MeSH ID for a disease name via NLM MeSH API.
 
+        Normalizes possessive apostrophes (e.g. 'Alzheimer's Disease' -> 'Alzheimer Disease')
+        which MeSH descriptors use.
+
         Args:
             client: Active httpx async client.
             disease_name: Disease name to search.
@@ -260,17 +310,92 @@ class IdentifierResolutionService:
         Returns:
             MeSH descriptor ID string, or None if not found.
         """
+        clean_name = disease_name.replace("'s", "").replace("’s", "").strip()
+        queries = [disease_name]
+        if clean_name != disease_name:
+            queries.append(clean_name)
+
+        for q in queries:
+            try:
+                resp = await client.get(
+                    MESH_SEARCH_URL,
+                    params={"label": q, "match": "contains", "limit": 1},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    resource = data[0].get("resource", "")
+                    if resource:
+                        return resource.rstrip("/").split("/")[-1]
+            except Exception as exc:
+                logger.warning("mesh_resolve_failed", extra={"disease": q, "error": str(exc)})
+        return None
+
+    async def _resolve_opentargets_mondo(
+        self,
+        client: httpx.AsyncClient,
+        disease_name: str,
+    ) -> str | None:
+        """Resolve a disease name to an Open Targets MONDO ID.
+
+        Runs concurrently with _resolve_mesh() inside resolve_disease().
+        Any exception is caught and returns None — OT unavailability must
+        not prevent disease resolution from succeeding.
+
+        Scoring: exact case-insensitive match > Jaccard token similarity.
+        Uses top 5 candidates (page size 5) to handle synonym mismatches
+        (e.g. 'Multiple Myeloma' → 'plasma cell myeloma').
+
+        Args:
+            client: Active httpx async client.
+            disease_name: Disease common name.
+
+        Returns:
+            MONDO ID string (e.g. 'MONDO_0009693'), or None on failure.
+        """
         try:
-            resp = await client.get(
-                MESH_SEARCH_URL,
-                params={"label": disease_name, "match": "contains", "limit": 1},
+            resp = await client.post(
+                OPEN_TARGETS_GQL_URL,
+                json={"query": _GQL_DISEASE_SEARCH, "variables": {"name": disease_name}},
+                headers={"Content-Type": "application/json"},
             )
             resp.raise_for_status()
             data = resp.json()
-            if data:
-                resource = data[0].get("resource", "")
-                if resource:
-                    return resource.rstrip("/").split("/")[-1]
         except Exception as exc:
-            logger.warning("mesh_resolve_failed", extra={"disease": disease_name, "error": str(exc)})
-        return None
+            logger.warning(
+                "opentargets_mondo_resolve_failed",
+                extra={"disease": disease_name, "error": str(exc)},
+            )
+            return None
+
+        hits = (data.get("data") or {}).get("search", {}).get("hits", [])
+        if not hits:
+            logger.info(
+                "opentargets_mondo_no_hits",
+                extra={"disease": disease_name},
+            )
+            return None
+
+        # Score candidates: exact match first, then Jaccard token similarity
+        query_tokens = set(disease_name.lower().split())
+        best_hit: dict | None = None
+        best_score = -1.0
+
+        for hit in hits:
+            hit_name = (hit.get("name") or "").lower()
+            if hit_name == disease_name.lower():
+                best_hit = hit
+                break
+            hit_tokens = set(hit_name.split())
+            if query_tokens and hit_tokens:
+                jaccard = len(query_tokens & hit_tokens) / len(query_tokens | hit_tokens)
+            else:
+                jaccard = 0.0
+            if jaccard > best_score:
+                best_score = jaccard
+                best_hit = hit
+
+        if not best_hit:
+            best_hit = hits[0]
+
+        return best_hit.get("id")

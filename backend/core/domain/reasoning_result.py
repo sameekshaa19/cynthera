@@ -131,6 +131,10 @@ class ScientificAuditReport(BaseModel):
         default_factory=list,
         description="Formatted citation strings: PMID/DOI, title, evidence type, ERW.",
     )
+    claims_by_source: dict[str, int] = Field(
+        default_factory=dict,
+        description="Breakdown of extracted claims by literature source name (e.g. pubmed, europepmc).",
+    )
     safety_breakdown: dict[str, Any] = Field(
         default_factory=dict,
         description=(
@@ -212,3 +216,48 @@ class ReasoningResult(BaseModel):
             "not scientifically extracted. Displayed in the report."
         ),
     )
+
+    @classmethod
+    def resolution_failed(
+        cls,
+        hypothesis_id: uuid.UUID,
+        drug_name: str,
+        disease_name: str,
+        reasons: list[str] | None = None,
+    ) -> "ReasoningResult":
+        """Factory method for creating a RESOLUTION_FAILED ReasoningResult when
+        identity resolution fails for both drug and disease.
+
+        Suppresses misleading scores (SS=0.0, MS=0.0, RS=0.0) and sets status
+        to RESOLUTION_FAILED with explicit diagnostic summary.
+        """
+        summary_msg = (
+            f"Identifier resolution failed for '{drug_name}' and/or '{disease_name}'. "
+            "Neither entity could be mapped to canonical ontology identifiers (ChEMBL, MeSH, MONDO). "
+            "No scientific conclusion can be drawn from this run — a retry or synonym query is recommended."
+        )
+        fail_reasons = reasons or [
+            f"Failed to map drug '{drug_name}' to a ChEMBL compound ID.",
+            f"Failed to map disease '{disease_name}' to a MeSH or MONDO ID.",
+        ]
+        return cls(
+            hypothesis_id=hypothesis_id,
+            support_assessment=SupportAssessment(
+                score=0.0, level="NONE", rationale="Resolution failed — support score not computed."
+            ),
+            mechanistic_assessment=MechanisticAssessment(
+                score=0.0, level="NONE", rationale="Resolution failed — mechanistic score not computed."
+            ),
+            risk_assessment=RiskAssessment(
+                score=0.0, level="NONE", rationale="Resolution failed — risk score not computed."
+            ),
+            recommendation_status=RecommendationStatus.RESOLUTION_FAILED,
+            recommendation_reasons=fail_reasons,
+            audit_report=ScientificAuditReport(
+                summary=summary_msg,
+                confidence_narrative="Confidence is 0.0 because entity identity could not be established.",
+                recommendation_rationale="Identifier resolution hard gate triggered.",
+                data_gaps=["Drug ChEMBL ID unmapped", "Disease MeSH/MONDO ID unmapped"],
+            ),
+            completed_at=datetime.utcnow(),
+        )

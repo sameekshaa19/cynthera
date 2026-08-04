@@ -2,274 +2,223 @@
 
 **Mechanism-grounded drug repurposing through multi-agent AI reasoning**
 
-> [!NOTE]
-> For the comprehensive, research-grade architectural blueprint and engineering design guidelines, see the [Foundational Engineering Specification](file:///c:/Users/User/Desktop/cynthera/SPECIFICATION.md).
+CYNTHERA is an agentic AI system that evaluates drug-disease repurposing hypotheses through mechanism-driven reasoning, cross-verification, and uncertainty modeling. Unlike pure similarity-based approaches, it prioritizes biological plausibility and produces fully explainable outputs with uncertainty as a first-class citizen.
 
-CYNTHERA is an agentic AI system that evaluates drug-disease pairs through mechanism-driven reasoning, cross-verification, and uncertainty modeling. Unlike similarity-based approaches, it prioritizes biological plausibility and produces explainable outputs with uncertainty as a first-class citizen.
+---
 
 ## ✨ Features
 
-- **Mechanism-First Reasoning**: Prioritizes biological plausibility over similarity matching
-- **Multi-Agent Architecture**: Specialized agents across engineering and reasoning layers working in coordination
-- **Uncertainty Quantification**: Treats conflicts and uncertainty as first-class outputs
-- **Explainable Results**: Full citation tracking and provenance for all claims
-- **100% Free Resources**: Uses only free/open-source databases and tools
-- **Interactive Web UI**: Modern Streamlit interface with visualizations
-- **CLI Support**: Command-line interface for batch processing
+- **Mechanism-First Reasoning**: Traces multi-hop biological pathways (Drug → Target → Pathway → Disease Gene) using Reactome and UniProt data.
+- **Multi-Agent Architecture**: Coordinates deterministic engineering pipeline components with specialized reasoning agents.
+- **Flexible LLM Provider Engine**: Native support for **Groq API** (`llama-3.3-70b-versatile`) and **Google Gemini** (`gemini-2.0-flash`) with automatic, weighted rule-based fallback.
+- **Per-Source Claims Breakdown**: Full citation and provenance tracking per data source (PubMed, Europe PMC, Open Targets, ClinicalTrials.gov).
+- **Contextual Clinical Trial Analysis**: Inspects `whyStopped` trial logs to distinguish true safety/efficacy failures from administrative friction (low enrollment, COVID-19 delays, funding limits).
+- **Raw-Response SQLite Cache Layer**: Tiered TTL caching (30-day structural, 14-day associations, 7-day literature, 1-day clinical trials) with `--no-cache` bypass.
+- **Identity Resolution Hard Gate**: Short-circuits invalid queries gracefully with `RESOLUTION_FAILED` status when canonical database IDs cannot be resolved.
+- **100% Free Open Biomedical Data**: Built entirely on free, open biomedical APIs.
+- **Interactive Streamlit Web UI & CLI**: Rich visual dashboard and command-line interfaces.
+
+---
 
 ## 🏗️ Architecture
 
-CYNTHERA follows a **hybrid architecture** with a deterministic engineering layer and an agentic reasoning layer separated by a sealed `RetrievalPackage` boundary.
+CYNTHERA uses a **sealed two-tier architecture**: a deterministic engineering retrieval layer feeds a structured `RetrievalPackage` into an agentic reasoning layer.
 
-### Engineering Layer (Deterministic)
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ENGINEERING LAYER (Deterministic)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Master Orchestrator → Identity Resolver (ChEMBL, MeSH, MONDO, UniProt)   │
+│                       ↓                                                 │
+│ Async Parallel Retrieval Pipeline (PubMed, Europe PMC, Open Targets,    │
+│                     Reactome, ClinicalTrials.gov, DisGeNET)            │
+│                       ↓                                                 │
+│ SQLite Raw-Response Cache Layer (`data/cynthera.db`)                    │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                        Sealed `RetrievalPackage`
+                                     │
+┌────────────────────────────────────▼────────────────────────────────────┐
+│                      REASONING LAYER (Agentic + Rules)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Claim Extraction Agent (Groq / Gemini LLM with discounted Fallback)    │
+│                       ↓                                                 │
+│ 6 Parallel Expert Agents:                                                │
+│   • Support Assessment Agent     • Mechanistic Expert Agent             │
+│   • Clinical & Safety Agent      • Risk Assessment Agent                │
+│   • Disease Biology Expert       • Contradiction Analysis Agent         │
+│                       ↓                                                 │
+│ Deterministic Consensus & Rule Engine (v3.1 Evidence-First Rules)       │
+│                       ↓                                                 │
+│ Scientific Audit Report & Recommendation Status                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-Orchestrates data acquisition, identifier resolution, and retrieval from external biomedical APIs. All operations are deterministic with no LLM involvement.
+---
 
-- **Master Orchestrator**: Coordinates the full pipeline lifecycle
-- **Identifier Resolution Service**: Maps drug/disease names to standardized database keys (ChEMBL, PubChem, MeSH, UMLS)
-- **Retrieval Planner & Query Optimizer**: Plans and optimizes API call schedules
-- **Retrieval Pipeline**: Executes async parallel queries to external data sources
-- **Canonical Mapping Registry**: Normalizes raw API payloads into canonical domain objects
-- **Quality Gate**: Validates and seals the `RetrievalPackage` before passing to reasoning
+## 🌐 Data Sources (100% Free & Open)
 
-### Reasoning Layer (Agentic + Deterministic)
+| Data Source | Domain / Information | Connector / Protocol |
+| :--- | :--- | :--- |
+| **ChEMBL** | Drug bioactivities, mechanisms, indication data | REST (`httpx`) |
+| **UniProt** | Human protein accessions, Swiss-Prot canonical mapping | REST (`httpx`) |
+| **Reactome** | Human biological pathways & participant mapping | REST (`httpx`) |
+| **Europe PMC** | Open-access biomedical literature & abstracts | REST (`httpx`) |
+| **PubMed** | NCBI literature & MEDLINE citations | E-utilities REST (`httpx`) |
+| **Open Targets** | MONDO disease-gene associations & UniProt mapping | GraphQL (`_post_with_retry`) |
+| **ClinicalTrials.gov** | Human trial status & `whyStopped` termination logs | REST API v2 (`httpx`) |
+| **DisGeNET** | Gene-disease association scores | REST (`httpx`) |
 
-Transforms structured evidence into reproducible scientific conclusions. LLMs are used strictly for claim extraction; all scoring and decision-making is deterministic.
-
-- **Claim Extraction Agent** (LLM-assisted): Extracts structured (subject, predicate, object) triplets from literature
-- **Claim Validation Agent** (deterministic): Validates and assigns Evidence Reliability Weights to claims
-- **Claim Graph**: Sealed immutable graph of validated claims — the central reasoning artifact
-
-Six parallel Expert Agents evaluate the hypothesis independently:
-
-1. **Mechanistic Expert Agent**: Constructs and validates biological pathway chains from drug to disease
-2. **Disease Biology Expert Agent**: Evaluates drug mechanism relevance to disease pathophysiology
-3. **Clinical Evidence Expert Agent**: Assesses human clinical trial evidence
-4. **Support Assessment Agent**: Aggregates evidence favoring the hypothesis
-5. **Risk Assessment Agent**: Evaluates harm, inefficacy, and contraindication signals
-6. **Contradiction Analysis Agent**: Detects and scores conflicting claims
-
-Synthesis and decision-making:
-
-- **Consensus Engine**: Integrates all six assessments into a unified consensus
-- **Rule Engine**: Applies deterministic, versioned rules to produce a `RecommendationStatus`
-- **Scientific Audit Agent**: Generates the fully traceable audit report
-
-### Data Sources (All Free)
-
-- **Drug Data**: PubChem, ChEMBL, DrugBank Open Data
-- **Literature**: PubMed E-utilities, OpenAlex, Semantic Scholar
-- **Pathways**: Reactome
-- **Gene-Disease**: DisGeNET
-- **Proteins**: UniProt
+---
 
 ## 🚀 Quick Start
 
 ### Installation
 
-1. **Clone or navigate to the project directory**:
-```bash
-cd c:\Users\User\Desktop\cynthera
-```
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/sameekshaa19/cynthera.git
+   cd cynthera
+   ```
 
-2. **Create a virtual environment** (recommended):
-```bash
-python -m venv venv
-venv\Scripts\activate  # Windows
-```
+2. **Set up a Python virtual environment**:
+   ```bash
+   python -m venv venv
+   # On Windows:
+   venv\Scripts\activate
+   # On Linux/macOS:
+   source venv/bin/activate
+   ```
 
 3. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Configure Environment Variables**:
+   Copy `.env.example` to `.env` and set your preferred LLM provider:
+   ```bash
+   copy .env.example .env  # Windows
+   # or: cp .env.example .env
+   ```
+
+   In `.env`:
+   ```env
+   LLM_PROVIDER=groq
+   GROQ_API_KEY=gsk_your_groq_api_key_here
+   GEMINI_API_KEY=your_gemini_api_key_here
+   ```
+
+---
+
+### Running via CLI
+
+Evaluate a drug-disease pair from the command line:
+
 ```bash
-pip install -r requirements.txt
-pip install reportlab pytest-mock python-multipart  # Phase 3 dependencies
+python main.py --drug "Aspirin" --disease "Multiple Myeloma"
 ```
 
-4. **Optional: Set up API keys** (for higher rate limits):
+Bypass raw response cache for fresh live API data:
 ```bash
-copy .env.example .env
-# Edit .env and add your API keys
+python main.py --drug "Duloxetine" --disease "Diabetic Neuropathy" --no-cache
 ```
+
+Save full JSON report to file:
+```bash
+python main.py --drug "Thalidomide" --disease "Multiple Myeloma" --output report.json
+```
+
+---
 
 ### Running the Web Interface
 
+Launch the interactive Streamlit dashboard:
+
 ```bash
-streamlit run frontend/app.py
+streamlit run app.py
 ```
 
-Then open your browser to `http://localhost:8501`
+Then open `http://localhost:8501` in your browser.
+
+---
 
 ### Running the API Server
+
+Launch the FastAPI backend server:
 
 ```bash
 python -m uvicorn backend.api.main:app --reload --port 8000
 ```
 
-The API docs will be available at `http://localhost:8000/docs`
+Open interactive Swagger documentation at `http://localhost:8000/docs`.
 
-### Using the CLI
+---
 
-```bash
-python main.py --drug "Sildenafil" --disease "Pulmonary Arterial Hypertension" --policy STANDARD
+## 📊 Sample Output & Report Structure
+
+CYNTHERA generates a comprehensive `ScientificAuditReport` containing:
+
+```text
+============================================================
+CYNTHERA HYPOTHESIS REPORT
+============================================================
+Drug: Duloxetine (ChEMBL ID: CHEMBL1175)
+Disease: Diabetic Neuropathy (MeSH ID: D003929, MONDO ID: MONDO_0001583)
+Recommendation: PROMISING
+Support Score (SS): 0.984 (HIGH)
+Mechanistic Score (MS): 0.793 (HIGH)
+Risk Score (RS): 0.000 (NONE)
+
+Summary:
+CYNTHERA v2.0 analysis of Duloxetine → Diabetic Neuropathy produced a recommendation of 'PROMISING'.
+Evidence Strength: 98.4% (HIGH) | Mechanistic Plausibility: 79.3% (HIGH) | Risk Level: 0.0% (NONE).
+4 claim(s) extracted from literature (4 from pubmed), 0 contradiction(s) detected. Safety grade: A. 9 mechanistic path(s) traced.
+
+Claims Breakdown by Source:
+  • PUBMED: 4 claim(s)
+============================================================
 ```
 
-With JSON output:
-```bash
-python main.py --drug "Sildenafil" --disease "Pulmonary Arterial Hypertension" --output report.json
-```
-
-## 📖 Usage Examples
-
-### Example: Async Programmatic Execution
-
-```python
-import asyncio
-from backend.engineering.orchestrator.master_orchestrator import MasterOrchestrator
-from backend.core.enums.retrieval_policy import RetrievalPolicy
-
-async def run_evaluation():
-    orchestrator = MasterOrchestrator()
-    hypothesis, package, result = await orchestrator.evaluate(
-        drug_name="Sildenafil",
-        disease_name="Pulmonary Arterial Hypertension",
-        policy=RetrievalPolicy.STANDARD
-    )
-    
-    print(f"Recommendation: {result.recommendation_status.value}")
-    print(f"Support Score: {result.support_assessment.score:.3f}")
-    print(f"Mechanistic Score: {result.mechanistic_assessment.score:.3f}")
-    print(f"Risk Score: {result.risk_assessment.score:.3f}")
-
-asyncio.run(run_evaluation())
-```
-
-> [!NOTE]
-> The Python API examples above use direct library calls for development and testing. Production deployments route through the FastAPI HTTP layer as documented in the [API Contracts specification](07_API_CONTRACTS.md).
+---
 
 ## 📁 Project Structure
 
 ```
 cynthera/
 ├── backend/                 # Server-side application code
-│   ├── api/                 # FastAPI application layer
-│   │   ├── v1/routes/       # API route handlers (evaluate, hypotheses, system)
-│   │   ├── dependencies.py  # Dependency injection providers
-│   │   └── middleware.py    # Auth, rate limiting, trace injection
-│   │   └── main.py          # FastAPI app factory
-│   ├── core/                # Domain layer (no external dependencies)
-│   │   ├── domain/          #   Canonical entities (Drug, Disease, Claim, etc.)
-│   │   ├── enums/           #   Controlled vocabularies (PredicateType, EvidenceType, etc.)
-│   │   └── value_objects/   #   Immutable value types (ERW, Provenance, Identifiers)
+│   ├── api/                 # FastAPI application layer & routes
+│   ├── core/                # Domain models, value objects, and enums
+│   │   ├── domain/          #   Drug, Disease, Claim, Evidence, ApprovalSignal
+│   │   ├── enums/           #   RecommendationStatus, TrialOutcomeStatus, etc.
+│   │   └── value_objects/   #   ERW, ProvenanceReference, CanonicalIdentifier
 │   ├── engineering/         # Deterministic retrieval infrastructure
 │   │   ├── orchestrator/    #   Master Orchestrator
-│   │   ├── identity/        #   Identifier Resolution Service
-│   │   ├── retrieval/       #   Planner, Optimizer, Pipeline, Connectors, Parsers
-│   │   └── quality_gate/    #   Quality Gate
-│   ├── reasoning/           # Agentic + deterministic reasoning
-│   │   ├── extraction/      #   Claim Extraction Agent (LLM-assisted)
-│   │   ├── validation/      #   Claim Validation Agent (deterministic)
-│   │   ├── graph/           #   Claim Graph construction + sealing
-│   │   ├── agents/          #   6 Expert Agents (Mechanistic, Disease, Clinical, etc.)
-│   │   ├── consensus/       #   Consensus Engine + Uncertainty Model
-│   │   ├── rules/           #   Rule Engine + versioned rule sets
-│   │   └── audit/           #   Scientific Audit Agent
-│   ├── infrastructure/      # Cross-cutting services (LLM, cache, config, logging, metrics)
-│   ├── database/            # SQLAlchemy models, repositories, Alembic migrations
-│   └── schemas/             # Pydantic request/response models
-├── frontend/               # Streamlit MVP frontend
-│   ├── app.py
-│   ├── pages/              #   evaluate, results, audit, history
-│   └── components/         #   score_cards, chain_viz, contradiction_table
-├── tests/                  # Unit, integration, and scientific validation tests
-├── config/                 # Configuration files (settings, sources, rules)
-├── docker/                 # Dockerfiles + docker-compose
-├── scripts/                # Operational scripts
-├── pyproject.toml          # Poetry project definition
-└── .env.example            # Environment variable template
+│   │   ├── identity/        #   Identity Resolution Service (ChEMBL, MeSH, MONDO)
+│   │   └── retrieval/       #   Pipeline, Connectors (Europe PMC, Open Targets, etc.)
+│   ├── infrastructure/      # SQLite RawResponseCache (`data/cynthera.db`), logging
+│   └── reasoning/           # Agentic reasoning & rule engine
+│       ├── extraction/      #   ClaimExtractionAgent (Groq/Gemini + Fallback)
+│       ├── agents/          #   6 Expert Agents (Mechanistic, Clinical, Risk, etc.)
+│       └── rules/           #   Deterministic v3.1 Rule Engine
+├── frontend/               # Streamlit MVP web app (`app.py`)
+├── tests/                  # Unit and integration test suite (`pytest`)
+├── main.py                 # CLI entry point
+├── .env.example            # Environment template
+└── requirements.txt        # Python dependencies
 ```
-
-## 🔧 Configuration
-
-Edit `config/config.yaml` to customize:
-
-- API endpoints and timeouts
-- Confidence thresholds
-- LLM settings (if using)
-- Caching behavior
-- Logging levels
-
-## 🧪 Testing
-
-Run tests (when implemented):
-```bash
-pytest tests/ -v
-```
-
-## 📊 Output Format
-
-Cynthera generates comprehensive `HypothesisReport` objects containing:
-
-- **Executive Summary**: High-level findings and recommendation
-- **Mechanisms of Action**: Identified drug targets and pathways
-- **Disease Relevance**: Alignment score and biological rationale
-- **Confidence Assessment**: Overall confidence with detailed breakdown
-- **Uncertainties**: Key limitations and conflicting evidence
-- **Supporting Evidence**: All citations with provenance
-- **Next Steps**: Recommended experimental validation steps
-
-## 🛣️ Roadmap
-
-### Phase 1: Foundation (Current)
-- ✅ Deterministic engineering layer (retrieval, normalization, quality gate)
-- ✅ Agentic reasoning layer (claim extraction, 6 expert agents, consensus, rules)
-- ✅ Free data source integration (ChEMBL, UniProt, PubMed, Reactome, ClinicalTrials, DisGeNET)
-- ✅ Streamlit UI
-- ✅ Structured confidence scoring with ERW hierarchy
-
-### Phase 2: Enhanced Capabilities (Completed)
-- ✅ Clinical & Safety Agent (Safety profile grading A–D, boxed warnings, AEs)
-- ✅ Literature Scan expansions (OpenAlex, Semantic Scholar)
-- ✅ Prior Knowledge Agent (vector DB style, TF-IDF, SQLite)
-- ✅ Multi-hop mechanistic reasoning (DIRECT, 2-HOP, 3-HOP)
-- ✅ Advanced conflict resolution (weighted multi-factor scoring)
-- ✅ Batch evaluation API (Semaphore-bounded background processing)
-
-### Phase 3: Production Features (Completed)
-- ✅ Comprehensive test suite (59/59 tests passing)
-- ✅ API deployment (FastAPI middleware, timing, request ID)
-- ✅ Result caching and history (EvaluationCache with SHA-256 keys)
-- ✅ User authentication (X-API-Key header)
-- ✅ Export to PDF reports (reportlab PDF generator)
-- ✅ Frontend Enhancements (Batch processing page, safety UI, mechanistic UI)
-
-## 🤝 Contributing
-
-Contributions are welcome! Areas for improvement:
-
-- Additional data source integrations
-- Enhanced confidence scoring algorithms
-- Better directionality determination
-- LLM-powered reasoning
-- UI/UX improvements
-- Test coverage
-
-## 📝 License
-
-This project is for educational and research purposes.
-
-## 🙏 Acknowledgments
-
-Built using free and open-source resources:
-- PubChem (NCBI)
-- ChEMBL (EMBL-EBI)
-- Reactome
-- PubMed
-- DisGeNET
-- UniProt
-
-## 📧 Contact
-
-For questions or feedback, please open an issue on the repository.
 
 ---
 
-**Note**: This is an MVP implementation. Results should be validated by domain experts before any clinical or research decisions.
+## 🧪 Running Tests
+
+Run unit tests:
+```bash
+python -m pytest tests/unit/ -v
+```
+
+---
+
+## 📝 License & Disclaimer
+
+This project is built for research and educational purposes. Hypotheses and scores output by CYNTHERA should be evaluated by domain experts prior to clinical or experimental decisions.

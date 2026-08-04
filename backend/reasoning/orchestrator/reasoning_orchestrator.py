@@ -239,9 +239,9 @@ class ReasoningOrchestrator:
         ]
         if claim_extraction_method in ("rule_based_fallback", "none") and package.literature_evidence:
             data_source_failures.append(
-                "LLM Claim Extraction -- Gemini API was unavailable (quota exhausted or "
-                "API key invalid). Claims were extracted using keyword matching, not "
-                "scientific reasoning. Claim quality and Support Score accuracy are degraded."
+                "LLM Claim Extraction -- LLM provider (Groq/Gemini) was unavailable or unconfigured "
+                "(quota exhausted or invalid API key). Claims were extracted using keyword matching, "
+                "not LLM reasoning. Claim quality and Support Score accuracy are degraded."
             )
 
         # ── Step 2: Build and seal the ClaimGraph ───────────────────────
@@ -353,7 +353,7 @@ class ReasoningOrchestrator:
                 package.drug.name,
                 package.disease.name,
             )
-            for ev in lit_evidence[:20]  # cap at 20 records
+            for ev in lit_evidence[:10]  # cap at 10 records for optimal rate-limit & throughput
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         claims: list[Claim] = []
@@ -898,6 +898,16 @@ class ReasoningOrchestrator:
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
+        # Rule 2: Clinical Trial Failure Veto — documented clinical trial failure(s) for lack of efficacy or safety
+        if risk.failed_trial_count >= 1 or risk.score >= 0.40:
+            reasons.append(
+                f"Rule 2 (CLINICAL FAILURE VETO): Risk Score = {risk.score:.3f} "
+                f"with {risk.failed_trial_count} documented clinical trial failure(s) for lack of efficacy or safety. "
+                "NOT RECOMMENDED due to failed human clinical endpoints."
+            )
+            reasons.extend(checks)
+            return RecommendationStatus.NOT_RECOMMENDED, reasons
+
         # Rule 3: Safety veto — high risk score (evidence-based, fires before data-lock)
         if risk.score >= 0.7:
             reasons.append(
@@ -1100,13 +1110,25 @@ class ReasoningOrchestrator:
                 "clinical validation data is unavailable."
             )
 
+        # ── Claims breakdown by literature source ────────
+        claims_by_source: dict[str, int] = {}
+        for c in all_claims:
+            src = (c.provenance.source_name if c.provenance and c.provenance.source_name else "literature").lower()
+            claims_by_source[src] = claims_by_source.get(src, 0) + 1
+
+        if claims_by_source:
+            src_parts = [f"{count} from {src}" for src, count in claims_by_source.items()]
+            source_breakdown_str = f" ({', '.join(src_parts)})"
+        else:
+            source_breakdown_str = ""
+
         summary = (
             f"CYNTHERA v2.0 analysis of {package.drug.name} → {package.disease.name} "
             f"produced a recommendation of '{recommendation.value}'.\n"
             f"Evidence Strength: {support.score:.1%} ({support.level}) | "
             f"Mechanistic Plausibility: {mechanistic.score:.1%} ({mechanistic.level}) | "
             f"Risk Level: {risk.score:.1%} ({risk.level}).\n"
-            f"{len(all_claims)} claim(s) extracted from literature, "
+            f"{len(all_claims)} claim(s) extracted from literature{source_breakdown_str}, "
             f"{len(contradictions)} contradiction(s) detected."
             f"{prior_note}{safety_note}{paths_note}"
             f"{score_conflict_note}"
@@ -1214,6 +1236,7 @@ class ReasoningOrchestrator:
             evaluation_pathway=prior_ctx.evaluation_pathway,
             clinical_trial_status=ct_status,
             top_citations=citations[:10],
+            claims_by_source=claims_by_source,
             safety_breakdown=safety_brkdown,
             positive_factors=positive_factors,
             negative_factors=negative_factors,

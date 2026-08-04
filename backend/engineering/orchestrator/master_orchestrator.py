@@ -65,7 +65,7 @@ class MasterOrchestrator:
         ncbi_api_key: str | None = None,
         disgenet_api_key: str | None = None,
         llm_api_key: str | None = None,
-        llm_model: str = "gemini-1.5-flash",
+        llm_model: str = "gemini-2.0-flash",
         db_path: str = "data/cynthera.db",
         cache_ttl_seconds: int = 86400,
         use_cache: bool = True,
@@ -81,8 +81,14 @@ class MasterOrchestrator:
             cache_ttl_seconds: Cache TTL in seconds (default 86400 = 24h).
             use_cache: Whether to use the evaluation cache (default True).
         """
+        self._db_path = db_path
         self._resolver = IdentifierResolutionService(ncbi_api_key=ncbi_api_key)
-        self._retrieval = RetrievalPipeline(ncbi_api_key=ncbi_api_key, disgenet_api_key=disgenet_api_key)
+        self._retrieval = RetrievalPipeline(
+            ncbi_api_key=ncbi_api_key,
+            disgenet_api_key=disgenet_api_key,
+            db_path=db_path,
+            bypass_raw_cache=not use_cache,
+        )
         self._reasoning = ReasoningOrchestrator(
             llm_api_key=llm_api_key,
             llm_model=llm_model,
@@ -163,6 +169,12 @@ class MasterOrchestrator:
                         extra={"hypothesis_id": str(cached_result.hypothesis_id)},
                     )
                 else:
+                    hypothesis = hypothesis.model_copy(
+                        update={
+                            "drug_chembl_id": package.drug.chembl_id,
+                            "disease_mesh_id": package.disease.mesh_id,
+                        }
+                    )
                     return hypothesis, package, cached_result
 
         # ── Step 2: Initialize Hypothesis ────────────────────────────────
@@ -184,11 +196,42 @@ class MasterOrchestrator:
             drug = Drug(name=drug_name, identifiers=drug_ids)
             disease = Disease(name=disease_name, identifiers=disease_ids)
 
+            hypothesis = hypothesis.model_copy(
+                update={
+                    "drug_chembl_id": drug.chembl_id,
+                    "disease_mesh_id": disease.mesh_id,
+                }
+            )
             hypothesis.transition_to(HypothesisLifecycleState.ID_RESOLVED)
             self._storage.save_hypothesis(hypothesis)
 
+            # Hard gate: If both drug (ChEMBL) and disease (MeSH/MONDO) failed resolution completely,
+            # return RESOLUTION_FAILED immediately instead of running retrieval and downstream reasoning.
+            if drug.chembl_id is None and disease.mesh_id is None and disease.mondo_id is None:
+                logger.warning(
+                    "resolution_failed_hard_gate_triggered",
+                    extra={"drug": drug_name, "disease": disease_name},
+                )
+                res_failed = ReasoningResult.resolution_failed(
+                    hypothesis.id, drug_name, disease_name
+                )
+                hypothesis.transition_to(HypothesisLifecycleState.EVALUATED)
+                hypothesis.transition_to(HypothesisLifecycleState.COMPLETED)
+                self._storage.save_hypothesis(hypothesis)
+                self._storage.save_reasoning_result(res_failed)
+
+                empty_package = RetrievalPackage(
+                    hypothesis_id=hypothesis.id,
+                    drug=drug,
+                    disease=disease,
+                    retrieval_confidence="LOW",
+                    sources_failed=["chembl", "mesh", "opentargets"],
+                )
+                return hypothesis, empty_package, res_failed
+
             # ── Step 4: Parallel Data Retrieval ──────────────────────────
             logger.info("step_retrieval", extra={"trace_id": str(trace_id)})
+            self._retrieval._bypass_raw_cache = bypass_cache or (not self._use_cache)
             package = await self._retrieval.execute(drug, disease, hypothesis.id)
             hypothesis.transition_to(HypothesisLifecycleState.DATA_RETRIEVED)
             self._storage.save_hypothesis(hypothesis)

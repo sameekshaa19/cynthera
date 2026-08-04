@@ -23,5 +23,8 @@ class TrialOutcomeStatus(str, Enum):
     ACTIVE = "ACTIVE"
     """Trial currently recruiting or running."""
 
+    TERMINATED_ADMINISTRATIVE = "TERMINATED_ADMINISTRATIVE"
+    """Trial stopped or withdrawn for non-clinical reasons (low enrollment, funding, business priority, pandemic)."""
+
     UNKNOWN = "UNKNOWN"
     """Trial status could not be determined from available data."""

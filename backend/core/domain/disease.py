@@ -43,3 +43,17 @@ class Disease(BaseModel):
     def mesh_id(self) -> str | None:
         """Convenience property for MeSH ID."""
         return self.identifiers.mesh_id
+
+    @property
+    def mondo_id(self) -> str | None:
+        """Convenience property for Open Targets MONDO disease ID.
+
+        Populated when IdentifierResolutionService successfully resolves
+        the disease name against the Open Targets search endpoint.
+        Used as the resolved identifier for OpenTargetsConnector queries
+        and as the stable cache key for Open Targets association data.
+        Returns None if OT resolution was unavailable — callers must
+        handle this gracefully (skip OT fetch or fall back to inline search).
+        """
+        return self.identifiers.mondo_id
+

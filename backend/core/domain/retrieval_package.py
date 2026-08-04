@@ -78,6 +78,20 @@ class RetrievalPackage(BaseModel):
             "API_FAILURE (endpoint error), NOT_ATTEMPTED."
         ),
     )
+    validated_disease_genes: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Gene-disease association scores from Open Targets (primary) or "
+            "DisGeNET (fallback). Keys are gene symbols (e.g. 'CRBN') and "
+            "UniProt accessions (e.g. 'Q96SW2') — both are stored for flexible "
+            "lookup by MultiHopReasoner. Values are association scores [0.0, 1.0], "
+            "higher = stronger association. "
+            "Empty dict when neither Open Targets nor DisGeNET returned data. "
+            "This field populates the disease-relevance validation in trace_paths() "
+            "and MUST NOT feed evidence_records or Support Score calculation."
+        ),
+    )
+
 
     @property
     def literature_evidence(self) -> list[Evidence]:

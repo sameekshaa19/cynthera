@@ -72,8 +72,9 @@ Source Registry
 ├── Source Definition [DisGeNET]
 ├── Source Definition [DrugBank Open]
 ├── Source Definition [Europe PMC]
+├── Source Definition [Open Targets]
 │
-└── ... [Future: KEGG, OpenTargets, STRING, PharmGKB]
+└── ... [Future: KEGG, STRING, PharmGKB]
 ```
 
 ### 3.3 Source Definition Contract

@@ -532,6 +532,36 @@ The following table defines the persistence policy for every canonical entity.
 
 ---
 
+### 6.16 RawResponseCache (SQLite Persistence Store)
+
+**Purpose**: High-performance SQLite database (`data/cynthera.db`) storing raw HTTP API response payloads from external sources (PubMed, Europe PMC, Open Targets, ChEMBL, UniProt, Reactome, ClinicalTrials.gov, DisGeNET). Eliminates redundant network I/O across evaluation sessions and enforces tiered TTL policies.
+
+**Table Name**: `raw_response_cache`
+
+**Primary Key**: `cache_key` (TEXT) — SHA-256 hash of API endpoint URL and normalized parameters.
+
+**Columns**:
+*   `cache_key` (TEXT, PRIMARY KEY) — Unique lookup hash.
+*   `category` (TEXT, NOT NULL) — Category index (`structural`, `associations`, `literature`, `clinical_trials`).
+*   `data_json` (TEXT, NOT NULL) — Serialized raw JSON payload returned by external API.
+*   `created_at` (DATETIME, NOT NULL) — UTC timestamp when entry was fetched.
+*   `expires_at` (DATETIME, NOT NULL) — Expiration timestamp based on category TTL.
+
+**Tiered TTL Rules**:
+*   `structural` (30 days): UniProt, Reactome pathway structures, ChEMBL mechanisms.
+*   `associations` (14 days): Open Targets, DisGeNET disease-gene association scores.
+*   `literature` (7 days): PubMed, Europe PMC abstracts and search results.
+*   `clinical_trials` (1 day): ClinicalTrials.gov study records.
+
+**Indexes**:
+*   B-tree on `cache_key`
+*   B-tree on `category`
+*   B-tree on `expires_at`
+
+**Bypass Mechanism**: CLI flag `--no-cache` / `bypass_raw_cache=True` bypasses SQLite cache reads and writes fresh API responses.
+
+---
+
 ## 7. Relationship Rules
 
 ### 7.1 Relationship Taxonomy

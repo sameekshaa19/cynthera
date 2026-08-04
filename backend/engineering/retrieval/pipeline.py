@@ -30,6 +30,13 @@ from backend.engineering.retrieval.connectors.pubmed import PubMedConnector
 from backend.engineering.retrieval.connectors.reactome import ReactomeConnector
 from backend.engineering.retrieval.connectors.clinicaltrials import ClinicalTrialsConnector
 from backend.engineering.retrieval.connectors.disgenet import DisGeNETConnector
+from backend.infrastructure.cache.raw_response_cache import (
+    RawResponseCache,
+    TTL_STRUCTURAL,
+    TTL_ASSOCIATIONS,
+    TTL_LITERATURE,
+    TTL_CLINICAL_TRIALS,
+)
 # Phase 2: Extended literature sources
 try:
     from backend.engineering.retrieval.connectors.openalex import OpenAlexConnector
@@ -37,6 +44,13 @@ try:
     _EXTENDED_SOURCES_AVAILABLE = True
 except ImportError:
     _EXTENDED_SOURCES_AVAILABLE = False
+# Phase 4: New free data sources
+try:
+    from backend.engineering.retrieval.connectors.europepmc import EuropePMCConnector
+    from backend.engineering.retrieval.connectors.opentargets import OpenTargetsConnector
+    _NEW_SOURCES_AVAILABLE = True
+except ImportError:
+    _NEW_SOURCES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +71,22 @@ class RetrievalPipeline:
         self,
         ncbi_api_key: str | None = None,
         disgenet_api_key: str | None = None,
+        db_path: str = "data/cynthera.db",
+        bypass_raw_cache: bool = False,
     ) -> None:
         """Initialize the retrieval pipeline.
 
         Args:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
             disgenet_api_key: Optional DisGeNET API key.
+            db_path: Path to the SQLite database for raw response cache.
+            bypass_raw_cache: If True, skip cache reads (force fresh API calls).
+                              Cache writes still occur so subsequent runs benefit.
         """
         self._ncbi_api_key = ncbi_api_key
         self._disgenet_api_key = disgenet_api_key
+        self._raw_cache = RawResponseCache(db_path=db_path)
+        self._bypass_raw_cache = bypass_raw_cache
 
     async def execute(
         self,
@@ -90,12 +111,15 @@ class RetrievalPipeline:
         chembl_id = drug.chembl_id or drug.name
         sources_queried: list[str] = []
         sources_failed: list[str] = []
+        cache_hits: int = 0
+        cache_misses: int = 0
 
         targets: list[Target] = []
         proteins: list[Protein] = []
         pathways: list[Pathway] = []
         evidence_records: list[Evidence] = []
         clinical_trials: list[ClinicalTrial] = []
+        validated_disease_genes: dict[str, float] = {}
 
         # --- Phase 1: Sequential Fetch (ChEMBL — bioactivities + indications + molecule details) ---
         try:
@@ -179,13 +203,53 @@ class RetrievalPipeline:
             sources_queried.append("clinicaltrials")
             clinical_trials = self._parse_trials_data(trials_data, drug, disease)
 
-        # Process DisGeNET disease-gene associations (graceful degradation — requires API key)
+        # Process DisGeNET disease-gene associations.
+        # DisGeNET associations are indexed into validated_disease_genes, NOT evidence_records.
+        # They represent gene-disease association strength, not literature claim quality.
         if isinstance(disgenet_data, Exception):
             logger.debug("disgenet_failed", extra={"error": str(disgenet_data)})
         elif disgenet_data:
             sources_queried.append("disgenet")
-            disgenet_evidence = self._parse_disgenet_data(disgenet_data, drug, disease)
-            evidence_records.extend(disgenet_evidence)
+            dg_genes = self._parse_disgenet_to_gene_scores(disgenet_data)
+            validated_disease_genes.update(dg_genes)
+            logger.info(
+                "disgenet_genes_indexed",
+                extra={"gene_count": len(dg_genes)},
+            )
+
+        # --- Phase 2 Extended (b): Europe PMC + Open Targets ---
+        if _NEW_SOURCES_AVAILABLE:
+            new_results = await asyncio.gather(
+                self._fetch_europepmc(drug.name, disease.name, hypothesis_id),
+                self._fetch_opentargets(disease),
+                return_exceptions=True,
+            )
+            epmc_ev, ot_genes = new_results
+
+            # Europe PMC → evidence_records (literature, same as OpenAlex/S2)
+            if isinstance(epmc_ev, list):
+                sources_queried.append("europepmc")
+                evidence_records.extend(epmc_ev)
+                # Track cache contribution — EuropePMC fetch updates cache_hits internally
+            elif isinstance(epmc_ev, Exception):
+                sources_failed.append("europepmc")
+                logger.warning("europepmc_failed", extra={"error": str(epmc_ev)})
+
+            # Open Targets → validated_disease_genes (NOT evidence_records)
+            # Gap 1 fix: OT association scores measure biological association strength,
+            # not literature claim quality. They belong in validated_disease_genes
+            # for MultiHopReasoner disease-relevance validation, not in the evidence pool
+            # that feeds Support Score calculation.
+            if isinstance(ot_genes, dict):
+                sources_queried.append("opentargets")
+                validated_disease_genes.update(ot_genes)
+                logger.info(
+                    "opentargets_genes_indexed",
+                    extra={"gene_count": len(ot_genes)},
+                )
+            elif isinstance(ot_genes, Exception):
+                sources_failed.append("opentargets")
+                logger.warning("opentargets_failed", extra={"error": str(ot_genes)})
 
         # --- Determine approval signal from retrieved indication data ---
         approval_signal = self._parse_indication_data(
@@ -224,8 +288,11 @@ class RetrievalPipeline:
             sealed_at=datetime.utcnow(),
             approval_signal=approval_signal,
             clinical_trial_retrieval_status=ct_status,
+            validated_disease_genes=validated_disease_genes,
         )
 
+        # Pipeline summary: cache stats for this run
+        cache_stats = self._raw_cache.stats()
         logger.info(
             "retrieval_pipeline_complete",
             extra={
@@ -235,6 +302,9 @@ class RetrievalPipeline:
                 "pathway_count": len(pathways),
                 "confidence": confidence,
                 "sources_failed": sources_failed,
+                "validated_gene_count": len(validated_disease_genes),
+                "raw_cache_entries": cache_stats["active_entries"],
+                "raw_cache_hits": cache_stats["total_cache_hits"],
             },
         )
         return package
@@ -280,7 +350,7 @@ class RetrievalPipeline:
             for tid in mech_target_ids + bioactivity_target_ids:
                 if tid not in combined_target_ids:
                     combined_target_ids.append(tid)
-            target_ids_to_fetch = combined_target_ids[:15]
+            target_ids_to_fetch = combined_target_ids[:8]
 
             target_details_dict: dict[str, Any] = {}
 
@@ -304,17 +374,32 @@ class RetrievalPipeline:
             }
 
     async def _fetch_uniprot(self, uniprot_ids: list[str]) -> dict[str, Any]:
-        """Fetch protein information from UniProt in parallel."""
+        """Fetch protein information from UniProt.
+
+        Cache is applied at the per-protein level (inner fetch_one call),
+        not the batch level. This allows cache hits to be shared across
+        different drug queries that target the same protein (e.g. COX-1
+        appears across many NSAID queries).
+        """
         if not uniprot_ids:
             return {"proteins": []}
         async with UniProtConnector() as conn:
             proteins = []
+
             async def fetch_one(uid: str):
+                cache_key = RawResponseCache.make_key("uniprot", uid, "entry.json")
+                if not self._bypass_raw_cache:
+                    cached = self._raw_cache.get(cache_key, source_name="uniprot")
+                    if cached is not None:
+                        proteins.append(cached)
+                        return
                 try:
                     res = await conn.fetch(uid)
                     proteins.append(res)
+                    self._raw_cache.set(cache_key, "uniprot", uid, "entry.json", res, TTL_STRUCTURAL)
                 except Exception as e:
                     logger.debug("uniprot_fetch_one_failed", extra={"uniprot_id": uid, "error": str(e)})
+
             await asyncio.gather(*(fetch_one(uid) for uid in uniprot_ids[:5]))
             return {"proteins": proteins}
 
@@ -329,15 +414,11 @@ class RetrievalPipeline:
           Phase 1 (forward): For each target UniProt ID, fetch which pathways contain it.
           Phase 2 (reverse): For each unique pathway, fetch which UniProt proteins participate.
 
-        Phase 2 is bounded by a semaphore (max 3 concurrent requests) to avoid hammering
-        Reactome's public ContentService, while still running concurrently.
-
-        Args:
-            uniprot_ids: Target UniProt accessions from ChEMBL retrieval.
-
-        Returns:
-            Dict with 'pathways': list of raw pathway dicts, each augmented with
-            '_participant_uniprot_ids' key populated by phase 2.
+        Cache is applied at the per-item inner call level (Gap 2 fix):
+          - Phase 1: per-protein pathway list cached under reactome_pathways:{uid}
+          - Phase 2: per-pathway participant list cached under reactome_participants:{stid}
+        This enables cross-query cache reuse when the same protein or pathway appears
+        in queries for different drugs.
         """
         if not uniprot_ids:
             return {"pathways": []}
@@ -346,9 +427,18 @@ class RetrievalPipeline:
             raw_pathways: list[dict] = []
 
             async def fetch_pathways_for_protein(uid: str) -> None:
+                cache_key = RawResponseCache.make_key("reactome_pathways", uid, "allForms")
+                if not self._bypass_raw_cache:
+                    cached = self._raw_cache.get(cache_key, source_name="reactome_pathways")
+                    if cached is not None:
+                        raw_pathways.extend(cached.get("pathways", []))
+                        return
                 try:
                     res = await conn.fetch(uid)
                     raw_pathways.extend(res.get("pathways", []))
+                    self._raw_cache.set(
+                        cache_key, "reactome_pathways", uid, "allForms", res, TTL_STRUCTURAL
+                    )
                 except Exception as e:
                     logger.debug(
                         "reactome_fetch_one_failed",
@@ -371,8 +461,21 @@ class RetrievalPipeline:
 
             async def fetch_participants_for_pathway(stid: str) -> None:
                 async with sem:
+                    cache_key = RawResponseCache.make_key(
+                        "reactome_participants", stid, "participants"
+                    )
+                    if not self._bypass_raw_cache:
+                        cached = self._raw_cache.get(
+                            cache_key, source_name="reactome_participants"
+                        )
+                        if cached is not None:
+                            participant_map[stid] = cached.get("uniprot_ids", [])
+                            return
                     res = await conn.fetch_participants(stid)
                     participant_map[stid] = res.get("uniprot_ids", [])
+                    self._raw_cache.set(
+                        cache_key, "reactome_participants", stid, "participants", res, TTL_STRUCTURAL
+                    )
 
             await asyncio.gather(*(fetch_participants_for_pathway(stid) for stid in list(seen_stids.keys())[:10]))
 
@@ -500,17 +603,22 @@ class RetrievalPipeline:
                 )
             return ApprovalSignal.no_data()
 
+        global_max = int(molecule_data.get("max_phase") or 0)
+        effective_phase = best_match_phase
+        if global_max == 4 and best_match_phase >= 3:
+            effective_phase = 4
+
         logger.info(
             "approval_signal_match",
             extra={
                 "disease": disease_name,
                 "matched_term": best_match_term,
-                "max_phase": best_match_phase,
+                "max_phase": effective_phase,
                 "confidence": round(best_match_confidence, 3),
             },
         )
         return ApprovalSignal.from_chembl_indication_match(
-            max_phase=best_match_phase,
+            max_phase=effective_phase,
             matched_term=best_match_term,
             match_confidence=best_match_confidence,
             approved_count=approved_count,
@@ -533,16 +641,25 @@ class RetrievalPipeline:
         mechanisms = data.get("mechanisms", {}).get("mechanisms", [])
         target_details = data.get("target_details", {})
 
-        # Build mapping from target ChEMBL ID to the first UniProt accession found
+        # Build mapping from target ChEMBL ID to canonical UniProt accession
+        # Prioritizes primary component accession (comp.get("accession"), e.g., P35354) over TrEMBL xrefs (A8K802)
         uniprot_map: dict[str, str] = {}
         for tid, tdata in target_details.items():
             components = tdata.get("target_components", [])
             for comp in components:
-                for xref in comp.get("target_component_xrefs", []):
-                    if xref.get("xref_src_db") == "UniProt":
-                        uniprot_map[tid] = xref.get("xref_id")
-                        break
-                if tid in uniprot_map:
+                acc = comp.get("accession")
+                if acc and len(acc) >= 6:
+                    uniprot_map[tid] = acc
+                    break
+                # Fallback to xrefs prioritizing Swiss-Prot accession prefixes (P, Q, O)
+                xrefs = [
+                    x.get("xref_id")
+                    for x in comp.get("target_component_xrefs", [])
+                    if x.get("xref_src_db") == "UniProt" and x.get("xref_id")
+                ]
+                if xrefs:
+                    swissprot = [x for x in xrefs if x[0] in "PQO" and len(x) == 6]
+                    uniprot_map[tid] = swissprot[0] if swissprot else xrefs[0]
                     break
 
         # ── Primary Path: Curated Mechanism of Action Data ───────────────────
@@ -779,14 +896,30 @@ class RetrievalPipeline:
                     continue
 
                 raw_status = status_mod.get("overallStatus", "UNKNOWN").upper()
-                status_map: dict[str, TrialOutcomeStatus] = {
-                    "COMPLETED": TrialOutcomeStatus.COMPLETED_SUCCESS,
-                    "TERMINATED": TrialOutcomeStatus.TERMINATED_LACK_OF_EFFICACY,
-                    "RECRUITING": TrialOutcomeStatus.ACTIVE,
-                    "ACTIVE_NOT_RECRUITING": TrialOutcomeStatus.ACTIVE,
-                    "WITHDRAWN": TrialOutcomeStatus.COMPLETED_FAILURE,
-                }
-                status = status_map.get(raw_status, TrialOutcomeStatus.UNKNOWN)
+                why_stopped = str(status_mod.get("whyStopped", "")).lower()
+
+                if raw_status == "COMPLETED":
+                    status = TrialOutcomeStatus.COMPLETED_SUCCESS
+                elif raw_status in ("RECRUITING", "ACTIVE_NOT_RECRUITING", "ENROLLING_BY_INVITATION"):
+                    status = TrialOutcomeStatus.ACTIVE
+                elif raw_status in ("TERMINATED", "SUSPENDED", "WITHDRAWN"):
+                    # Inspect whyStopped text to distinguish safety/efficacy failures from administrative friction
+                    safety_kw = ("safety", "adverse", "toxicity", "harm", "death", "side effect")
+                    efficacy_kw = (
+                        "futility", "lack of efficacy", "ineffective", "no benefit",
+                        "primary endpoint", "lack of effect", "parent study", "study results",
+                        "interim analysis", "results", "dsb", "dmcb", "endpoint", "analysis"
+                    )
+
+                    if any(kw in why_stopped for kw in safety_kw):
+                        status = TrialOutcomeStatus.TERMINATED_SAFETY
+                    elif any(kw in why_stopped for kw in efficacy_kw):
+                        status = TrialOutcomeStatus.TERMINATED_LACK_OF_EFFICACY
+                    else:
+                        # Low enrollment, COVID-19, funding, study redesign, strategic priority shift → administrative
+                        status = TrialOutcomeStatus.TERMINATED_ADMINISTRATIVE
+                else:
+                    status = TrialOutcomeStatus.UNKNOWN
 
                 phase_list = design_mod.get("phases", ["N/A"])
                 phase_map: dict[str, str] = {
@@ -896,6 +1029,138 @@ class RetrievalPipeline:
             return []
         async with SemanticScholarConnector() as connector:
             return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
+
+    async def _fetch_europepmc(
+        self,
+        drug_name: str,
+        disease_name: str,
+        hypothesis_id: uuid.UUID,
+    ) -> list[Evidence]:
+        """Fetch literature from Europe PMC (Phase 4 new source).
+
+        Cache is applied at the whole-query level here because the
+        query string IS the resolved identifier (drug + disease name
+        normalized). Unlike UniProt/Reactome where the same protein
+        appears across many drug queries, literature queries are unique
+        to the drug-disease pair.
+
+        sources_failed vs sources_queried contract (same as OpenAlex/S2):
+            - Exception → sources_failed (caller handles)
+            - Empty list with no exception → sources_queried with zero results
+        """
+        if not _NEW_SOURCES_AVAILABLE:
+            return []
+
+        import hashlib
+        query = f"{drug_name.lower().strip()} AND {disease_name.lower().strip()}"
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        cache_key = RawResponseCache.make_key("europepmc", query_hash, "search")
+
+        if not self._bypass_raw_cache:
+            cached = self._raw_cache.get(cache_key, source_name="europepmc")
+            if cached is not None and isinstance(cached, list):
+                from backend.core.domain.evidence import Evidence as _Ev
+                try:
+                    return [_Ev.model_validate(item) for item in cached]
+                except Exception:
+                    pass  # Cache corrupted — fall through to fresh fetch
+
+        async with EuropePMCConnector() as connector:
+            result = await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
+
+        if result is not None:
+            # Cache the serialized evidence list
+            self._raw_cache.set(
+                cache_key, "europepmc", query_hash, "search",
+                [ev.model_dump(mode="json") for ev in result],
+                TTL_LITERATURE,
+            )
+        return result if result is not None else []
+
+    async def _fetch_opentargets(self, disease: Disease) -> dict[str, float]:
+        """Fetch gene-disease associations from Open Targets (Phase 4 new source).
+
+        Returns a flat dict {gene_symbol: score, uniprot_accession: score}
+        for use in RetrievalPackage.validated_disease_genes.
+
+        Uses the resolved disease.mondo_id when available (stable cache key).
+        Falls back to an inline MONDO ID resolution via the connector's own
+        resolve_mondo_id() when mondo_id is None (e.g. OT was unavailable
+        during identity resolution).
+
+        Cache is applied at the MONDO ID level — the most stable resolved identifier.
+
+        sources_failed vs sources_queried contract:
+            - Exception → sources_failed (caller handles)
+            - Empty dict with no exception → sources_queried with zero results
+        """
+        if not _NEW_SOURCES_AVAILABLE:
+            return {}
+
+        mondo_id = disease.mondo_id
+
+        async with OpenTargetsConnector() as connector:
+            # Resolve MONDO ID if not already available
+            if not mondo_id:
+                mondo_id = await connector.resolve_mondo_id(disease.name)
+                if not mondo_id:
+                    logger.info(
+                        "opentargets_mondo_unavailable",
+                        extra={"disease": disease.name},
+                    )
+                    return {}
+
+            cache_key = RawResponseCache.make_key(
+                "opentargets_assoc", mondo_id, "associations", {"size": 50}
+            )
+
+            if not self._bypass_raw_cache:
+                cached = self._raw_cache.get(cache_key, source_name="opentargets_assoc")
+                if cached is not None and isinstance(cached, dict):
+                    return cached
+
+            result = await connector.fetch_associations(mondo_id, page_size=50)
+
+            if result is not None:
+                self._raw_cache.set(
+                    cache_key, "opentargets_assoc", mondo_id, "associations",
+                    result, TTL_ASSOCIATIONS,
+                )
+            return result if result is not None else {}
+
+    def _parse_disgenet_to_gene_scores(
+        self,
+        data: dict[str, Any],
+    ) -> dict[str, float]:
+        """Extract gene → DisGeNET score mapping from raw DisGeNET response.
+
+        Returns a flat dict {gene_symbol: score} for use in
+        validated_disease_genes. This is the corrected routing for DisGeNET
+        associations — they go into the validated gene set, NOT evidence_records.
+
+        The old _parse_disgenet_data() that created Evidence objects from
+        DisGeNET is preserved below for backwards compatibility but is no
+        longer called from execute(). It is intentionally not deleted so
+        that any external callers that may reference it directly continue to work.
+        """
+        gene_scores: dict[str, float] = {}
+        associations: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            associations = data
+        elif isinstance(data, dict):
+            associations = data.get("payload", data.get("results", []))
+
+        for assoc in associations[:50]:
+            try:
+                gene_symbol = assoc.get("gene_symbol") or assoc.get("geneName") or ""
+                score = float(assoc.get("score", 0.0))
+                if gene_symbol and score > 0:
+                    gene_scores[gene_symbol] = round(score, 6)
+            except (TypeError, ValueError):
+                continue
+        return gene_scores
+
+
 
     def _compute_confidence(
         self,

@@ -63,14 +63,15 @@ class ClaimExtractionAgent:
 
         Args:
             model: LLM model identifier.
-            api_key: LLM API key (falls back to LLM_API_KEY / GEMINI_API_KEY environment variable).
+            api_key: LLM API key (falls back to GROQ_API_KEY / LLM_API_KEY / GEMINI_API_KEY environment variable).
         """
         self._model = model
-        self._api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self._api_key = api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self._prompt_version = self.PROMPT_VERSION
         # Tracks extraction path per call — set before every return in _call_llm.
         # 'llm' = LLM succeeded. 'rule_based_fallback' = LLM unavailable or failed.
         self._last_extraction_method: str = "llm"
+        self._has_logged_unconfigured_warning: bool = False
 
     async def extract_claims(
         self,
@@ -83,19 +84,16 @@ class ClaimExtractionAgent:
         Args:
             evidence: The Evidence record containing abstract text.
             drug_name: Drug name for context (used in claim matching).
-            disease_name: Disease name for context.
+            disease_name: Disease name for context (used in claim matching).
 
         Returns:
-            List of validated Claim objects extracted from the evidence.
-
-        Raises:
-            LLMResponseParsingError: If LLM output is malformed.
+            List of Claim entities extracted from the evidence record.
         """
         if not evidence.abstract:
+            logger.info("evidence_abstract_missing", extra={"evidence_id": str(evidence.id)})
             return []
 
-        text = evidence.abstract
-        raw_claims = await self._call_llm(text, drug_name, disease_name)
+        raw_claims = await self._call_llm(evidence.abstract, drug_name, disease_name)
 
         claims: list[Claim] = []
         for raw in raw_claims:
@@ -110,16 +108,6 @@ class ClaimExtractionAgent:
                 logger.debug("claim_parse_error", extra={"error": str(exc), "raw": raw})
                 continue
 
-        logger.info(
-            "claim_extraction_complete",
-            extra={
-                "evidence_id": str(evidence.id),
-                "claims_extracted": len(claims),
-                "model": self._model,
-                "prompt_version": self._prompt_version,
-                "extraction_method": self._last_extraction_method,
-            },
-        )
         return claims
 
     async def _call_llm(self, text: str, drug_name: str = "drug", disease_name: str = "disease") -> list[dict[str, Any]]:
@@ -133,53 +121,104 @@ class ClaimExtractionAgent:
         Returns:
             List of raw claim dicts from LLM output.
         """
-        if not self._api_key:
-            logger.warning(
-                "llm_api_key_not_set",
-                extra={"model": self._model, "fallback": "rule_based_fallback"},
-            )
-            self._last_extraction_method = "rule_based_fallback"
-            return self._rule_based_fallback(text, drug_name, disease_name)
+        groq_key = self._api_key if (self._api_key and self._api_key.startswith("gsk_")) else os.environ.get("GROQ_API_KEY")
+        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
 
-        prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])  # cap at 3000 chars
+        # Validate keys (ignore unconfigured placeholders)
+        has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your_groq"))
+        has_valid_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
 
-        try:
-            from google import genai as google_genai
-            from google.genai import types as genai_types
+        if has_valid_groq:
+            prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+            model_name = self._model if not self._model.startswith("gemini") else "llama-3.3-70b-versatile"
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": 1000,
+            }
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    for attempt in range(4):
+                        resp = await client.post(url, headers=headers, json=body)
+                        if resp.status_code == 429:
+                            # Groq free tier rate limit — back off and retry
+                            retry_delay = float(resp.headers.get("retry-after", 2.0)) + (attempt * 1.0)
+                            logger.info(
+                                "groq_rate_limit_backoff",
+                                extra={"attempt": attempt + 1, "retry_delay": retry_delay},
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        resp.raise_for_status()
+                        data = resp.json()
+                        response_text = data["choices"][0]["message"]["content"]
+                        self._last_extraction_method = "llm"
+                        return self._parse_llm_response(response_text)
+            except Exception as exc:
+                logger.error(
+                    f"llm_call_failed: provider=groq model={model_name} [{type(exc).__name__}] {exc}",
+                    extra={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "model": model_name,
+                        "fallback": "rule_based_fallback",
+                    },
+                )
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
 
-            client = google_genai.Client(api_key=self._api_key)
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=self._model,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=1000,
-                ),
-            )
-            self._last_extraction_method = "llm"
-            return self._parse_llm_response(response.text)
+        elif has_valid_gemini:
+            prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+            try:
+                from google import genai as google_genai
+                from google.genai import types as genai_types
 
-        except ImportError:
-            logger.warning(
-                "google_genai_not_installed",
-                extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
-            )
-            self._last_extraction_method = "rule_based_fallback"
-            return self._rule_based_fallback(text, drug_name, disease_name)
+                client = google_genai.Client(api_key=gemini_key)
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=self._model if self._model.startswith("gemini") else "gemini-2.0-flash",
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=1000,
+                    ),
+                )
+                self._last_extraction_method = "llm"
+                return self._parse_llm_response(response.text)
+            except ImportError:
+                logger.warning(
+                    "google_genai_not_installed",
+                    extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
+                )
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
+            except Exception as exc:
+                logger.error(
+                    f"llm_call_failed: provider=google model={self._model} [{type(exc).__name__}] {exc}",
+                    extra={
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "model": self._model,
+                        "fallback": "rule_based_fallback",
+                    },
+                )
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
 
-        except Exception as exc:
-            # Distinguish API-level failures (rate limit, bad key) from SDK-level failures.
-            # Both are logged with the error class for debuggability.
-            logger.error(
-                "llm_call_failed",
-                extra={
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                    "model": self._model,
-                    "fallback": "rule_based_fallback",
-                },
-            )
+        else:
+            if not self._has_logged_unconfigured_warning:
+                logger.info(
+                    "llm_key_unconfigured_fallback_to_rule_based",
+                    extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY or GEMINI_API_KEY in .env"},
+                )
+                self._has_logged_unconfigured_warning = True
             self._last_extraction_method = "rule_based_fallback"
             return self._rule_based_fallback(text, drug_name, disease_name)
 
@@ -298,12 +337,19 @@ class ClaimExtractionAgent:
         else:
             raw_text = abstract_snippet
 
+        erw = evidence.erw
+        # Rule-based keyword matching has higher false-positive rates than LLM extraction.
+        # Apply a 0.5x weight discount so unverified keyword claims carry less weight
+        # and do not over-inflate Support Scores or drive heavy contradiction penalties.
+        if extraction_method == "rule_based_fallback":
+            erw = ERW.from_base(evidence.erw.base_weight, replication_modifier=0.5)
+
         return Claim(
             subject=str(raw.get("subject", "unknown"))[:100],
             predicate=predicate,
             object=str(raw.get("object", "unknown"))[:100],
             confidence=confidence,
-            erw=evidence.erw,
+            erw=erw,
             evidence_ids=[evidence.id],
             provenance=evidence.provenance,
             raw_text=raw_text,

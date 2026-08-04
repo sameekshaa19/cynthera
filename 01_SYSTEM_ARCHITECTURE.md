@@ -42,6 +42,8 @@ graph TD
     
     subgraph Retrieval Services
         Retrieval --> PubMed[PubMed API]
+        Retrieval --> EuropePMC[Europe PMC API]
+        Retrieval --> OpenTargets[Open Targets GraphQL API]
         Retrieval --> ChEMBL[ChEMBL API]
         Retrieval --> Reactome[Reactome API]
         Retrieval --> UniProt[UniProt API]

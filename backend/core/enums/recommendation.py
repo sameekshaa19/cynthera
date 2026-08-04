@@ -16,3 +16,6 @@ class RecommendationStatus(str, Enum):
 
     NOT_RECOMMENDED = "NOT_RECOMMENDED"
     """Strong contradictory evidence, failed clinical trials, or high biological risks."""
+
+    RESOLUTION_FAILED = "RESOLUTION_FAILED"
+    """Target drug or disease could not be mapped to any canonical ontology ID (ChEMBL, MeSH, MONDO)."""

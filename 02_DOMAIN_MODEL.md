@@ -401,6 +401,26 @@ The system's biological and analytical reasoning is governed by the following co
 
 ---
 
+---
+
+### 4.18 Controlled Vocabularies & Enums
+
+*   **`RecommendationStatus`**:
+    *   `PROMISING`: High-quality supporting evidence with plausible biological pathways and low safety/failure risks.
+    *   `UNCERTAIN`: Conflicting or sparse evidence, incomplete pathway connectivity, or missing clinical data.
+    *   `NOT_RECOMMENDED`: Strong contradictory evidence, failed clinical trials, or high biological risks.
+    *   `RESOLUTION_FAILED`: Target drug or disease could not be mapped to any canonical ontology ID (ChEMBL, MeSH, MONDO). Hard gate.
+*   **`TrialOutcomeStatus`**:
+    *   `COMPLETED_SUCCESS`: Trial finished, meeting primary clinical endpoints.
+    *   `COMPLETED_FAILURE`: Trial finished, failing to meet primary endpoints.
+    *   `TERMINATED_LACK_OF_EFFICACY`: Trial stopped early due to insufficient therapeutic effect.
+    *   `TERMINATED_SAFETY`: Trial stopped early due to unacceptable toxicity or adverse events.
+    *   `TERMINATED_ADMINISTRATIVE`: Trial stopped or withdrawn for non-clinical reasons (low enrollment, funding, COVID-19 delays, study redesign). Carries 0.0 risk burden.
+    *   `ACTIVE`: Trial currently recruiting or running.
+    *   `UNKNOWN`: Trial status could not be determined.
+
+---
+
 ## 5. Future Domain Extensions
 
 The following entity stubs are defined as placeholders for future system expansions:
@@ -413,3 +433,4 @@ The following entity stubs are defined as placeholders for future system expansi
 *   **PathwayRelation**: Documents the reaction edges linking separate pathway systems together.
 *   **EvidenceWeight**: Metric configuring the impact factor of a given Evidence record.
 *   **AuditTrail**: Session-level record verifying the pipeline step durations, user parameters, and environment state variables.
+
