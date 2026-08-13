@@ -8,7 +8,9 @@ Reference: 03_RETRIEVAL_SPECIFICATION.md, Phase 2 literature scan expansion
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -36,12 +38,18 @@ class SemanticScholarConnector(BaseConnector):
     - Fields of study (to validate relevance)
     - Open access PDF availability
 
-    No API key required for basic use (100 req/5min limit).
+    Authenticated using x-api-key header.
+    Rate-limited to strictly below 1 req/sec to avoid API rejection.
     """
 
     source_name = "semantic_scholar"
     base_url = _S2_BASE
     timeout_seconds = _DEFAULT_TIMEOUT
+
+    # Class-level rate limiter lock and timestamp to enforce <= 1 req/s threshold globally
+    _rate_limit_lock = asyncio.Lock()
+    _last_request_time: float = 0.0
+    _min_request_interval: float = 1.05  # 1.05s interval stays safely under 1 req/s limit
 
     def __init__(self, api_key: str | None = None) -> None:
         """Initialize the Semantic Scholar connector.
@@ -54,11 +62,32 @@ class SemanticScholarConnector(BaseConnector):
         super().__init__(api_key=key)
 
     def _build_headers(self) -> dict[str, str]:
-        """Build default headers override to set x-api-key if key is provided."""
-        headers = super()._build_headers()
+        """Build default request headers override to set x-api-key if key is provided."""
+        headers = {"Accept": "application/json", "User-Agent": "CYNTHERA/1.0"}
         if self._api_key:
             headers["x-api-key"] = self._api_key
         return headers
+
+    async def _rate_limit(self) -> None:
+        """Enforce strict rate limit (< 1 req/sec) to avoid overloading S2 API."""
+        import asyncio
+        import time
+        async with SemanticScholarConnector._rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - SemanticScholarConnector._last_request_time
+            if elapsed < SemanticScholarConnector._min_request_interval:
+                wait_time = SemanticScholarConnector._min_request_interval - elapsed
+                logger.debug(
+                    "semantic_scholar_rate_limiting",
+                    extra={"wait_seconds": round(wait_time, 3)},
+                )
+                await asyncio.sleep(wait_time)
+            SemanticScholarConnector._last_request_time = time.monotonic()
+
+    async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute a GET request with rate-limiting delay and retry logic."""
+        await self._rate_limit()
+        return await super()._get(url, params=params)
 
     async def fetch(self, **kwargs: Any) -> dict[str, Any]:
         """Fetch raw data from the Semantic Scholar API.

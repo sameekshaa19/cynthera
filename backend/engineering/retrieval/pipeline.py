@@ -71,6 +71,7 @@ class RetrievalPipeline:
         self,
         ncbi_api_key: str | None = None,
         disgenet_api_key: str | None = None,
+        semantic_scholar_api_key: str | None = None,
         db_path: str = "data/cynthera.db",
         bypass_raw_cache: bool = False,
     ) -> None:
@@ -79,12 +80,15 @@ class RetrievalPipeline:
         Args:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
             disgenet_api_key: Optional DisGeNET API key.
+            semantic_scholar_api_key: Optional Semantic Scholar API key for higher rate limits.
             db_path: Path to the SQLite database for raw response cache.
             bypass_raw_cache: If True, skip cache reads (force fresh API calls).
                               Cache writes still occur so subsequent runs benefit.
         """
+        import os
         self._ncbi_api_key = ncbi_api_key
         self._disgenet_api_key = disgenet_api_key
+        self._semantic_scholar_api_key = semantic_scholar_api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
         self._raw_cache = RawResponseCache(db_path=db_path)
         self._bypass_raw_cache = bypass_raw_cache
 
@@ -1027,7 +1031,7 @@ class RetrievalPipeline:
         """Fetch literature from Semantic Scholar (Phase 2 extended source)."""
         if not _EXTENDED_SOURCES_AVAILABLE:
             return []
-        async with SemanticScholarConnector() as connector:
+        async with SemanticScholarConnector(api_key=self._semantic_scholar_api_key) as connector:
             return await connector.fetch_literature(drug_name, disease_name, hypothesis_id)
 
     async def _fetch_europepmc(

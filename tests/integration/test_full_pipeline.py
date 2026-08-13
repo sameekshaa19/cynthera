@@ -42,9 +42,9 @@ from datetime import datetime
 def _make_provenance(source: str) -> ProvenanceReference:
     return ProvenanceReference(
         source_name=source,
-        source_url=f"https://{source}.example.com",
-        retrieved_at=datetime.utcnow(),
-        raw_id=f"raw_{source}_001",
+        source_version="v1.0",
+        record_id=f"raw_{source}_001",
+        url=f"https://{source}.example.com",
     )
 
 
@@ -54,12 +54,17 @@ def _build_sildenafil_pah_package() -> RetrievalPackage:
     drug = Drug(name="Sildenafil", identifiers={"chembl_id": "CHEMBL192"})
     disease = Disease(name="Pulmonary Arterial Hypertension", identifiers={"mesh_id": "D000081029"})
 
+    prov = _make_provenance("ChEMBL")
+    erw = ERW.from_base(base_weight=0.85)
     targets = [
         Target(
-            name="Phosphodiesterase 5A",
+            drug_chembl_id="CHEMBL192",
             protein_uniprot="O76074",
-            chembl_target_id="CHEMBL1827",
-            confidence_score=0.95,
+            affinity_nm=1.0,
+            affinity_type="IC50",
+            mechanism="INHIBITOR",
+            erw=erw,
+            provenance=prov,
         )
     ]
 
@@ -67,7 +72,7 @@ def _build_sildenafil_pah_package() -> RetrievalPackage:
         Protein(
             uniprot_accession="O76074",
             gene_symbol="PDE5A",
-            protein_name="cGMP-specific 3',5'-cyclic phosphodiesterase",
+            name="cGMP-specific 3',5'-cyclic phosphodiesterase",
             organism="Homo sapiens",
         )
     ]
@@ -220,6 +225,80 @@ def _build_metformin_t2d_package() -> RetrievalPackage:
 # Integration Tests
 # ─────────────────────────────────────────────
 
+def _build_minimal_context_pkg() -> RetrievalPackage:
+    """Minimal, model-valid Sildenafil/PAH package used by context regressions.
+
+    Independent of the (stale) _build_sildenafil_pah_package helper so that the
+    ScientificContext / Rule -1 assertions do not depend on unrelated test
+    builders that reference a non-existent EvidenceType member.
+    """
+    return _build_minimal_context_package(approved=False, disease_name="Pulmonary Arterial Hypertension")
+
+
+def _build_minimal_context_package(
+    approved: bool = False,
+    drug_name: str = "Sildenafil",
+    disease_name: str = "Pulmonary Arterial Hypertension",
+) -> RetrievalPackage:
+    hypothesis_id = uuid.uuid4()
+    drug = Drug(name=drug_name, identifiers={"chembl_id": "CHEMBL192"})
+    disease = Disease(name=disease_name, identifiers={"mesh_id": "D000081029"})
+
+    evidence = [
+        Evidence(
+            hypothesis_id=hypothesis_id,
+            title="Sildenafil in PAH: systematic review",
+            abstract="Sildenafil PDE5A inhibition improves PAH outcomes.",
+            evidence_type=EvidenceType.META_ANALYSIS,
+            erw=ERW(value=0.9),
+            source="pubmed",
+            provenance=_make_provenance("pubmed"),
+        ),
+        Evidence(
+            hypothesis_id=hypothesis_id,
+            title="PDE5 inhibition in vascular smooth muscle",
+            abstract="Sildenafil binds PDE5A in vitro.",
+            evidence_type=EvidenceType.IN_VITRO,
+            erw=ERW(value=0.6),
+            source="pubmed",
+            provenance=_make_provenance("pubmed"),
+        ),
+    ]
+
+    trials = [
+        ClinicalTrial(
+            nct_id="NCT00412446",
+            title="Sildenafil in Pulmonary Arterial Hypertension",
+            phase="Phase III",
+            status=TrialOutcomeStatus.COMPLETED_SUCCESS,
+            provenance=_make_provenance("ClinicalTrials.gov"),
+        )
+    ]
+
+    approval_signal = None
+    if approved:
+        from backend.core.domain.approval_signal import ApprovalSignal
+        approval_signal = ApprovalSignal.from_chembl_indication_match(
+            max_phase=4,
+            matched_term="Pulmonary Arterial Hypertension",
+            match_confidence=0.95,
+            approved_count=3,
+        )
+
+    return RetrievalPackage(
+        hypothesis_id=hypothesis_id,
+        drug=drug,
+        disease=disease,
+        evidence_records=evidence,
+        clinical_trials=trials,
+        approval_signal=approval_signal,
+        retrieval_confidence="HIGH",
+        sources_queried=["chembl", "uniprot", "pubmed", "reactome", "clinicaltrials"],
+        sources_failed=[],
+        sealed_at=datetime.utcnow(),
+    )
+
+
 class TestFullReasoningPipeline:
     """Integration tests for the full reasoning pipeline."""
 
@@ -356,3 +435,45 @@ class TestFullReasoningPipeline:
         assert 0.0 <= result.support_assessment.score <= 1.0
         assert 0.0 <= result.mechanistic_assessment.score <= 1.0
         assert 0.0 <= result.risk_assessment.score <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_scientific_context_surfaces_in_audit(self, orchestrator):
+        """Audit report should contain the five-dimensional ScientificContext."""
+        package = _build_minimal_context_pkg()
+        with patch.object(orchestrator._extraction_agent, "extract_claims") as mock_extract:
+            mock_extract.return_value = []
+            result = await orchestrator.reason(package)
+
+        sc = result.audit_report.scientific_context
+        assert set(sc) == {"regulatory", "repurposing", "mechanistic",
+                           "clinical", "knowledge_maturity", "related_pairs"}
+        for dim in ("regulatory", "repurposing", "mechanistic", "clinical", "knowledge_maturity"):
+            assert "status" in sc[dim]
+            assert "confidence" in sc[dim]
+            assert "evidence" in sc[dim]
+
+    @pytest.mark.asyncio
+    async def test_rule_minus1_only_for_live_approval(self, orchestrator):
+        """Rule -1 must fire ONLY on a live ChEMBL APPROVED signal.
+
+        Regression: the cache-only route previously promoted an established,
+        high-similarity seed pair (Sildenafil/PAH) to APPROVED and could grant
+        the Rule -1 bypass without live ChEMBL data. It must no longer do so.
+        """
+        # No approval signal → cache seed alone must not fire Rule -1.
+        pkg_no_signal = _build_minimal_context_package(approved=False)
+        with patch.object(orchestrator._extraction_agent, "extract_claims") as mock_extract:
+            mock_extract.return_value = []
+            result_no_signal = await orchestrator.reason(pkg_no_signal)
+
+        assert not any(r.startswith("Rule -1") for r in result_no_signal.recommendation_reasons)
+        assert result_no_signal.audit_report.scientific_context["regulatory"]["status"] == "NONE"
+
+        # Live approval present → Rule -1 fires.
+        pkg_approved = _build_minimal_context_package(approved=True)
+        with patch.object(orchestrator._extraction_agent, "extract_claims") as mock_extract:
+            mock_extract.return_value = []
+            result_approved = await orchestrator.reason(pkg_approved)
+
+        assert any(r.startswith("Rule -1") for r in result_approved.recommendation_reasons)
+        assert result_approved.audit_report.scientific_context["regulatory"]["status"] == "APPROVED"

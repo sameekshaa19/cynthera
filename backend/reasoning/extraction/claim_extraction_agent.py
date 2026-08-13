@@ -18,6 +18,8 @@ from backend.core.value_objects.erw import ERW
 from backend.core.value_objects.provenance import ProvenanceReference
 from backend.core.exceptions import LLMResponseParsingError
 
+from backend.infrastructure.cache.raw_response_cache import RawResponseCache, TTL_LITERATURE
+
 logger = logging.getLogger(__name__)
 
 # Versioned extraction prompt
@@ -45,7 +47,7 @@ class ClaimExtractionAgent:
     All other components must be deterministic.
 
     Attributes:
-        _model: LLM model name (default 'gemini-2.0-flash').
+        _model: LLM model name.
         _api_key: LLM API key from environment.
         _prompt_version: Version string of the extraction prompt used.
         _last_extraction_method: Tracks whether the last call used LLM or rule-based fallback.
@@ -58,20 +60,22 @@ class ClaimExtractionAgent:
         self,
         model: str = "gemini-2.0-flash",
         api_key: str | None = None,
+        db_path: str = "data/cynthera.db",
     ) -> None:
         """Initialize the ClaimExtractionAgent.
 
         Args:
             model: LLM model identifier.
             api_key: LLM API key (falls back to GROQ_API_KEY / LLM_API_KEY / GEMINI_API_KEY environment variable).
+            db_path: Path to SQLite database file for claim caching.
         """
         self._model = model
         self._api_key = api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self._prompt_version = self.PROMPT_VERSION
-        # Tracks extraction path per call — set before every return in _call_llm.
-        # 'llm' = LLM succeeded. 'rule_based_fallback' = LLM unavailable or failed.
         self._last_extraction_method: str = "llm"
         self._has_logged_unconfigured_warning: bool = False
+        self._raw_cache = RawResponseCache(db_path=db_path) if db_path else None
+        self._sem = asyncio.Semaphore(3)  # Bound concurrent LLM calls to 3 to prevent TPM/RPM bursts
 
     async def extract_claims(
         self,
@@ -93,7 +97,43 @@ class ClaimExtractionAgent:
             logger.info("evidence_abstract_missing", extra={"evidence_id": str(evidence.id)})
             return []
 
+        # Check raw cache for previously extracted claims
+        import hashlib
+        abstract_hash = hashlib.sha256(evidence.abstract.encode()).hexdigest()[:16]
+        cache_key = ""
+        if self._raw_cache:
+            cache_key = RawResponseCache.make_key(
+                "llm_claims",
+                evidence.citation_key or abstract_hash,
+                "extract_v1",
+                {"drug": drug_name.lower().strip(), "disease": disease_name.lower().strip()},
+            )
+            cached = self._raw_cache.get(cache_key, source_name="llm_claims")
+            if cached is not None and isinstance(cached, dict):
+                method = cached.get("method", "llm")
+                raw_claims = cached.get("claims", [])
+                self._last_extraction_method = method
+                claims: list[Claim] = []
+                for raw in raw_claims:
+                    try:
+                        claim = self._parse_raw_claim(raw, evidence, extraction_method=method)
+                        claims.append(claim)
+                    except Exception:
+                        continue
+                return claims
+
         raw_claims = await self._call_llm(evidence.abstract, drug_name, disease_name)
+
+        # Store extraction in raw cache for instant 0ms response on future calls
+        if self._raw_cache and cache_key and raw_claims:
+            self._raw_cache.set(
+                cache_key,
+                "llm_claims",
+                evidence.citation_key or abstract_hash,
+                "extract_v1",
+                {"claims": raw_claims, "method": self._last_extraction_method},
+                TTL_LITERATURE,
+            )
 
         claims: list[Claim] = []
         for raw in raw_claims:
@@ -121,106 +161,108 @@ class ClaimExtractionAgent:
         Returns:
             List of raw claim dicts from LLM output.
         """
-        groq_key = self._api_key if (self._api_key and self._api_key.startswith("gsk_")) else os.environ.get("GROQ_API_KEY")
-        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
+        async with self._sem:
+            groq_key = self._api_key if (self._api_key and self._api_key.startswith("gsk_")) else os.environ.get("GROQ_API_KEY")
+            gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
 
-        # Validate keys (ignore unconfigured placeholders)
-        has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your_groq"))
-        has_valid_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
+            # Validate keys (ignore unconfigured placeholders)
+            has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your_groq"))
+            has_valid_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
 
-        if has_valid_groq:
-            prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
-            model_name = self._model if not self._model.startswith("gemini") else "llama-3.3-70b-versatile"
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {groq_key}",
-                "Content-Type": "application/json",
-            }
-            body = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 1000,
-            }
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    for attempt in range(4):
-                        resp = await client.post(url, headers=headers, json=body)
-                        if resp.status_code == 429:
-                            # Groq free tier rate limit — back off and retry
-                            retry_delay = float(resp.headers.get("retry-after", 2.0)) + (attempt * 1.0)
-                            logger.info(
-                                "groq_rate_limit_backoff",
-                                extra={"attempt": attempt + 1, "retry_delay": retry_delay},
-                            )
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        resp.raise_for_status()
-                        data = resp.json()
-                        response_text = data["choices"][0]["message"]["content"]
-                        self._last_extraction_method = "llm"
-                        return self._parse_llm_response(response_text)
-            except Exception as exc:
-                logger.error(
-                    f"llm_call_failed: provider=groq model={model_name} [{type(exc).__name__}] {exc}",
-                    extra={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                        "model": model_name,
-                        "fallback": "rule_based_fallback",
-                    },
-                )
+            if has_valid_groq:
+                prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+                # Default to llama-3.1-8b-instant for fast, low-latency, high-throughput Groq extraction
+                model_name = self._model if ("8b" in self._model or "instant" in self._model) else "llama-3.1-8b-instant"
+                url = "https://api.groq.com/openai/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                }
+                body = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 1000,
+                }
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        for attempt in range(4):
+                            resp = await client.post(url, headers=headers, json=body)
+                            if resp.status_code == 429:
+                                # Groq free tier rate limit — back off and retry
+                                retry_delay = float(resp.headers.get("retry-after", 1.5)) + (attempt * 0.5)
+                                logger.info(
+                                    "groq_rate_limit_backoff",
+                                    extra={"attempt": attempt + 1, "retry_delay": retry_delay},
+                                )
+                                await asyncio.sleep(retry_delay)
+                                continue
+                            resp.raise_for_status()
+                            data = resp.json()
+                            response_text = data["choices"][0]["message"]["content"]
+                            self._last_extraction_method = "llm"
+                            return self._parse_llm_response(response_text)
+                except Exception as exc:
+                    logger.error(
+                        f"llm_call_failed: provider=groq model={model_name} [{type(exc).__name__}] {exc}",
+                        extra={
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "model": model_name,
+                            "fallback": "rule_based_fallback",
+                        },
+                    )
+                    self._last_extraction_method = "rule_based_fallback"
+                    return self._rule_based_fallback(text, drug_name, disease_name)
+
+            elif has_valid_gemini:
+                prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+                try:
+                    from google import genai as google_genai
+                    from google.genai import types as genai_types
+
+                    client = google_genai.Client(api_key=gemini_key)
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model=self._model if self._model.startswith("gemini") else "gemini-2.0-flash",
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.0,
+                            max_output_tokens=1000,
+                        ),
+                    )
+                    self._last_extraction_method = "llm"
+                    return self._parse_llm_response(response.text)
+                except ImportError:
+                    logger.warning(
+                        "google_genai_not_installed",
+                        extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
+                    )
+                    self._last_extraction_method = "rule_based_fallback"
+                    return self._rule_based_fallback(text, drug_name, disease_name)
+                except Exception as exc:
+                    logger.error(
+                        f"llm_call_failed: provider=google model={self._model} [{type(exc).__name__}] {exc}",
+                        extra={
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "model": self._model,
+                            "fallback": "rule_based_fallback",
+                        },
+                    )
+                    self._last_extraction_method = "rule_based_fallback"
+                    return self._rule_based_fallback(text, drug_name, disease_name)
+
+            else:
+                if not self._has_logged_unconfigured_warning:
+                    logger.info(
+                        "llm_key_unconfigured_fallback_to_rule_based",
+                        extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY or GEMINI_API_KEY in .env"},
+                    )
+                    self._has_logged_unconfigured_warning = True
                 self._last_extraction_method = "rule_based_fallback"
                 return self._rule_based_fallback(text, drug_name, disease_name)
-
-        elif has_valid_gemini:
-            prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
-            try:
-                from google import genai as google_genai
-                from google.genai import types as genai_types
-
-                client = google_genai.Client(api_key=gemini_key)
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=self._model if self._model.startswith("gemini") else "gemini-2.0-flash",
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.0,
-                        max_output_tokens=1000,
-                    ),
-                )
-                self._last_extraction_method = "llm"
-                return self._parse_llm_response(response.text)
-            except ImportError:
-                logger.warning(
-                    "google_genai_not_installed",
-                    extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
-                )
-                self._last_extraction_method = "rule_based_fallback"
-                return self._rule_based_fallback(text, drug_name, disease_name)
-            except Exception as exc:
-                logger.error(
-                    f"llm_call_failed: provider=google model={self._model} [{type(exc).__name__}] {exc}",
-                    extra={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                        "model": self._model,
-                        "fallback": "rule_based_fallback",
-                    },
-                )
-                self._last_extraction_method = "rule_based_fallback"
-                return self._rule_based_fallback(text, drug_name, disease_name)
-
-        else:
-            if not self._has_logged_unconfigured_warning:
-                logger.info(
-                    "llm_key_unconfigured_fallback_to_rule_based",
-                    extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY or GEMINI_API_KEY in .env"},
-                )
-                self._has_logged_unconfigured_warning = True
-            self._last_extraction_method = "rule_based_fallback"
-            return self._rule_based_fallback(text, drug_name, disease_name)
 
     def _parse_llm_response(self, response_text: str) -> list[dict[str, Any]]:
         """Parse and validate LLM JSON response.

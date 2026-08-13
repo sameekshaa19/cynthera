@@ -434,7 +434,7 @@ if page == "🔬 Evaluate":
                     }
 
                     orchestrator = MasterOrchestrator(
-                        llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
+                        llm_api_key=os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
                         ncbi_api_key=os.environ.get("NCBI_API_KEY"),
                         disgenet_api_key=os.environ.get("DISGENET_API_KEY"),
                     )
@@ -682,60 +682,70 @@ elif page == "📊 Results":
             </div>
             """, unsafe_allow_html=True)
 
-        # ── Evaluation Pathway Banner (evidence-driven, from retrieved ChEMBL data) ────────
+        # ── Scientific Context Banner (dimensional prior knowledge) ──────────
         audit = result.audit_report
-        evaluation_pathway = getattr(audit, "evaluation_pathway", "NOVEL_HYPOTHESIS")
         ct_status = getattr(audit, "clinical_trial_status", "NOT_ATTEMPTED")
+        scientific_context = getattr(audit, "scientific_context", {}) or {}
 
-        _PATHWAY_CONFIG = {
-            "APPROVED_INDICATION": {
-                "icon": "✅",
-                "label": "FDA / EMA APPROVED INDICATION",
-                "color": "#10b981",
-                "bg": "rgba(16,185,129,0.1)",
-                "desc": "This drug-disease pair represents an established approved therapy, "
-                        "as detected from ChEMBL drug indication data (max_phase_for_ind = 4).",
-            },
-            "PHASE_III_INVESTIGATION": {
-                "icon": "🧪",
-                "label": "PHASE III CLINICAL INVESTIGATION",
-                "color": "#3b82f6",
-                "bg": "rgba(59,130,246,0.1)",
-                "desc": "This drug is in Phase III trials for this indication (ChEMBL max_phase_for_ind = 3).",
-            },
-            "PHASE_II_INVESTIGATION": {
-                "icon": "🔬",
-                "label": "PHASE II CLINICAL INVESTIGATION",
-                "color": "#8b5cf6",
-                "bg": "rgba(139,92,246,0.1)",
-                "desc": "This drug is in Phase II trials for this indication (ChEMBL max_phase_for_ind = 2).",
-            },
-            "PHASE_I_INVESTIGATION": {
-                "icon": "🔬",
-                "label": "PHASE I CLINICAL INVESTIGATION",
-                "color": "#f59e0b",
-                "bg": "rgba(245,158,11,0.1)",
-                "desc": "This drug has Phase I safety data for this indication (ChEMBL max_phase_for_ind = 1).",
-            },
-            "NOVEL_HYPOTHESIS": {
-                "icon": "🔬",
-                "label": "REPURPOSING HYPOTHESIS",
-                "color": "#64748b",
-                "bg": "rgba(100,116,139,0.1)",
-                "desc": "No prior approved indication match found in ChEMBL for this drug-disease pair. "
-                        "Evidence is evaluated as a novel repurposing hypothesis.",
-            },
+        _STATUS_STYLE = {
+            "APPROVED": ("✅", "#10b981", "rgba(16,185,129,0.12)"),
+            "INVESTIGATIONAL": ("🧪", "#3b82f6", "rgba(59,130,246,0.12)"),
+            "ESTABLISHED": ("✅", "#10b981", "rgba(16,185,129,0.12)"),
+            "EMERGING": ("🟡", "#f59e0b", "rgba(245,158,11,0.12)"),
+            "STRONG": ("🟢", "#10b981", "rgba(16,185,129,0.12)"),
+            "MODERATE": ("🟡", "#f59e0b", "rgba(245,158,11,0.12)"),
+            "HUMAN_EVIDENCE": ("🧬", "#3b82f6", "rgba(59,130,246,0.12)"),
+            "ANIMAL_ONLY": ("🐁", "#8b5cf6", "rgba(139,92,246,0.12)"),
+            "GROWING": ("🌱", "#3b82f6", "rgba(59,130,246,0.12)"),
         }
-        pw_cfg = _PATHWAY_CONFIG.get(evaluation_pathway, _PATHWAY_CONFIG["NOVEL_HYPOTHESIS"])
-        st.markdown(f"""
-        <div style="border-left: 4px solid {pw_cfg['color']}; background: {pw_cfg['bg']};
-                    padding: 1rem 1.25rem; border-radius: 8px; margin-bottom: 1rem;">
-            <div style="font-size: 1rem; font-weight: 700; color: {pw_cfg['color']}; letter-spacing: 0.05em;">
-                {pw_cfg['icon']} {pw_cfg['label']}
+        _DIMENSION_LABELS = {
+            "regulatory": "Regulatory",
+            "repurposing": "Repurposing",
+            "mechanistic": "Mechanistic",
+            "clinical": "Clinical",
+            "knowledge_maturity": "Knowledge Maturity",
+        }
+
+        if scientific_context:
+            chips: list[str] = []
+            for dim_key in ("regulatory", "repurposing", "mechanistic", "clinical", "knowledge_maturity"):
+                dim = scientific_context.get(dim_key) or {}
+                status = dim.get("status", "—")
+                icon, color, bg = _STATUS_STYLE.get(status, ("🔬", "#64748b", "rgba(100,116,139,0.1)"))
+                conf = float(dim.get("confidence", 0.0))
+                evidence = " ".join(dim.get("evidence", [])[:2])
+                chips.append(
+                    f"<div style='flex:1;min-width:150px;background:{bg};border:1px solid {color}33;"
+                    f"border-radius:8px;padding:0.6rem 0.75rem;margin:0.15rem 0;'>"
+                    f"<div style='color:#94a3b8;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;'>"
+                    f"{_DIMENSION_LABELS.get(dim_key, dim_key)}</div>"
+                    f"<div style='font-size:0.95rem;font-weight:700;color:{color};'>{icon} {status} "
+                    f"<span style='color:#94a3b8;font-weight:400;'>· {conf:.0%}</span></div>"
+                    f"<div style='color:#cbd5e1;font-size:0.75rem;margin-top:0.2rem;'>{evidence[:160]}</div>"
+                    f"</div>"
+                )
+            st.markdown(
+                "<div style='font-size:0.85rem;font-weight:700;color:#94a3b8;text-transform:uppercase;"
+                "letter-spacing:0.05em;margin:0.5rem 0 0.25rem;'>Prior Knowledge — Scientific Context</div>"
+                + "".join(chips),
+                unsafe_allow_html=True,
+            )
+        else:
+            # Fallback: legacy single-pathway banner
+            evaluation_pathway = getattr(audit, "evaluation_pathway", "NOVEL_HYPOTHESIS")
+            _PATHWAY_CONFIG = {
+                "APPROVED_INDICATION": ("✅", "#10b981", "rgba(16,185,129,0.1)", "FDA / EMA APPROVED INDICATION"),
+                "NOVEL_HYPOTHESIS": ("🔬", "#64748b", "rgba(100,116,139,0.1)", "REPURPOSING HYPOTHESIS"),
+            }
+            cfg = _PATHWAY_CONFIG.get(evaluation_pathway, _PATHWAY_CONFIG["NOVEL_HYPOTHESIS"])
+            st.markdown(f"""
+            <div style="border-left: 4px solid {cfg[1]}; background: {cfg[2]};
+                        padding: 1rem 1.25rem; border-radius: 8px; margin-bottom: 1rem;">
+                <div style="font-size: 1rem; font-weight: 700; color: {cfg[1]}; letter-spacing: 0.05em;">
+                    {cfg[0]} {cfg[3]}
+                </div>
             </div>
-            <div style="color: #cbd5e1; font-size: 0.85rem; margin-top: 0.4rem;">{pw_cfg['desc']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
         # ── Multi-Agent Consensus Panel ────────────────────────────────────────────
         agent_verdicts = getattr(audit, "agent_verdicts", {})

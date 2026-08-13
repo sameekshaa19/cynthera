@@ -35,11 +35,13 @@ def _make_protein(uniprot_id: str = "P12345", gene_symbol: str = "TGENE", organi
     return p
 
 
-def _make_pathway(reactome_id: str = "R-HSA-001", name: str = "TestPathway"):
+def _make_pathway(reactome_id: str = "R-HSA-001", name: str = "TestPathway", participant_ids: list | None = None):
     pw = MagicMock()
     pw.reactome_id = reactome_id
     pw.name = name
-    pw.participant_uniprot_ids = []
+    # P8 fix: tests that need 2-HOP/3-HOP paths must include the target's UniProt ID.
+    # Empty list triggers fail-closed guard (correct behaviour). Pass participant_ids to test real membership.
+    pw.participant_uniprot_ids = participant_ids if participant_ids is not None else []
     return pw
 
 
@@ -89,18 +91,28 @@ class TestMultiHopReasoner:
         assert len(direct_paths) > 0
 
     def test_two_hop_path_with_pathway(self):
-        """Target + Pathway should produce 2-HOP paths."""
-        target = _make_target()
-        pathway = _make_pathway()
+        """Target + Pathway should produce 2-HOP paths.
+
+        P8 fix: pathway must include target UniProt ID in participant_uniprot_ids.
+        With fail-closed guard, empty participant list rejects the hop (correct).
+        """
+        target = _make_target(uniprot_id="P12345")
+        # Include target's UniProt ID so membership guard passes
+        pathway = _make_pathway(participant_ids=["P12345"])
         package = _make_package(targets=[target], pathways=[pathway])
         paths = self.reasoner.trace_paths(package)
         two_hop_paths = [p for p in paths if p.path_type == "2-HOP"]
         assert len(two_hop_paths) > 0
 
     def test_three_hop_path_with_secondary_protein(self):
-        """Target + Pathway + secondary protein should produce 3-HOP paths."""
+        """Target + Pathway + secondary protein should produce 3-HOP paths.
+
+        P8 fix: pathway must include target UniProt ID in participant_uniprot_ids.
+        With fail-closed guard, empty participant list rejects the hop (correct).
+        """
         target = _make_target(uniprot_id="P11111")
-        pathway = _make_pathway()
+        # Include both proteins in pathway so membership guard passes for the primary
+        pathway = _make_pathway(participant_ids=["P11111", "P22222"])
         primary_protein = _make_protein(uniprot_id="P11111", gene_symbol="GENE1")
         secondary_protein = _make_protein(uniprot_id="P22222", gene_symbol="GENE2")
         package = _make_package(

@@ -58,3 +58,14 @@ sources:
     timeout_seconds: 30
     rate_limit_rps: 5
     requires_api_key: false
+
+  - name: semantic_scholar
+    display_name: "Semantic Scholar"
+    description: "AI-curated research context, citation velocity, and influential citations"
+    base_url: "https://api.semanticscholar.org/graph/v1"
+    is_core: false
+    evidence_type: "LITERATURE"
+    timeout_seconds: 20
+    rate_limit_rps: 1.0
+    requires_api_key: false
+

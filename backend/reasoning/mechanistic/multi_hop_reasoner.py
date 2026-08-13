@@ -15,9 +15,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.core.domain.retrieval_package import RetrievalPackage
+from utils.confidence_scoring import calculate_pathway_relevance_score
+
+if TYPE_CHECKING:
+    from backend.core.domain.target import Target
 
 logger = logging.getLogger(__name__)
 
@@ -153,32 +157,55 @@ def _build_validated_gene_set(package: RetrievalPackage) -> set[str]:
 # Organism validation
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# Organism validation
+# ─────────────────────────────────────────────
+
 _HUMAN_ORGANISM_MARKERS: frozenset[str] = frozenset({
     "homo sapiens",
     "human",
 })
 
 
-def _is_human_protein(protein: Any) -> bool:
-    """Return True only if the protein's organism is confirmed Homo sapiens.
+def _clean_uniprot(acc: str | None) -> str:
+    """Normalize UniProt accession by removing isoform suffixes and whitespace."""
+    if not acc:
+        return ""
+    return acc.split("-")[0].strip().upper()
 
-    Errs on the side of exclusion: a protein with an unknown or missing organism
-    field is NOT trusted as a human mechanism. Only explicitly Homo sapiens records
-    are accepted. This prevents bacterial, viral, or yeast proteins from ChEMBL
-    cross-references contributing to a human-disease mechanistic hypothesis.
+
+def _is_human_protein(protein: Any) -> bool:
+    """Return True if the protein's organism is human or unstated/unfetched.
+
+    Returns False only for explicitly non-human organisms (e.g., bacterial, viral, rodent).
+    Handles string variations like 'Homo sapiens (Human)', 'Homo sapiens (9606)', 'Human', etc.
 
     Args:
         protein: A Protein domain model, or None.
 
     Returns:
-        True if organism is Homo sapiens, False for None / unknown / non-human.
+        True if organism is human or unstated, False for non-human organisms.
     """
     if protein is None:
-        return False
+        return True  # If protein details were not fetched, do not reject valid target
     organism = getattr(protein, "organism", None)
     if not organism:
+        return True
+    org_lower = organism.strip().lower()
+    
+    # Explicit non-human keywords check
+    non_human_keywords = (
+        "bacteria", "bacterial", "virus", "viral", "coli", "yeast",
+        "rattus", "mouse", "mus musculus", "bovine", "porcine", "vector"
+    )
+    if any(k in org_lower for k in non_human_keywords):
         return False
-    return organism.strip().lower() in _HUMAN_ORGANISM_MARKERS
+
+    # Check for human keywords / taxon ID
+    human_keywords = ("homo sapiens", "human", "9606", "swiss-prot")
+    if any(k in org_lower for k in human_keywords):
+        return True
+    return True
 
 
 class MultiHopReasoner:
@@ -220,34 +247,49 @@ class MultiHopReasoner:
         drug_name = package.drug.name
         disease_name = package.disease.name
         targets = package.targets
-        pathways = package.pathways
         proteins = package.proteins
 
         if not targets:
             # No targets — cannot trace any path
             return []
 
-        # Build protein lookup by UniProt accession
-        protein_by_uniprot: dict[str, Any] = {
-            p.uniprot_accession: p for p in proteins
-        }
+        # ── P6: Rank pathways by gene-overlap relevance before iteration ────
+        # calculate_pathway_relevance_score combines disease-gene overlap (60%)
+        # and drug-target overlap (40%) to prioritise biologically relevant pathways.
+        # Replaces insertion-order [:4] slice which selected arbitrary pathways.
+        drug_target_genes = [p.gene_symbol for p in proteins if p.gene_symbol]
+        disease_genes = list((getattr(package, "validated_disease_genes", None) or {}).keys())
+
+        def _pathway_relevance(pw) -> float:
+            return calculate_pathway_relevance_score(
+                pathway_genes=pw.participant_uniprot_ids or [],
+                disease_genes=disease_genes,
+                drug_targets=drug_target_genes,
+            )
+
+        pathways = sorted(package.pathways, key=_pathway_relevance, reverse=True)
+
+        # Build protein lookup by UniProt accession (supporting both raw and clean accessions)
+        protein_by_uniprot: dict[str, Any] = {}
+        for p in proteins:
+            if p.uniprot_accession:
+                protein_by_uniprot[p.uniprot_accession] = p
+                clean_acc = _clean_uniprot(p.uniprot_accession)
+                if clean_acc:
+                    protein_by_uniprot[clean_acc] = p
 
         # Build set of gene symbols validated by DisGeNET for this disease
         validated_genes = _build_validated_gene_set(package)
 
         for target in targets[:6]:  # cap at 6 targets
             uniprot_id = target.protein_uniprot
+            norm_uniprot = _clean_uniprot(uniprot_id)
 
             # Resolve protein label
-            protein = protein_by_uniprot.get(uniprot_id)
+            protein = protein_by_uniprot.get(uniprot_id) or protein_by_uniprot.get(norm_uniprot)
 
-            # ── Organism guard (Fix C) ───────────────────────────────────────────
-            # Reject any target whose protein is not confirmed Homo sapiens.
-            # This is the primary guard preventing bacterial/viral/non-human
-            # proteins from appearing as "mechanisms" in human-disease hypotheses.
-            # Note: if protein is None (target outside the UniProt fetch cap of 5),
-            # the target is also excluded — this is safe but means RC-06 (UniProt
-            # cap) can incidentally exclude legitimate human targets 6+.
+            # ── Organism guard ──────────────────────────────────────────────────
+            # Reject any target whose protein is explicitly confirmed non-human.
             if not _is_human_protein(protein):
                 logger.info(
                     "mechanistic_target_skipped_non_human",
@@ -297,12 +339,24 @@ class MultiHopReasoner:
 
             # ── Path Type 2: Drug → Target → Pathway → Disease (2-HOP)
             for pathway in pathways[:4]:
-                # ── Pathway membership guard (Fix B3) ───────────────────────────
-                # Only proceed if this target's protein is a known participant in
-                # this pathway. If participant_uniprot_ids is [] (participant fetch
-                # failed or not yet populated), the guard is skipped to degrade
-                # gracefully to pre-Fix-B behaviour rather than blocking all paths.
-                if pathway.participant_uniprot_ids and uniprot_id not in pathway.participant_uniprot_ids:
+                # ── P8: Fail-closed pathway membership guard ─────────────────
+                # Reject the hop if we have NO participant data (unknown membership
+                # is treated as non-membership). Previously the guard was fail-open:
+                # empty participant_ids let any target pass unconditionally.
+                participant_ids = pathway.participant_uniprot_ids or []
+                if not participant_ids:
+                    logger.debug(
+                        "pathway_membership_data_absent_skip",
+                        extra={"uniprot_id": uniprot_id, "pathway": pathway.reactome_id},
+                    )
+                    continue
+
+                clean_participants = {_clean_uniprot(pid) for pid in participant_ids if pid}
+                if (
+                    clean_participants
+                    and norm_uniprot not in clean_participants
+                    and uniprot_id not in participant_ids
+                ):
                     logger.debug(
                         "mechanistic_2hop_skipped_non_participant",
                         extra={"uniprot_id": uniprot_id, "pathway": pathway.reactome_id},
@@ -331,26 +385,36 @@ class MultiHopReasoner:
             # ── Path Type 3: Drug → Target → Pathway → Protein2 → Disease (3-HOP)
             if proteins and pathways:
                 for pathway in pathways[:2]:
-                    # ── Pathway membership guard — primary target (Fix B3) ───────
-                    if pathway.participant_uniprot_ids and uniprot_id not in pathway.participant_uniprot_ids:
+                    # ── P8: Same fail-closed guard for 3-HOP paths ───────────
+                    participant_ids = pathway.participant_uniprot_ids or []
+                    if not participant_ids:
+                        logger.debug(
+                            "pathway_membership_data_absent_skip_3hop",
+                            extra={"uniprot_id": uniprot_id, "pathway": pathway.reactome_id},
+                        )
+                        continue
+
+                    clean_participants = {_clean_uniprot(pid) for pid in participant_ids if pid}
+                    if (
+                        clean_participants
+                        and norm_uniprot not in clean_participants
+                        and uniprot_id not in participant_ids
+                    ):
                         continue
 
                     # Use secondary proteins as downstream effectors.
-                    # Restrict to human proteins only (Gap 1 fix).
                     secondary_proteins = [
                         p for p in proteins
-                        if p.uniprot_accession != uniprot_id
-                        and _is_human_protein(p)  # Gap 1: organism filter on effector
+                        if _clean_uniprot(p.uniprot_accession) != norm_uniprot
+                        and _is_human_protein(p)
                     ][:2]
 
                     for sec_protein in secondary_proteins:
-                        # ── Pathway membership guard — effector protein (Gap 2 fix) ─
-                        # Both hops in a 3-HOP chain need grounding. The effector
-                        # must also participate in the same pathway — not just the
-                        # primary target.
+                        sec_norm = _clean_uniprot(sec_protein.uniprot_accession)
                         if (
-                            pathway.participant_uniprot_ids
-                            and sec_protein.uniprot_accession not in pathway.participant_uniprot_ids
+                            clean_participants
+                            and sec_norm not in clean_participants
+                            and sec_protein.uniprot_accession not in participant_ids
                         ):
                             logger.debug(
                                 "mechanistic_3hop_skipped_effector_non_participant",
@@ -412,11 +476,23 @@ class MultiHopReasoner:
     def compute_mechanistic_score(self, paths: list[MechanisticPath]) -> float:
         """Compute a Mechanistic Score from traced paths.
 
-        Uses the top-3 paths with diminishing-returns aggregation:
-        score = 1 - prod(1 - conf_i) for top-3 paths
+        P7 Fix: Replaces union-inflation formula with weakest-link + diminishing
+        returns (DeepRoot arXiv 2606.15931 informed).
+
+        Old formula: score = 1 - prod(1 - conf_i)
+          Problem: 3 paths at 0.40 → 0.784 (HIGH) — unjustified when no single
+          path exceeds 40% confidence.
+
+        New formula: score = best_conf × (1 - exp(-0.5 × n_paths))
+          The best (highest-confidence) path drives the score. Additional
+          corroborating paths add diminishing returns via the exponential factor:
+            n=1 → ×0.394  (single path, no corroboration)
+            n=2 → ×0.632  (one corroborating path)
+            n=3 → ×0.777  (two corroborating paths)
+          Result: 3 paths at 0.40 → 0.40 × 0.777 = 0.311 (LOW-MEDIUM) ✓
 
         Args:
-            paths: List of MechanisticPath objects sorted by confidence.
+            paths: List of MechanisticPath objects sorted by confidence descending.
 
         Returns:
             Mechanistic Score in [0.0, 1.0].
@@ -424,12 +500,9 @@ class MultiHopReasoner:
         if not paths:
             return 0.0
 
-        import math
-
         top = paths[:3]
-        # Probability of at least one path being valid
-        prob_none = 1.0
-        for p in top:
-            prob_none *= (1.0 - p.confidence)
-        score = round(1.0 - prob_none, 4)
+        best_conf = top[0].confidence  # paths already sorted descending
+        n = len(top)
+        # Weakest-link: best path confidence × diminishing-returns coverage factor
+        score = round(best_conf * (1.0 - math.exp(-0.5 * n)), 4)
         return min(1.0, score)

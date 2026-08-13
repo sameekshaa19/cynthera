@@ -5,8 +5,9 @@ Reference: 02_DOMAIN_MODEL.md §4.3
 from __future__ import annotations
 
 import uuid
+from typing import Any
 from pydantic import BaseModel, Field, field_validator
-from backend.core.value_objects.identifier import ResolvedIdentifierSet
+from backend.core.value_objects.identifier import CanonicalIdentifier, ResolvedIdentifierSet
 
 
 class Drug(BaseModel):
@@ -51,6 +52,16 @@ class Drug(BaseModel):
         if not v.strip():
             raise ValueError("Drug name must be a non-empty string.")
         return v.strip()
+
+    @field_validator("identifiers", mode="before")
+    @classmethod
+    def coerce_identifiers(cls, v: Any, info: Any) -> Any:
+        """Coerce dictionary inputs to ResolvedIdentifierSet for flexible construction."""
+        if isinstance(v, dict) and not isinstance(v, ResolvedIdentifierSet):
+            entity_name = info.data.get("name", "unknown") if hasattr(info, "data") else "unknown"
+            ids = [CanonicalIdentifier(namespace=k.replace("_id", ""), value=str(val)) for k, val in v.items()]
+            return ResolvedIdentifierSet(entity_name=entity_name, entity_type="drug", identifiers=ids)
+        return v
 
     def has_identifier(self, namespace: str) -> bool:
         """Check whether a specific identifier namespace is resolved.

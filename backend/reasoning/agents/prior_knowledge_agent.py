@@ -12,9 +12,12 @@ Classification logic (all evidence-driven):
   PHASE_I_INVESTIGATION   → ChEMBL max_phase_for_ind == 1 AND indication matches disease
   NOVEL_HYPOTHESIS        → No matching indication found OR max_phase == 0
 
-The KnowledgeStore (TF-IDF cache) remains available as a secondary signal
-for previously evaluated pairs, but it only stores data that was originally
-retrieved — it is never a manually authored knowledge base.
+Approval status is established ONLY from the live ChEMBL ApprovalSignal.
+The KnowledgeStore (TF-IDF cache) NEVER grants approval — cache entries are
+retrieved as a secondary signal (related pairs, mechanistic hints, evidence
+boost) but the evaluation_pathway is never promoted to APPROVED_INDICATION
+from cache data. A richer, multi-dimensional interpretation of this context
+is assembled downstream by ScientificContextBuilder.
 
 Reference: 04_REASONING_SPECIFICATION.md, 05_AGENT_SPECIFICATIONS.md
 """
@@ -265,10 +268,15 @@ class PriorKnowledgeAgent:
     ) -> PriorKnowledgeContext:
         """Infer from KnowledgeStore cache only (used when ChEMBL signal unavailable).
 
-        The cache contains only previously retrieved data, never manually
+        The cache contains only previously retrieved knowledge, never manually
         authored entries (except for the small seed set of known repurposing
         cases that serves as a warm start until the database accumulates
         retrieved data).
+
+        IMPORTANT: cache data never grants approval. Without a live ChEMBL
+        signal the pathway is always NOVEL_HYPOTHESIS and is_approved_indication
+        is always False. Cache evidence still contributes an evidence boost,
+        confidence adjustment, mechanistic hints, and related-pair context.
         """
         entries = self._store.retrieve_prior_knowledge(
             drug=drug_name.lower(),
@@ -277,34 +285,36 @@ class PriorKnowledgeAgent:
             min_similarity=self._LOW_SIM,
         )
 
-        if not entries:
-            return PriorKnowledgeContext(
-                evaluation_pathway="NOVEL_HYPOTHESIS",
-                narrative=(
-                    f"No ChEMBL indication data available and no cache entries found "
-                    f"for {drug_name} → {disease_name}. "
-                    "Treating as a novel repurposing hypothesis. "
-                    "Evidence evaluated on its own merits."
-                ),
-            )
-
-        top = entries[0]
-        # Cache-based approval: requires high similarity AND established flag
-        is_approved = top.established and top.similarity >= self._HIGH_SIM
-        pathway = "APPROVED_INDICATION" if is_approved else "NOVEL_HYPOTHESIS"
-        has_precedent = is_approved
+        pathway = "NOVEL_HYPOTHESIS"
+        is_approved = False
+        has_precedent = False
 
         evidence_boost = self._compute_evidence_boost_from_cache(entries)
         confidence_adj = self._compute_confidence_adjustment_from_cache(entries)
         mechanistic_hints = self._extract_mechanistic_hints(entries)
-        narrative = self._build_cache_narrative(drug_name, disease_name, entries, is_approved, evidence_boost)
+
+        if not entries:
+            narrative = (
+                f"No ChEMBL indication data available and no cache entries found "
+                f"for {drug_name} → {disease_name}. "
+                "Treating as a novel repurposing hypothesis. "
+                "Evidence evaluated on its own merits."
+            )
+        else:
+            narrative = self._build_cache_narrative(
+                drug_name, disease_name, entries, evidence_boost
+            )
+
+        top = entries[0] if entries else None
 
         return PriorKnowledgeContext(
             evaluation_pathway=pathway,
             is_approved_indication=is_approved,
             approval_type=pathway,
-            approval_confidence=top.similarity if is_approved else 0.0,
-            matched_indication_term=f"{top.drug} → {top.disease}",
+            approval_confidence=0.0,
+            matched_indication_term=(
+                f"{top.drug} → {top.disease}" if top else ""
+            ),
             has_established_precedent=has_precedent,
             mechanistic_hints=mechanistic_hints,
             evidence_boost=evidence_boost,
@@ -419,32 +429,27 @@ class PriorKnowledgeAgent:
         drug_name: str,
         disease_name: str,
         entries: list[KnowledgeEntry],
-        is_approved: bool,
         evidence_boost: float,
     ) -> str:
-        """Build narrative from cache entries only."""
+        """Build narrative from cache entries only.
+
+        Cache data never grants approval — the narrative reports related
+        prior knowledge but always notes that live ChEMBL data was unavailable.
+        """
         parts: list[str] = []
         top = entries[0]
 
-        if is_approved:
+        if top.similarity >= self._MED_SIM:
             parts.append(
-                f"Cache indicates established precedent for {drug_name} → {disease_name} "
-                f"(cache similarity: {top.similarity:.2f}, evidence level: {top.evidence_level}). "
-                "Note: ChEMBL live data was unavailable; this conclusion is based on "
-                "previously retrieved cache data."
+                f"Related cache entry found (similarity: {top.similarity:.2f}): "
+                f"{top.drug.title()} → {top.disease.title()}."
             )
         else:
-            if top.similarity >= self._MED_SIM:
-                parts.append(
-                    f"Related cache entry found (similarity: {top.similarity:.2f}): "
-                    f"{top.drug.title()} → {top.disease.title()}."
-                )
-            else:
-                parts.append(
-                    f"Weak cache signal for {drug_name} → {disease_name}. "
-                    "Treating as novel repurposing hypothesis. "
-                    "ChEMBL live indication data was unavailable."
-                )
+            parts.append(
+                f"Weak cache signal for {drug_name} → {disease_name}. "
+                "Treating as novel repurposing hypothesis. "
+                "ChEMBL live indication data was unavailable."
+            )
 
         if evidence_boost > 0.1:
             parts.append(

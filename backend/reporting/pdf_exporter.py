@@ -241,6 +241,46 @@ class PDFReporter:
         story.append(score_table)
         story.append(Spacer(1, 0.3 * cm))
 
+        # ── Scientific Context (dimensional prior knowledge) ────────────
+        sc = getattr(result.audit_report, "scientific_context", {}) or {}
+        if sc:
+            story.append(Paragraph("Scientific Context — Prior Knowledge", section_style))
+            story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
+            context_data = [["Dimension", "Status", "Confidence", "Evidence"]]
+            for dim_key in ("regulatory", "repurposing", "mechanistic", "clinical", "knowledge_maturity"):
+                dim = sc.get(dim_key) or {}
+                if not dim:
+                    continue
+                context_data.append([
+                    str(dim.get("dimension", dim_key)).replace("_", " ").title(),
+                    str(dim.get("status", "—")),
+                    f"{float(dim.get('confidence', 0.0)):.0%}",
+                    "; ".join(dim.get("evidence", [])[:2])[:120],
+                ])
+            if len(context_data) > 1:
+                context_table = Table(context_data, colWidths=[3.5 * cm, 3.5 * cm, 2.5 * cm, 7.5 * cm])
+                context_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f766e")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f0fdfa"), colors.white]),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.append(context_table)
+                related = sc.get("related_pairs", []) or []
+                if related:
+                    rel_text = ", ".join(
+                        f"{p.get('drug')} → {p.get('disease')} ({p.get('similarity', 0):.2f})"
+                        for p in related[:3]
+                    )
+                    story.append(Paragraph(f"<b>Related prior-knowledge pairs:</b> {rel_text}", body_style))
+                story.append(Spacer(1, 0.2 * cm))
+
         # ── Mechanistic Chain ──────────────────────────
         if ma.mechanistic_chain:
             story.append(Paragraph("Mechanistic Chain", section_style))
@@ -347,6 +387,34 @@ class PDFReporter:
                 " → ".join(ma.mechanistic_chain),
                 "",
             ]
+
+        sc = getattr(result.audit_report, "scientific_context", {}) or {}
+        if sc:
+            lines += [
+                "─" * 70,
+                "SCIENTIFIC CONTEXT — PRIOR KNOWLEDGE",
+                "─" * 70,
+            ]
+            for dim_key in ("regulatory", "repurposing", "mechanistic", "clinical", "knowledge_maturity"):
+                dim = sc.get(dim_key) or {}
+                if not dim:
+                    continue
+                label = str(dim.get("dimension", dim_key)).replace("_", " ").title()
+                lines.append(
+                    f"  {label:<22} {dim.get('status', '—'):<15} "
+                    f"({float(dim.get('confidence', 0.0)):.0%})"
+                )
+                for evidence in dim.get("evidence", [])[:2]:
+                    lines.append(f"      - {evidence}")
+            related = sc.get("related_pairs", []) or []
+            if related:
+                lines.append("  Related prior-knowledge pairs:")
+                for p in related[:3]:
+                    lines.append(
+                        f"      - {p.get('drug')} → {p.get('disease')} "
+                        f"({p.get('similarity', 0):.2f})"
+                    )
+            lines.append("")
 
         if result.contradictions:
             lines += ["─" * 70, "CONTRADICTIONS", "─" * 70]

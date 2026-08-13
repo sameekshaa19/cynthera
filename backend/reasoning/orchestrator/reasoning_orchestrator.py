@@ -46,6 +46,10 @@ from backend.reasoning.agents.clinical_safety_agent import ClinicalSafetyAgent, 
 from backend.reasoning.agents.prior_knowledge_agent import PriorKnowledgeAgent, PriorKnowledgeContext
 from backend.reasoning.mechanistic.multi_hop_reasoner import MultiHopReasoner, MechanisticPath
 from backend.reasoning.conflict.conflict_resolver import AdvancedConflictResolver, ConflictResolutionReport
+from backend.reasoning.context.scientific_context_builder import (
+    ScientificContext,
+    ScientificContextBuilder,
+)
 from backend.infrastructure.knowledge.knowledge_store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -131,7 +135,7 @@ class ReasoningOrchestrator:
         db_path: str = "data/cynthera.db",
     ) -> None:
         """Initialize the ReasoningOrchestrator."""
-        self._extraction_agent = ClaimExtractionAgent(model=llm_model, api_key=llm_api_key)
+        self._extraction_agent = ClaimExtractionAgent(model=llm_model, api_key=llm_api_key, db_path=db_path)
         self._knowledge_store = KnowledgeStore(db_path=db_path)
         self._prior_knowledge_agent = PriorKnowledgeAgent(
             knowledge_store=self._knowledge_store
@@ -273,6 +277,17 @@ class ReasoningOrchestrator:
             support_task, mechanistic_task, risk_task
         )
 
+        # ── Step 6b: Assemble dimensional ScientificContext ──────────────
+        # A descriptive/transparency layer over signals the pipeline already
+        # computed. Rule -1 consumes only scientific_context.regulatory.
+        scientific_context = ScientificContextBuilder.build(
+            prior_ctx=prior_ctx,
+            support=support_assessment,
+            mechanistic=mechanistic_assessment,
+            mechanistic_paths=mechanistic_paths,
+            package=package,
+        )
+
         # ── Step 7: Apply recommendation rules ──────────────────────────
         recommendation_status, reasons = self._apply_rules(
             support_assessment,
@@ -282,6 +297,7 @@ class ReasoningOrchestrator:
             package,
             safety_profile,
             prior_ctx,
+            scientific_context,
         )
 
         # ── Step 8: Generate scientific audit report ─────────────────────
@@ -294,6 +310,7 @@ class ReasoningOrchestrator:
             recommendation=recommendation_status,
             reasons=reasons,
             prior_ctx=prior_ctx,
+            scientific_context=scientific_context,
             safety_profile=safety_profile,
             mechanistic_paths=mechanistic_paths,
             conflict_report=conflict_report,
@@ -369,10 +386,43 @@ class ReasoningOrchestrator:
     def _build_claim_graph(
         self, claims: list[Claim], hypothesis_id: uuid.UUID
     ) -> ClaimGraph:
-        """Construct a ClaimGraph from a list of Claims."""
+        """Construct a ClaimGraph from a list of Claims.
+
+        P5 Fix: Implements spec §8.3 direction-consistent hop gating.
+        After adding all claim nodes, wires directed edges between pairs where
+        claim_A.object matches claim_B.subject (downstream biological cascade).
+        Edge weight = min(confidence_A, confidence_B) — weakest-link per hop.
+
+        Previously add_relation() was never called, leaving the graph with zero
+        edges and making direction-consistent gating impossible.
+        """
+        from backend.core.domain.claim_graph import ClaimRelation
+
         graph = ClaimGraph(hypothesis_id=hypothesis_id)
         for claim in claims:
             graph.add_claim(claim)
+
+        # Wire direction-consistent edges: A.object → B.subject
+        # Normalise for case-insensitive substring matching to catch partial overlaps
+        # (e.g. "PDE5A" in "PDE5A (P33402)").
+        for c_a in claims:
+            obj_lower = c_a.object.strip().lower()
+            if not obj_lower:
+                continue
+            for c_b in claims:
+                if c_a.id == c_b.id:
+                    continue
+                subj_lower = c_b.subject.strip().lower()
+                # Match if one contains the other (handles abbreviated vs full names)
+                if obj_lower in subj_lower or subj_lower in obj_lower:
+                    relation = ClaimRelation(
+                        source_claim_id=c_a.id,
+                        target_claim_id=c_b.id,
+                        relation_type=c_b.predicate,
+                        weight=round(min(c_a.confidence, c_b.confidence), 4),
+                    )
+                    graph.add_relation(relation)
+
         return graph
 
     # ─────────────────────────────────────────────
@@ -831,14 +881,14 @@ class ReasoningOrchestrator:
         risk: RiskAssessment,
         contradictions: list[Contradiction],
         package: RetrievalPackage,
-        safety_profile: SafetyProfile,
+safety_profile: SafetyProfile,
         prior_ctx: "PriorKnowledgeContext",
+        scientific_context: ScientificContext,
     ) -> tuple[RecommendationStatus, list[str]]:
         """Apply deterministic recommendation rules over (SS, MS, RS).
 
         Rule Set v3.1 — Evidence-First Architecture:
         Evidence-based rules (3, 1) fire before the data-availability lock (Rule 4).
-        This prevents a missing data source from burying strong, low-risk evidence.
 
         - Rule -1 (APPROVED INDICATION): ChEMBL signals approved for this disease
             → PROMISING, bypass ClinicalTrials safety lock (Rule 4)
@@ -849,23 +899,24 @@ class ReasoningOrchestrator:
         - Rule 4 (SAFETY_LOCK): ClinicalTrials failed AND not approved → cap at UNCERTAIN
         - Rule 5 (UNCERTAIN): default
 
-        Critically: Rule -1 is triggered ONLY by the retrieved ApprovalSignal
-        from ChEMBL. No drug name checks. No hardcoded disease lists.
-        Any drug approved for any disease (as determined by live ChEMBL data)
-        will follow the approved-indication pathway.
+        Critically: Rule -1 fires ONLY when the dimensional Regulatory Status is
+        APPROVED — which is True only from the live ChEMBL ApprovalSignal
+        (max_phase_for_ind == 4 for this disease, confidence >= 0.35). No drug
+        name checks. No hardcoded disease lists. All other dimensions are purely
+        descriptive and grant no rule-bypass privilege.
         """
         reasons: list[str] = []
 
         # Build ✓/✗ evidence checklist
         checks = self._build_evidence_checks(support, mechanistic, risk, contradictions, package)
 
-        # Rule -1: Approved indication pathway (evidence-driven, not hardcoded)
-        if prior_ctx.is_approved_indication:
+        # Rule: Approved indication pathway (evidence-driven, not hardcoded)
+        if scientific_context.regulatory.status == "APPROVED":
             reasons.append(
                 f"Rule -1 (APPROVED INDICATION): ChEMBL indication data indicates this drug "
-                f"is approved (max_phase_for_ind = 4) for an indication matching '{package.disease.name}'. "
-                f"Matched ChEMBL term: '{prior_ctx.matched_indication_term}' "
-                f"(match confidence: {prior_ctx.approval_confidence:.2%}). "
+                f"is approved (max_phase_for_ind = 4) for an indication matching '{package.disease.name}' "
+                f"(regulatory confidence {scientific_context.regulatory.confidence:.0%}). "
+                f"Matched ChEMBL term: '{prior_ctx.matched_indication_term}'. "
                 "ClinicalTrials.gov safety lock (Rule 4) bypassed for approved therapies. "
                 "Standard safety vetoes (Rules 0 and 3) still apply."
             )
@@ -1003,6 +1054,7 @@ class ReasoningOrchestrator:
         recommendation: RecommendationStatus,
         reasons: list[str],
         prior_ctx: PriorKnowledgeContext,
+        scientific_context: ScientificContext,
         safety_profile: SafetyProfile,
         mechanistic_paths: list[MechanisticPath],
         conflict_report: ConflictResolutionReport,
@@ -1048,7 +1100,7 @@ class ReasoningOrchestrator:
 
         if "clinicaltrials" in package.sources_failed:
             # For approved indications, the message is different
-            if prior_ctx.is_approved_indication:
+            if scientific_context.regulatory.status == "APPROVED":
                 data_gaps.append(
                     "ClinicalTrials.gov unavailable — unable to verify current trial status. "
                     "This does NOT cap the recommendation for approved therapies "
@@ -1062,12 +1114,18 @@ class ReasoningOrchestrator:
                 )
                 confidence_penalty += 0.25
 
-        if not prior_ctx.top_entries:
+        if scientific_context.knowledge_maturity.status in ("SPECULATIVE", "ESTABLISHED") and not prior_ctx.top_entries:
             data_gaps.append(
                 "No prior knowledge entries found for this drug-disease pair. "
-                "This appears to be a novel repurposing hypothesis (−0.05 confidence penalty)."
+                "This appears to be a genuinely novel repurposing hypothesis "
+                "(−0.05 confidence penalty)."
             )
             confidence_penalty += 0.05
+        elif scientific_context.knowledge_maturity.status == "SPECULATIVE":
+            data_gaps.append(
+                "Prior-knowledge cache signal is weak for this drug-disease pair. "
+                "No established prior hypothesis."
+            )
 
         if "uniprot" in package.sources_failed:
             data_gaps.append(
@@ -1076,12 +1134,25 @@ class ReasoningOrchestrator:
             )
             confidence_penalty += 0.10
 
-        # ── Citations from evidence records (FIX Issue #12) ──────────────
+        # ── Citations from evidence records (FIX Issue #12, P4) ──────────
         citations = self._extract_citations(package.evidence_records[:15])
+
+        # ── Claim citation mapping: claim UUID → list of PMID/DOI keys ──────
+        # Resolves Claim.evidence_ids → Evidence.citation_key for traceability.
+        # No new storage needed — assembles from already-available data.
+        evidence_by_id = {str(ev.id): ev for ev in package.evidence_records}
+        claim_citations: dict[str, list[str]] = {}
+        for claim in all_claims:
+            keys = [
+                evidence_by_id[str(eid)].citation_key
+                for eid in claim.evidence_ids
+                if str(eid) in evidence_by_id
+            ]
+            claim_citations[str(claim.id)] = [k for k in keys if k]
 
         # ── Agent assessment verdicts (FIX Issue #17) ────────────────────
         agent_verdicts = self._compute_agent_verdicts(
-            support, mechanistic, risk, contradictions, safety_profile, prior_ctx
+            support, mechanistic, risk, contradictions, safety_profile, scientific_context
         )
 
         # ── Next steps (FIX Issue #15) ───────────────────────────────────
@@ -1089,7 +1160,12 @@ class ReasoningOrchestrator:
 
         # ── Summary (FIX Issue #1) — explains why scores ≠ recommendation ─
         prior_note = (
-            f" Prior knowledge: {'established repurposing precedent found' if prior_ctx.has_established_precedent else 'novel hypothesis — no prior precedent'}."
+            f" Prior knowledge: regulatory {scientific_context.regulatory.status} "
+            f"({scientific_context.regulatory.confidence:.0%}), "
+            f"repurposing {scientific_context.repurposing.status}, "
+            f"mechanistic {scientific_context.mechanistic.status}, "
+            f"clinical {scientific_context.clinical.status}, "
+            f"knowledge maturity {scientific_context.knowledge_maturity.status}."
         )
         safety_note = (
             f" Safety grade: {safety_profile.overall_safety_grade}"
@@ -1192,11 +1268,11 @@ class ReasoningOrchestrator:
                 positive_factors.append(check[2:].strip())
             elif check.startswith("✗"):
                 negative_factors.append(check[2:].strip())
-        if prior_ctx.is_approved_indication:
+        if scientific_context.regulatory.status == "APPROVED":
             positive_factors.insert(
                 0,
                 f"FDA/EMA approved indication: {prior_ctx.matched_indication_term} "
-                f"(ChEMBL, match confidence {prior_ctx.approval_confidence:.0%})",
+                f"(ChEMBL, match confidence {scientific_context.regulatory.confidence:.0%})",
             )
 
         # ── Safety Breakdown (from SafetyProfile) ────────────────────────────
@@ -1240,32 +1316,41 @@ class ReasoningOrchestrator:
             safety_breakdown=safety_brkdown,
             positive_factors=positive_factors,
             negative_factors=negative_factors,
+            scientific_context=scientific_context.to_dict(),
+            claim_citations=claim_citations,
         )
 
     def _extract_citations(self, evidence_records: list) -> list[str]:
         """Extract human-readable citations from evidence records.
 
-        FIX (Issue #12): Returns formatted citation strings with PMID/DOI,
-        year, evidence type, and ERW weight.
+        FIX (Issue #12, P4): Returns formatted citation strings with PMID/DOI,
+        evidence type, and ERW weight. Handles both 'doi:10.' prefix (OpenAlex)
+        and plain '10.' prefix, with cross-source deduplication by normalised
+        DOI so the same paper doesn't appear twice from different sources.
         """
         citations = []
+        seen_dois: set[str] = set()  # dedup: same paper from PubMed+EuropePMC+OpenAlex
         for ev in evidence_records:
             key = ev.citation_key
             ev_type = ev.evidence_type.value if hasattr(ev.evidence_type, "value") else str(ev.evidence_type)
             erw = ev.erw.value
             title_short = (ev.title[:60] + "...") if ev.title and len(ev.title) > 60 else (ev.title or "")
-            year = ""
-            if ev.provenance and hasattr(ev.provenance, "retrieved_at"):
-                year = str(ev.provenance.retrieved_at.year) if ev.provenance.retrieved_at else ""
 
             if key.startswith("PMID:") or key.isdigit():
                 pmid = key.replace("PMID:", "").strip()
                 citations.append(
                     f"PMID:{pmid} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
                 )
-            elif key.startswith("10."):
+            elif key.startswith("doi:") or key.startswith("10."):
+                # P4 Fix: OpenAlex produces 'doi:10.xxx', Semantic Scholar 'doi:10.xxx',
+                # EuropePMC also 'doi:10.xxx'. Normalise to 'DOI:10.xxx' for display
+                # and deduplicate across sources.
+                doi_clean = key.replace("doi:", "").strip()
+                if doi_clean in seen_dois:
+                    continue  # cross-source duplicate — skip
+                seen_dois.add(doi_clean)
                 citations.append(
-                    f"DOI:{key} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
+                    f"DOI:{doi_clean} [{ev_type}, ERW:{erw:.2f}] — {title_short}"
                 )
             else:
                 citations.append(
@@ -1280,7 +1365,7 @@ class ReasoningOrchestrator:
         risk: RiskAssessment,
         contradictions: list[Contradiction],
         safety_profile: SafetyProfile,
-        prior_ctx: PriorKnowledgeContext,
+        scientific_context: ScientificContext,
     ) -> dict[str, str]:
         """Compute agent-level verdicts for the report.
 
@@ -1326,15 +1411,15 @@ class ReasoningOrchestrator:
                 f"net score: {sum(c.contradiction_score for c in contradictions) / len(contradictions):.2f})"
             )
 
-        # Prior Knowledge Agent
-        if prior_ctx.has_established_precedent:
-            verdicts["Prior Knowledge Agent"] = (
-                f"ESTABLISHED PRECEDENT — evidence boost: {prior_ctx.evidence_boost:+.3f}"
-            )
-        else:
-            verdicts["Prior Knowledge Agent"] = (
-                f"NOVEL HYPOTHESIS — no prior repurposing precedent found"
-            )
+        # Prior Knowledge Agent (dimensional)
+        sc = scientific_context
+        verdicts["Prior Knowledge Agent"] = (
+            f"Regulatory: {sc.regulatory.status} ({sc.regulatory.confidence:.0%}) | "
+            f"Repurposing: {sc.repurposing.status} ({sc.repurposing.confidence:.0%}) | "
+            f"Mechanistic: {sc.mechanistic.status} ({sc.mechanistic.confidence:.0%}) | "
+            f"Clinical: {sc.clinical.status} ({sc.clinical.confidence:.0%}) | "
+            f"Knowledge: {sc.knowledge_maturity.status} ({sc.knowledge_maturity.confidence:.0%})"
+        )
 
         # Clinical Safety Agent
         verdicts["Clinical Safety Agent"] = (

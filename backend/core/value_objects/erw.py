@@ -4,7 +4,9 @@ Reference: 02_DOMAIN_MODEL.md §4.11, 03_RETRIEVAL_SPECIFICATION.md
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ERW(BaseModel):
@@ -40,6 +42,16 @@ class ERW(BaseModel):
         le=0.5,
         description="Penalty subtracted when contradicting claims exist for this evidence.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_base_weight(cls, data: Any) -> Any:
+        """Default base_weight to value if base_weight is omitted in dict instantiation."""
+        if isinstance(data, dict):
+            if "base_weight" not in data and "value" in data:
+                data = dict(data)
+                data["base_weight"] = data["value"]
+        return data
 
     @field_validator("value")
     @classmethod

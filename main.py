@@ -63,7 +63,7 @@ def main():
     logger.info(f"Processing: {args.drug} -> {args.disease} (policy: {args.policy}) [bypass_cache={args.no_cache}]")
     
     orchestrator = MasterOrchestrator(
-        llm_api_key=os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
+        llm_api_key=os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY"),
         ncbi_api_key=os.environ.get("NCBI_API_KEY"),
         disgenet_api_key=os.environ.get("DISGENET_API_KEY"),
     )
@@ -105,7 +105,7 @@ def main():
     
     # Save to file if requested
     if args.output:
-        with open(args.output, 'w') as f:
+        with open(args.output, 'w', encoding='utf-8') as f:
             f.write(result.model_dump_json(indent=2))
         print(f"\nFull report saved to: {args.output}")
     

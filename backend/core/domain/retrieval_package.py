@@ -95,7 +95,13 @@ class RetrievalPackage(BaseModel):
 
     @property
     def literature_evidence(self) -> list[Evidence]:
-        """Filter to evidence records with abstract text (for claim extraction)."""
+        """Filter to evidence records with abstract text (for claim extraction).
+
+        Includes all literature-type evidence: META_ANALYSIS, RCT, OBSERVATIONAL,
+        and LITERATURE (OpenAlex, EuropePMC, Semantic Scholar). Previously LITERATURE
+        was excluded, silently dropping all OpenAlex/EuropePMC/S2 abstracts from
+        claim extraction (Bug P3 fix).
+        """
         from backend.core.enums.evidence_type import EvidenceType
         return [
             e for e in self.evidence_records
@@ -103,5 +109,6 @@ class RetrievalPackage(BaseModel):
                 EvidenceType.META_ANALYSIS,
                 EvidenceType.RCT,
                 EvidenceType.OBSERVATIONAL,
+                EvidenceType.LITERATURE,   # OpenAlex / EuropePMC / Semantic Scholar
             ) and e.abstract
         ]

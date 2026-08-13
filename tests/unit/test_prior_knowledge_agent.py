@@ -150,3 +150,17 @@ class TestPriorKnowledgeAgent:
         ctx = agent.retrieve("sildenafil", "pah")
         # May have hints if similarity threshold met
         assert isinstance(ctx.mechanistic_hints, list)
+
+    def test_cache_only_never_grants_approval(self, agent):
+        """Cache data must NEVER promote a pair to APPROVED_INDICATION.
+
+        Regression for the stripped cache-driven-approval route. Sildenafil/PAH
+        has an established, high-similarity seed cache entry, so this guards the
+        behavior: without a live ChEMBL signal, approval is always False.
+        """
+        ctx = agent.retrieve("sildenafil", "pulmonary arterial hypertension")
+        assert ctx.is_approved_indication is False
+        assert ctx.evaluation_pathway == "NOVEL_HYPOTHESIS"
+        assert ctx.has_established_precedent is False
+        assert ctx.approval_type == "NOVEL_HYPOTHESIS"
+        assert ctx.approval_confidence == 0.0

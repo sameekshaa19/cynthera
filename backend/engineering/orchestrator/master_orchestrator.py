@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 
 from backend.core.domain.hypothesis import Hypothesis
@@ -64,6 +65,7 @@ class MasterOrchestrator:
         self,
         ncbi_api_key: str | None = None,
         disgenet_api_key: str | None = None,
+        semantic_scholar_api_key: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str = "gemini-2.0-flash",
         db_path: str = "data/cynthera.db",
@@ -75,6 +77,7 @@ class MasterOrchestrator:
         Args:
             ncbi_api_key: Optional NCBI API key for higher PubMed rate limits.
             disgenet_api_key: Optional DisGeNET API key for gene-disease associations.
+            semantic_scholar_api_key: Optional Semantic Scholar API key.
             llm_api_key: LLM API key for claim extraction.
             llm_model: LLM model name (default 'gemini-1.5-flash').
             db_path: Path to SQLite database file.
@@ -86,11 +89,13 @@ class MasterOrchestrator:
         self._retrieval = RetrievalPipeline(
             ncbi_api_key=ncbi_api_key,
             disgenet_api_key=disgenet_api_key,
+            semantic_scholar_api_key=semantic_scholar_api_key,
             db_path=db_path,
             bypass_raw_cache=not use_cache,
         )
+        resolved_llm_key = llm_api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self._reasoning = ReasoningOrchestrator(
-            llm_api_key=llm_api_key,
+            llm_api_key=resolved_llm_key,
             llm_model=llm_model,
             db_path=db_path,
         )

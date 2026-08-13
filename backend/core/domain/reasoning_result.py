@@ -151,6 +151,24 @@ class ScientificAuditReport(BaseModel):
         default_factory=list,
         description="Factors against or limiting the recommendation.",
     )
+    scientific_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Dimensional prior-knowledge context assembled by ScientificContextBuilder: "
+            "regulatory, repurposing, mechanistic, clinical, and knowledge_maturity "
+            "statuses, each with confidence and evidence provenance, plus related "
+            "prior-knowledge pairs. Descriptive only — Rule -1 uses the regulatory "
+            "dimension (== APPROVED) exclusively."
+        ),
+    )
+    claim_citations: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Maps each Claim UUID (str) to its supporting PMID/DOI citation keys. "
+            "Built at report-assembly time from Claim.evidence_ids → Evidence.citation_key. "
+            "Enables per-claim traceability in JSON exports and audit UI."
+        ),
+    )
 
 
 

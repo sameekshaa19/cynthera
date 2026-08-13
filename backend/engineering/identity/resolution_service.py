@@ -80,9 +80,31 @@ class IdentifierResolutionService:
         attempted: list[str] = []
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            # Try ChEMBL
+            # Try ChEMBL — with synonym retry on empty result (Bug P2 fix)
             chembl_id = await self._resolve_chembl(client, drug_name)
             attempted.append("chembl")
+            if not chembl_id:
+                # Retry with lowercase variant (ChEMBL text search is case-sensitive
+                # for some compound names, e.g. "Thalidomide" may need to match
+                # ChEMBL's preferred name casing)
+                lower_name = drug_name.strip().lower()
+                if lower_name != drug_name.strip():
+                    chembl_id = await self._resolve_chembl(client, lower_name)
+                    if chembl_id:
+                        logger.info(
+                            "chembl_resolved_via_lowercase_retry",
+                            extra={"original": drug_name, "tried": lower_name},
+                        )
+                # Retry with hyphens/apostrophes stripped (e.g. "5-fluorouracil" → "5 fluorouracil")
+                if not chembl_id:
+                    simplified = drug_name.replace("-", " ").replace("'", "").strip()
+                    if simplified.lower() != lower_name:
+                        chembl_id = await self._resolve_chembl(client, simplified)
+                        if chembl_id:
+                            logger.info(
+                                "chembl_resolved_via_simplified_retry",
+                                extra={"original": drug_name, "tried": simplified},
+                            )
             if chembl_id:
                 identifiers.append(CanonicalIdentifier(namespace="chembl", value=chembl_id))
 

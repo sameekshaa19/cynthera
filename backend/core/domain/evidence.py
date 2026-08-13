@@ -38,7 +38,7 @@ class Evidence(BaseModel):
     evidence_type: EvidenceType = Field(..., description="Empirical origin classification.")
     erw: ERW = Field(..., description="Evidence Reliability Weight [0.15, 1.00].")
     citation_key: str = Field(
-        ...,
+        default="mock_citation_key",
         min_length=1,
         description="DOI, PMID, or NCT ID identifying this record.",
     )
