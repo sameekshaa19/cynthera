@@ -501,21 +501,16 @@ class EvidenceGraphBuilder:
                     ))
                     genes_linked_to_disease.add(gene_id)
             else:
-                # No disease-gene score for this target's gene (data absence).
-                # Allow a conservative, explicitly-flagged direct fallback hop.
-                graph.add_edge(GraphEdge(
-                    source_id=target_id,
-                    target_id=disease_id,
-                    predicate="IMPLICATED_IN",
-                    evidence_strength=_UNVALIDATED_GENE_DEFAULT,
-                    source="unresolved (no Open Targets/DisGeNET score for this gene)",
-                    provenance=(
-                        "target retrieved from ChEMBL but no disease-gene "
-                        "association score could be resolved for its gene"
-                    ),
-                    links=[],
-                    data_quality="UNVALIDATED",
-                ))
+                # No disease-gene score for this target's gene.
+                # Do NOT create a fallback edge — missing data is not evidence.
+                # Paths can only traverse EVIDENCE_BACKED edges.
+                logger.debug(
+                    "evidence_graph_no_gene_disease_edge",
+                    extra={
+                        "gene_symbol": gene_sym_u,
+                        "reason": "no Open Targets/DisGeNET association score for this gene",
+                    },
+                )
 
             # ── Target → Pathway → Disease-associated gene(s) ────────────
             # Fix 1.1: real membership check (fail-closed, P8 preserved)
@@ -535,7 +530,21 @@ class EvidenceGraphBuilder:
                 relevance = pathway_relevance_score(
                     pw_gene_syms, disease_gene_syms, drug_target_syms
                 )
-                participation_strength = round(max(0.5, relevance), 4) if relevance > 0 else 0.5
+
+                # Fix 2: Replace the max(0.5, relevance) floor.
+                # Confirmed membership is a structural fact (baseline 0.30).
+                # Relevance to the disease adds up to 0.50 more.
+                # A pathway with 0 disease-gene overlap scores 0.30, not 0.50.
+                # Pathways with relevance == 0 AND no disease-gene overlap are
+                # skipped entirely — they cannot contribute to a valid mechanism.
+                if relevance == 0 and not (pw_gene_syms & disease_gene_syms):
+                    logger.debug(
+                        "evidence_graph_pathway_skipped_zero_relevance",
+                        extra={"pathway_id": pathway.reactome_id, "name": pathway.name},
+                    )
+                    continue
+
+                participation_strength = round(0.30 + 0.50 * relevance, 4)
 
                 pw_links: list[EvidenceLink] = []
                 u_pw = SourceURLBuilder.reactome_url(pathway.reactome_id)
@@ -550,7 +559,8 @@ class EvidenceGraphBuilder:
                     source="Reactome",
                     provenance=(
                         f"confirmed pathway participant; "
-                        f"gene-symbol relevance overlap {relevance:.2f}"
+                        f"disease-gene overlap relevance {relevance:.2f}; "
+                        f"participation strength {participation_strength:.2f}"
                     ),
                     links=pw_links,
                     data_quality="EVIDENCE_BACKED",

@@ -237,9 +237,19 @@ class PathScorer:
     def score(self, path: MechanisticPath) -> float:
         """Compute a confidence score for a path.
 
-        Formula: product of all edge evidence_strength values, with a per-hop
-        decay factor applied for each additional hop beyond the first.
+        Returns 0.0 immediately if ANY hop carries an UNVALIDATED status.
+        An UNVALIDATED hop means there was no Open Targets/DisGeNET association
+        score for the gene — missing data is not evidence and cannot support a
+        mechanistic claim.
+
+        Formula for valid paths: product of all edge evidence_strength values,
+        with a per-hop decay factor applied for each additional hop beyond the first.
         """
+        # Hard gate: reject any path with an UNVALIDATED hop
+        for h in path.hops:
+            if h.status == "UNVALIDATED":
+                return 0.0
+
         strengths = [
             h.evidence_strength
             for h in path.hops
@@ -358,7 +368,9 @@ class MultiHopReasoner:
 
             # Classify support level
             conf = path.confidence
-            if has_unverified or conf < 0.15:
+            if has_unverified:
+                level = "UNSUPPORTED"   # not speculative — actual unverified data absence
+            elif conf < 0.15:
                 level = "WEAK_SPECULATIVE"
             elif conf >= 0.60:
                 level = "STRONGLY_SUPPORTED"
@@ -393,10 +405,13 @@ class MultiHopReasoner:
         return candidates
 
     def compute_mechanistic_score(self, paths: list[MechanisticPath]) -> float:
-        """Compute a conservative Mechanistic Score from traced paths (Fix for Root Cause 7).
+        """Compute a conservative Mechanistic Score from traced paths.
 
-        Best path drives base confidence. Additional paths offer capped corroboration
-        discounted by shared intermediate nodes to prevent score saturation.
+        NOTE: When candidates are available, prefer `compute_mechanistic_score_from_candidates()`
+        which derives the score from validated candidate mechanism quality, ensuring
+        MS level is always consistent with candidate support levels.
+
+        This method is retained for backward compat and as a fallback.
         """
         if not paths:
             return 0.0
@@ -413,3 +428,67 @@ class MultiHopReasoner:
         score = round(min(1.0, best_conf + min(0.15, corroboration_bonus)), 4)
         return min(1.0, score)
 
+    def compute_mechanistic_score_from_candidates(
+        self,
+        candidates: list["CandidateMechanism"],
+    ) -> tuple[float, str]:
+        """Derive MS score AND level directly from validated CandidateMechanism quality.
+
+        This is the primary scoring method (Fix 3). Score and level come from the
+        same source, so they can NEVER be logically inconsistent.
+
+        Support level weights map the biological evidence quality to a numeric score:
+          STRONGLY_SUPPORTED  -> base confidence * 1.0
+          MODERATELY_SUPPORTED -> base confidence * 0.75
+          WEAK_SPECULATIVE    -> base confidence * 0.40
+          CONTRADICTED        -> base confidence * 0.10
+          UNSUPPORTED         -> 0.0
+
+        Corroboration from additional INDEPENDENT candidates adds up to +0.10 bonus.
+
+        Returns:
+            (score: float, level: str) — always consistent with each other.
+        """
+        _SUPPORT_WEIGHTS: dict[str, float] = {
+            "STRONGLY_SUPPORTED": 1.0,
+            "MODERATELY_SUPPORTED": 0.75,
+            "WEAK_SPECULATIVE": 0.40,
+            "CONTRADICTED": 0.10,
+            "UNSUPPORTED": 0.0,
+        }
+
+        if not candidates:
+            return 0.0, "NONE"
+
+        # Best candidate drives base score
+        best = candidates[0]
+        weight = _SUPPORT_WEIGHTS.get(best.support_level, 0.0)
+        base_score = best.confidence_score * weight
+
+        # Additional independent candidates (different primary target) add corroboration
+        best_target = best.name  # used to detect independence
+        corroboration = 0.0
+        for cand in candidates[1:4]:
+            if cand.support_level in ("UNSUPPORTED", "CONTRADICTED"):
+                continue
+            w = _SUPPORT_WEIGHTS.get(cand.support_level, 0.0)
+            # Independence: different candidate name prefix (different primary target)
+            is_independent = not cand.name.startswith(best_target[:20])
+            corroboration += cand.confidence_score * w * (1.0 if is_independent else 0.3)
+        corroboration_bonus = min(0.10, corroboration / 3.0)
+
+        score = round(min(1.0, base_score + corroboration_bonus), 4)
+
+        # Level is derived FROM the best support level — never from a separate threshold
+        if best.support_level == "STRONGLY_SUPPORTED" and score >= 0.55:
+            level = "HIGH"
+        elif best.support_level in ("STRONGLY_SUPPORTED", "MODERATELY_SUPPORTED") and score >= 0.30:
+            level = "MEDIUM"
+        elif best.support_level == "WEAK_SPECULATIVE" and score > 0.0:
+            level = "LOW"
+        elif score > 0.0:
+            level = "LOW"
+        else:
+            level = "NONE"
+
+        return score, level

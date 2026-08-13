@@ -896,6 +896,45 @@ elif page == "📋 Audit Report":
         </div>
         """, unsafe_allow_html=True)
 
+        # ── Fix 6: 4-Dimensional Evidence Synthesis Panel ─────────────────────────
+        m_narrative = getattr(audit, "mechanistic_narrative", "")
+        c_narrative = getattr(audit, "clinical_narrative", "")
+        s_narrative = getattr(audit, "safety_narrative", "")
+        f_synthesis = getattr(audit, "final_synthesis", "")
+
+        if m_narrative or c_narrative or s_narrative or f_synthesis:
+            st.markdown("### 🧩 Evidence Synthesis & Dimensional Assessment")
+            st_col1, st_col2 = st.columns(2)
+            with st_col1:
+                st.markdown(f"""
+                <div class="info-panel" style="border-left: 4px solid #8b5cf6;">
+                    <div style="font-weight: 700; color: #8b5cf6; margin-bottom: 0.5rem;">1. 🧬 Mechanistic Assessment</div>
+                    <div style="color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;">{m_narrative}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class="info-panel" style="border-left: 4px solid #10b981;">
+                    <div style="font-weight: 700; color: #10b981; margin-bottom: 0.5rem;">3. 🛡️ Safety & Risk Assessment</div>
+                    <div style="color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;">{s_narrative}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with st_col2:
+                st.markdown(f"""
+                <div class="info-panel" style="border-left: 4px solid #3b82f6;">
+                    <div style="font-weight: 700; color: #3b82f6; margin-bottom: 0.5rem;">2. 📊 Clinical Evidence Assessment</div>
+                    <div style="color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;">{c_narrative}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class="info-panel" style="border-left: 4px solid #f59e0b;">
+                    <div style="font-weight: 700; color: #f59e0b; margin-bottom: 0.5rem;">4. 🎯 Final Recommendation Synthesis</div>
+                    <div style="color: #cbd5e1; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap;">{f_synthesis}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
         # Evaluation pathway and clinical trial status
         audit_pathway = getattr(audit, "evaluation_pathway", "NOVEL_HYPOTHESIS")
         audit_ct_status = getattr(audit, "clinical_trial_status", "NOT_ATTEMPTED")

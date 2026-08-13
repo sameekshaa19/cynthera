@@ -584,26 +584,19 @@ class ReasoningOrchestrator:
         prior_ctx: PriorKnowledgeContext,
         all_claims: list[Claim] | None = None,
     ) -> MechanisticAssessment:
-        """Compute the Mechanistic Score (MS) and discover Candidate Biological Mechanisms."""
+        """Compute the Mechanistic Score (MS) and discover Candidate Biological Mechanisms.
+
+        Fix 3: MS score is derived DIRECTLY from candidate mechanism quality via
+        compute_mechanistic_score_from_candidates(). Score and level are always consistent.
+
+        Fix 4: Hop-level claim mapping populates each candidate's literature_grounding_level
+        based on whether specific hops are supported by extracted literature claims, not just
+        a global claim count.
+        """
         target_count = len(package.targets)
         pathway_count = len(package.pathways)
-        has_pathways = pathway_count > 0
 
-        # Discover Candidate Mechanisms
-        candidates = self._multi_hop_reasoner.discover_candidate_mechanisms(package, paths)
-        serialized_candidates = [c.to_dict() for c in candidates]
-
-        # Determine Literature Grounding Level
-        lit_claims_count = len(all_claims or [])
-        if not package.literature_evidence and "pubmed" in (package.sources_failed or []):
-            lit_grounding = "UNAVAILABLE"
-        elif lit_claims_count >= 3:
-            lit_grounding = "STRONG"
-        elif lit_claims_count >= 1:
-            lit_grounding = "MODERATE"
-        else:
-            lit_grounding = "NONE"
-
+        # Early exit: no targets retrieved
         if target_count == 0 and not paths:
             target_sources_failed = [
                 s for s in (package.sources_failed or [])
@@ -630,15 +623,12 @@ class ReasoningOrchestrator:
                 mechanistic_chain=[],
                 candidate_mechanisms=[],
                 evidence_status=ev_status,
-                literature_grounding_level=lit_grounding,
+                literature_grounding_level="UNAVAILABLE",
                 rationale=rationale,
             )
 
-        # -- Compute base score from multi-hop paths ---------------------
-        if paths:
-            ms_from_paths = self._multi_hop_reasoner.compute_mechanistic_score(paths)
-            ev_status = "MECHANISTICALLY_PLAUSIBLE"
-        else:
+        # No traversable paths: targets exist but no disease connection
+        if not paths:
             failed_src = ", ".join(package.sources_failed) if package.sources_failed else "none logged"
             return MechanisticAssessment(
                 score=0.0,
@@ -647,54 +637,65 @@ class ReasoningOrchestrator:
                 mechanistic_chain=[],
                 candidate_mechanisms=[],
                 evidence_status="MECHANISTICALLY_UNSUPPORTED",
-                literature_grounding_level=lit_grounding,
+                literature_grounding_level="NONE",
                 rationale=(
                     f"Mechanistic Score (MS) = 0.0 (NONE). "
                     f"{target_count} target(s) were retrieved but no biological mechanism "
-                    "could be connected to the queried disease. "
+                    "could be connected to the queried disease using retrieved database evidence. "
                     f"Pathway count: {pathway_count}. "
                     f"Failed retrieval sources: [{failed_src}]."
                 ),
             )
 
-        # -- Cap score at MEDIUM if no pathway data ----------------------
-        if not has_pathways:
-            ms_from_paths = min(ms_from_paths, 0.55)
+        # --- Fix 3: Discover candidates first, derive MS from their quality ---
+        candidates = self._multi_hop_reasoner.discover_candidate_mechanisms(package, paths)
 
-        # -- Prior knowledge mechanistic hints boost ---------------------
-        if prior_ctx.mechanistic_hints and ms_from_paths < 0.9:
-            hint_boost = min(0.10, len(prior_ctx.mechanistic_hints) * 0.03)
-            ms_from_paths = min(1.0, ms_from_paths + hint_boost)
+        # --- Fix 4: Hop-level literature claim mapping ---
+        if candidates and all_claims:
+            candidates = self._map_claims_to_candidates(candidates, all_claims)
 
-        if not has_pathways:
-            ms_from_paths = min(ms_from_paths, 0.55)
-
-        # Apply literature grounding cap if 0 literature claims exist
-        if lit_grounding == "NONE" and ms_from_paths > 0.5:
-            ms_from_paths = min(ms_from_paths, 0.50)
-
-        score = round(min(1.0, ms_from_paths), 4)
-
-        if has_pathways and lit_grounding != "NONE":
-            level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
+        # Derive MS score AND level from candidate quality (Fix 3: always consistent)
+        if candidates:
+            score, level = self._multi_hop_reasoner.compute_mechanistic_score_from_candidates(candidates)
+            ev_status = "MECHANISTICALLY_PLAUSIBLE"
         else:
-            level = "MEDIUM" if score >= 0.35 else "LOW"
+            score, level = 0.0, "NONE"
+            ev_status = "MECHANISTICALLY_UNSUPPORTED"
+
+        # Prior knowledge mechanistic hints can nudge score upward but not change level
+        if prior_ctx.mechanistic_hints and score < 0.9:
+            hint_boost = min(0.05, len(prior_ctx.mechanistic_hints) * 0.02)
+            score = round(min(1.0, score + hint_boost), 4)
+
+        # Compute global literature grounding for reporting (not for scoring)
+        lit_claims_count = len(all_claims or [])
+        if not package.literature_evidence and "pubmed" in (package.sources_failed or []):
+            lit_grounding = "UNAVAILABLE"
+        elif any(
+            getattr(c, "literature_grounding_level", "DATABASE_ONLY") in ("STRONG", "MODERATE")
+            for c in candidates
+        ):
+            lit_grounding = "MODERATE"
+        elif lit_claims_count >= 3:
+            lit_grounding = "MODERATE"
+        elif lit_claims_count >= 1:
+            lit_grounding = "DATABASE_ONLY"
+        else:
+            lit_grounding = "DATABASE_ONLY" if candidates else "NONE"
 
         # Build primary mechanistic chain
         chain = self._build_mechanistic_chain(package, paths, prior_ctx)
+        serialized_candidates = [c.to_dict() for c in candidates]
 
-        # Rationale explanation
-        pathway_note = (
-            f"No Reactome pathways retrieved — MS capped at 0.55 (MEDIUM ceiling). "
-            if not has_pathways else
-            f"{pathway_count} Reactome pathway(s) available. "
-        )
+        # Rationale
         candidates_note = f"Discovered {len(candidates)} candidate biological mechanism(s). "
-        lit_note = f"Literature grounding level: {lit_grounding} ({lit_claims_count} claim(s)). "
+        best_level = candidates[0].support_level if candidates else "NONE"
+        lit_note = f"Literature grounding: {lit_grounding} ({lit_claims_count} claim(s)). "
 
         rationale = (
-            f"Mechanistic Score (MS) from {target_count} target(s) and {pathway_count} pathway(s). "
-            f"{pathway_note}{candidates_note}{lit_note}"
+            f"Mechanistic Score (MS) derived from candidate mechanism quality. "
+            f"Best candidate support level: {best_level}. "
+            f"{candidates_note}{lit_note}"
             f"Final MS = {score:.3f} ({level})."
         )
 
@@ -819,9 +820,74 @@ class ReasoningOrchestrator:
         chain.append(package.disease.name)
         return chain
 
-    # ─────────────────────────────────────────────
-    # Step 6c: Risk Score — enhanced
-    # ─────────────────────────────────────────────
+    def _map_claims_to_candidates(
+        self,
+        candidates: list,
+        all_claims: list[Claim],
+    ) -> list:
+        """Fix 4: Map extracted literature claims to specific candidate mechanism hops.
+
+        For each CandidateMechanism, checks whether any extracted claim's subject/object
+        textually matches the hop's entity names. This turns claim coverage from a global
+        count into per-candidate, per-hop validation.
+
+        Updates each CandidateMechanism with:
+          - literature_citations: list of citation keys for claims supporting this candidate
+          - literature_grounding_level: STRONG (>=2 hops covered), MODERATE (>=1 hop),
+            DATABASE_ONLY (no claim matches this candidate's specific hops)
+        """
+        if not all_claims:
+            return candidates
+
+        updated_candidates = []
+        for candidate in candidates:
+            matched_claim_ids: list[str] = []
+            hops_with_claim_support: set[int] = set()
+
+            for hop_idx, hop in enumerate(getattr(candidate, "hops", [])):
+                from_entity = (hop.from_node or "").lower()
+                to_entity = (hop.to_node or "").lower()
+
+                for claim in all_claims:
+                    subj = (getattr(claim, "subject", "") or "").lower()
+                    obj = (getattr(claim, "object", "") or "").lower()
+                    subj_hit = (
+                        subj in from_entity or from_entity in subj
+                        or any(tok in from_entity for tok in subj.split() if len(tok) > 3)
+                    )
+                    obj_hit = (
+                        obj in to_entity or to_entity in obj
+                        or any(tok in to_entity for tok in obj.split() if len(tok) > 3)
+                    )
+                    if subj_hit and obj_hit:
+                        claim_key = getattr(claim, "id", None)
+                        if claim_key and str(claim_key) not in matched_claim_ids:
+                            matched_claim_ids.append(str(claim_key))
+                        hops_with_claim_support.add(hop_idx)
+
+            covered_hops = len(hops_with_claim_support)
+            total_hops = len(getattr(candidate, "hops", []))
+            if covered_hops >= 2 or (total_hops > 0 and covered_hops / total_hops >= 0.5):
+                grounding = "STRONG"
+            elif covered_hops >= 1:
+                grounding = "MODERATE"
+            else:
+                grounding = "DATABASE_ONLY"
+
+            # Create updated immutable copy for Pydantic / dataclass candidate
+            cites = [{"claim_id": cid} for cid in matched_claim_ids[:10]]
+            if hasattr(candidate, "model_copy"):
+                cand_copy = candidate.model_copy(update={"literature_citations": cites})
+                object.__setattr__(cand_copy, "literature_grounding_level", grounding)
+                updated_candidates.append(cand_copy)
+            else:
+                setattr(candidate, "literature_citations", cites)
+                setattr(candidate, "literature_grounding_level", grounding)
+                updated_candidates.append(candidate)
+
+        return updated_candidates
+
+
 
     async def _compute_risk_score(
         self,
@@ -831,26 +897,64 @@ class ReasoningOrchestrator:
         conflict_report: ConflictResolutionReport,
         claims: list[Claim] | None = None,
     ) -> RiskAssessment:
-        """Compute the Risk Score (RS) enhanced with safety profile data and harmful claims."""
-        failed_trials = [
-            t for t in package.clinical_trials
-            if t.status in (
+        """Compute the Risk Score (RS) with trial termination WHY-analysis.
+
+        Fix 5: Trial terminations are now categorized by reason:
+          SAFETY_TERMINATED     -> counts strongly toward risk (1.8x weight)
+          EFFICACY_TERMINATED   -> counts toward risk (1.0x weight)
+          ADMINISTRATIVE_TERMINATED -> does NOT count toward risk
+          COVID_TERMINATED      -> does NOT count toward risk
+
+        This prevents administrative/enrollment failures from being treated as
+        clinical evidence against the drug, which was the root cause of the
+        Alteplase-style NOT_RECOMMENDED false positives.
+        """
+        # Categorize trials by termination reason
+        safety_terminated: list = []
+        efficacy_terminated: list = []
+        administrative_terminated: list = []
+        covid_terminated: list = []
+        other_failed: list = []
+
+        _ADMIN_KEYWORDS = (
+            "enrollment", "enrolment", "funding", "sponsor", "administrative",
+            "business decision", "feasibility", "recruitment", "accrual",
+            "withdrawn", "logistic", "protocol deviation",
+        )
+        _COVID_KEYWORDS = ("covid", "pandemic", "sars-cov", "coronavirus")
+
+        for t in package.clinical_trials:
+            if t.status not in (
                 TrialOutcomeStatus.COMPLETED_FAILURE,
                 TrialOutcomeStatus.TERMINATED_LACK_OF_EFFICACY,
                 TrialOutcomeStatus.TERMINATED_SAFETY,
-            )
-        ]
+            ):
+                continue
+
+            why = (getattr(t, "why_stopped", "") or "").lower()
+
+            if t.status == TrialOutcomeStatus.TERMINATED_SAFETY:
+                safety_terminated.append(t)
+            elif any(k in why for k in _COVID_KEYWORDS):
+                covid_terminated.append(t)
+            elif any(k in why for k in _ADMIN_KEYWORDS):
+                administrative_terminated.append(t)
+            elif t.status == TrialOutcomeStatus.TERMINATED_LACK_OF_EFFICACY:
+                efficacy_terminated.append(t)
+            else:
+                other_failed.append(t)
+
+        # Only safety + efficacy failures count toward clinical risk
+        clinically_significant_failures = safety_terminated + efficacy_terminated + other_failed
 
         raw_risk = 0.0
-        safety_failed = [
-            t for t in failed_trials
-            if t.status == TrialOutcomeStatus.TERMINATED_SAFETY
-        ]
-        raw_risk += len(failed_trials) * 1.0
-        raw_risk += len(safety_failed) * 0.8
+        raw_risk += len(safety_terminated) * 1.8      # safety failures: highest weight
+        raw_risk += len(efficacy_terminated) * 1.0    # efficacy failures: standard weight
+        raw_risk += len(other_failed) * 0.6           # ambiguous failures: low weight
+        # Administrative/COVID terminations: do NOT add to risk
         raw_risk += conflict_report.net_conflict_score * len(contradictions) * 0.5
 
-        # Check for harmful / disease exacerbation / contraindication claims
+        # Harmful / contraindication claims
         harmful_claims = []
         for c in (claims or []):
             text = (getattr(c, "raw_text", "") or f"{c.subject} {c.predicate.value} {c.object}").lower()
@@ -880,19 +984,31 @@ class ReasoningOrchestrator:
         if score == 0.0:
             level = "NONE"
 
-        # FIX (Issue #9): Build plain-English risk breakdown
+        # Build plain-English risk breakdown with WHY categorization
         risk_factors = []
-        if len(failed_trials) > 0:
-            risk_factors.append(f"Failed/terminated trials: {len(failed_trials)}")
-        if safety_failed:
-            risk_factors.append(f"Safety-terminated trials: {len(safety_failed)}")
+        if safety_terminated:
+            risk_factors.append(f"Safety-terminated trials: {len(safety_terminated)} [HIGH RISK]")
+        if efficacy_terminated:
+            risk_factors.append(f"Efficacy-terminated trials: {len(efficacy_terminated)}")
+        if other_failed:
+            risk_factors.append(f"Other failed trials: {len(other_failed)}")
+        if administrative_terminated:
+            risk_factors.append(
+                f"Administrative/enrollment terminations: {len(administrative_terminated)} "
+                "[NOT counted in risk — not a clinical signal]"
+            )
+        if covid_terminated:
+            risk_factors.append(
+                f"COVID/pandemic terminations: {len(covid_terminated)} "
+                "[NOT counted in risk — external disruption]"
+            )
         if contradictions:
             risk_factors.append(
                 f"Contradictory evidence: {len(contradictions)} conflict(s) "
                 f"(net score: {conflict_report.net_conflict_score:.2f})"
             )
         if safety_profile.has_boxed_warning:
-            risk_factors.append("⚠ FDA Boxed Warning detected")
+            risk_factors.append("FDA Boxed Warning detected")
         if safety_profile.adverse_events:
             severe_aes = [ae for ae in safety_profile.adverse_events if ae.severity in ("SEVERE", "FATAL")]
             if severe_aes:
@@ -906,16 +1022,18 @@ class ReasoningOrchestrator:
         )
 
         rationale = (
-            f"Risk Score (RS) computed from multiple safety signals.\n"
+            f"Risk Score (RS) computed from clinically significant safety signals.\n"
+            f"Trial analysis: {len(clinically_significant_failures)} clinically significant failure(s); "
+            f"{len(administrative_terminated + covid_terminated)} administrative/external termination(s) excluded.\n"
             f"Risk factors: {'; '.join(risk_factors) if risk_factors else 'None identified'}.\n"
-            f"Formula: RS = 1 - exp(-0.30 × raw_risk_burden). "
+            f"Formula: RS = 1 - exp(-0.30 x raw_risk_burden). "
             f"Raw burden = {raw_risk:.2f}. Final RS = {score:.3f} ({level})."
         )
 
         return RiskAssessment(
             score=score,
             level=level,
-            failed_trial_count=len(failed_trials),
+            failed_trial_count=len(clinically_significant_failures),
             contradiction_count=len(contradictions),
             rationale=rationale,
         )
@@ -1009,12 +1127,12 @@ safety_profile: SafetyProfile,
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
 
-        # Rule 2: Clinical Trial Failure Veto — documented clinical trial failure(s) for lack of efficacy or safety
-        if risk.failed_trial_count >= 1 or risk.score >= 0.40:
+        # Rule 2: Clinical Trial Failure Assessment — multiple clinically significant trial failures or high risk burden
+        if risk.score >= 0.60 or (risk.failed_trial_count >= 2 and risk.score >= 0.50):
             reasons.append(
                 f"Rule 2 (CLINICAL FAILURE VETO): Risk Score = {risk.score:.3f} "
-                f"with {risk.failed_trial_count} documented clinical trial failure(s) for lack of efficacy or safety. "
-                "NOT RECOMMENDED due to failed human clinical endpoints."
+                f"with {risk.failed_trial_count} clinically significant trial failure(s). "
+                "NOT RECOMMENDED due to documented clinical endpoint failures or safety signals."
             )
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
@@ -1414,6 +1532,37 @@ safety_profile: SafetyProfile,
             "label": "Open ClinicalTrials.gov",
         })
 
+        # ── Fix 6: Separate Narrative Sections ────────────────────────────────
+        mechanistic_narrative = (
+            f"Mechanistic Assessment: {mechanistic.level} (Score = {mechanistic.score:.3f}).\n"
+            f"Literature Grounding: {mechanistic.literature_grounding_level}.\n"
+            f"Candidate Biological Mechanisms Discovered: {len(mechanistic.candidate_mechanisms)}.\n"
+            f"Primary Mechanistic Chain: {' → '.join(mechanistic.mechanistic_chain) if mechanistic.mechanistic_chain else 'None identified'}.\n"
+            f"Rationale: {mechanistic.rationale}"
+        )
+
+        clinical_narrative = (
+            f"Clinical Evidence Assessment: {support.level} Literature Support (Score = {support.score:.3f}).\n"
+            f"Clinical Trial Status: {ct_status}.\n"
+            f"Clinical Trial Findings: {len(package.clinical_trials)} trial(s) evaluated, {risk.failed_trial_count} clinically significant failure(s).\n"
+            f"Literature Support Rationale: {support.rationale}"
+        )
+
+        safety_narrative = (
+            f"Safety & Risk Assessment: Grade {safety_profile.overall_safety_grade} — {safety_desc} (Risk Score = {risk.score:.3f}, {risk.level}).\n"
+            f"Boxed Warning: {'YES' if safety_profile.has_boxed_warning else 'NO'}.\n"
+            f"Risk Factors & Signal Analysis: {risk.rationale}"
+        )
+
+        final_synthesis = (
+            f"Synthesis & Recommendation: {recommendation.value}.\n"
+            f"Regulatory Status: {scientific_context.regulatory.status} (Term: {prior_ctx.matched_indication_term or 'N/A'}).\n"
+            f"1. Mechanistic Plausibility: {mechanistic.level} ({mechanistic.score:.3f})\n"
+            f"2. Literature/Clinical Support: {support.level} ({support.score:.3f})\n"
+            f"3. Risk & Safety Profile: {risk.level} ({risk.score:.3f}, Grade {safety_profile.overall_safety_grade})\n"
+            f"Conclusion Summary: {reasons[0] if reasons else 'No recommendation reasons generated.'}"
+        )
+
         return ScientificAuditReport(
             summary=summary,
             key_supporting_claim_ids=[str(c.id) for c in supporting],
@@ -1421,6 +1570,10 @@ safety_profile: SafetyProfile,
             data_gaps=data_gaps,
             confidence_narrative=confidence_narrative,
             recommendation_rationale="\n".join(rationale_lines),
+            mechanistic_narrative=mechanistic_narrative,
+            clinical_narrative=clinical_narrative,
+            safety_narrative=safety_narrative,
+            final_synthesis=final_synthesis,
             agent_verdicts=agent_verdicts,
             evaluation_pathway=prior_ctx.evaluation_pathway,
             clinical_trial_status=ct_status,

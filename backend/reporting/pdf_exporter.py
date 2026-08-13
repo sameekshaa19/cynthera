@@ -395,6 +395,28 @@ class PDFReporter:
             for gap in result.audit_report.data_gaps:
                 story.append(Paragraph(f"• {gap}", body_style))
 
+        # ── Evidence Synthesis & Dimensional Narratives (Fix 6) ────────
+        ar = result.audit_report
+        if getattr(ar, "mechanistic_narrative", None):
+            story.append(Paragraph("Evidence Synthesis & Dimensional Assessment", section_style))
+            story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
+
+            story.append(Paragraph("<b>1. Mechanistic Assessment</b>", body_style))
+            story.append(Paragraph(ar.mechanistic_narrative.replace("\n", "<br/>"), body_style))
+            story.append(Spacer(1, 0.2 * cm))
+
+            story.append(Paragraph("<b>2. Clinical Evidence Assessment</b>", body_style))
+            story.append(Paragraph(ar.clinical_narrative.replace("\n", "<br/>"), body_style))
+            story.append(Spacer(1, 0.2 * cm))
+
+            story.append(Paragraph("<b>3. Safety & Risk Assessment</b>", body_style))
+            story.append(Paragraph(ar.safety_narrative.replace("\n", "<br/>"), body_style))
+            story.append(Spacer(1, 0.2 * cm))
+
+            story.append(Paragraph("<b>4. Final Synthesis</b>", body_style))
+            story.append(Paragraph(ar.final_synthesis.replace("\n", "<br/>"), body_style))
+            story.append(Spacer(1, 0.3 * cm))
+
         # ── Confidence Narrative ───────────────────────
         story.append(Paragraph("Confidence Narrative", section_style))
         story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))

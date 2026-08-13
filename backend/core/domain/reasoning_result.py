@@ -123,6 +123,22 @@ class ScientificAuditReport(BaseModel):
     data_gaps: list[str] = Field(default_factory=list)
     confidence_narrative: str = Field(default="")
     recommendation_rationale: str = Field(default="")
+    mechanistic_narrative: str = Field(
+        default="",
+        description="Explicit narrative of biological candidate mechanisms and graph evidence.",
+    )
+    clinical_narrative: str = Field(
+        default="",
+        description="Explicit narrative of clinical trial findings with trial termination WHY analysis.",
+    )
+    safety_narrative: str = Field(
+        default="",
+        description="Explicit narrative of safety profile, adverse events, boxed warnings, and safety grade.",
+    )
+    final_synthesis: str = Field(
+        default="",
+        description="Integrated synthesis connecting mechanistic, clinical, and safety dimensions.",
+    )
     agent_verdicts: dict[str, str] = Field(
         default_factory=dict,
         description="Per-agent assessment verdicts keyed by agent name.",
