@@ -1,6 +1,6 @@
 # Cynthera - Agentic AI for Drug Repurposing
 
-cache/
+/cache/
 logs/
 chroma_db/
 *.pyc
