@@ -323,6 +323,30 @@ class PDFReporter:
                         body_style
                     )
                     story.append(hop_p)
+                    hop_status = str(h.get("status", "CANDIDATE_STRUCTURAL")).replace("_", " ")
+                    directionality = str(h.get("directionality", "DIRECTION_UNCERTAIN")).replace("_", " ")
+                    story.append(Paragraph(
+                        f"<font color='#475569'>Status: {hop_status}; Directionality: {directionality}; Source: {h_src}</font>",
+                        body_style,
+                    ))
+                    for citation in h.get("supporting_claims", []):
+                        citation_key = citation.get("citation_key") or citation.get("source", "literature")
+                        citation_url = citation.get("url")
+                        citation_text = f"Supporting literature: {citation_key}"
+                        if citation_url:
+                            citation_text = f"Supporting literature: <a href='{citation_url}' color='#3b82f6'><u>{citation_key}</u></a>"
+                        story.append(Paragraph(citation_text, body_style))
+                    for citation in h.get("contradicting_claims", []):
+                        citation_key = citation.get("citation_key") or citation.get("source", "literature")
+                        citation_url = citation.get("url")
+                        citation_text = f"Contradicting literature: {citation_key}"
+                        if citation_url:
+                            citation_text = f"Contradicting literature: <a href='{citation_url}' color='#dc2626'><u>{citation_key}</u></a>"
+                        story.append(Paragraph(citation_text, body_style))
+                for explanation in cand.get("score_explanation", []):
+                    story.append(Paragraph(f"<font color='#475569'>{explanation}</font>", body_style))
+                for gap in cand.get("missing_critical_evidence", []):
+                    story.append(Paragraph(f"<b>Missing evidence:</b> {gap}", body_style))
                 story.append(Spacer(1, 0.2 * cm))
 
         # ── Sources Accessed ──────────────────────────────────

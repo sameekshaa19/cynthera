@@ -118,7 +118,10 @@ async def test_dapagliflozin_hf_regression(dapagliflozin_package):
 
     cand1 = candidates[0]
     assert "SLC5A2" in cand1.name or "Mechanism 1" in cand1.name
-    assert cand1.support_level in ("STRONGLY_SUPPORTED", "MODERATELY_SUPPORTED")
+    # Discovery records a structural candidate; it is not a validated causal
+    # mechanism until the literature-to-hop validation stage runs.
+    assert cand1.discovery_status == "CANDIDATE_STRUCTURAL"
+    assert cand1.support_level == "WEAK_SPECULATIVE"
 
     # Verify Hop evidence links
     has_links = any(len(h.links) > 0 for h in cand1.hops)
@@ -167,6 +170,19 @@ async def test_api_failure_evidence_status():
     assert result.mechanistic_assessment.score == 0.0
     assert result.mechanistic_assessment.evidence_status == "SOURCE_UNAVAILABLE"
     assert result.recommendation_status.value == "INSUFFICIENT_DATA"
+
+
+@pytest.mark.asyncio
+async def test_missing_disease_mechanism_source_is_not_a_biological_negative(dapagliflozin_package):
+    """A failed pathway/association source must not become "unsupported"."""
+    package = dapagliflozin_package.model_copy(update={
+        "pathways": [],
+        "validated_disease_genes": {},
+        "sources_failed": ["reactome", "opentargets"],
+    })
+    result = await ReasoningOrchestrator().reason(package)
+    assert result.mechanistic_assessment.score == 0.0
+    assert result.mechanistic_assessment.evidence_status == "SOURCE_UNAVAILABLE"
 
 
 @pytest.mark.asyncio

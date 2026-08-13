@@ -44,7 +44,7 @@ class MechanisticAssessment(BaseModel):
         pathway_count: Number of overlapping pathways traced.
         mechanistic_chain: List of nodes in the primary traced chain (Drug→Target→Pathway→Disease).
         candidate_mechanisms: Discovered CandidateMechanism domain objects with hop evidence & URLs.
-        evidence_status: 'SOURCE_UNAVAILABLE' | 'IDENTITY_RESOLUTION_FAILED' | 'INSUFFICIENT_EVIDENCE' | 'MECHANISTICALLY_UNSUPPORTED' | 'MECHANISTICALLY_PLAUSIBLE'
+        evidence_status: 'SOURCE_UNAVAILABLE' | 'IDENTITY_RESOLUTION_FAILED' | 'INSUFFICIENT_EVIDENCE' | 'MECHANISTICALLY_UNSUPPORTED' | 'CONTRADICTED' | 'MECHANISTICALLY_PLAUSIBLE'
         literature_grounding_level: 'STRONG' | 'MODERATE' | 'NONE' | 'UNAVAILABLE'
         rationale: Human-readable explanation.
     """
@@ -64,7 +64,7 @@ class MechanisticAssessment(BaseModel):
     )
     evidence_status: str = Field(
         default="MECHANISTICALLY_PLAUSIBLE",
-        description="Data state: SOURCE_UNAVAILABLE | IDENTITY_RESOLUTION_FAILED | INSUFFICIENT_EVIDENCE | MECHANISTICALLY_UNSUPPORTED | MECHANISTICALLY_PLAUSIBLE",
+        description="Data state: SOURCE_UNAVAILABLE | IDENTITY_RESOLUTION_FAILED | INSUFFICIENT_EVIDENCE | MECHANISTICALLY_UNSUPPORTED | CONTRADICTED | MECHANISTICALLY_PLAUSIBLE",
     )
     literature_grounding_level: str = Field(
         default="MODERATE",

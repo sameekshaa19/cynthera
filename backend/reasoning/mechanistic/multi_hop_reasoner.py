@@ -348,13 +348,16 @@ class MultiHopReasoner:
         for idx, path in enumerate(paths[:5], start=1):
             # Hop breakdown
             mechanism_hops: list[MechanismHop] = []
-            has_unverified = False
             for i in range(1, len(path.hops)):
                 h_prev = path.hops[i - 1]
                 h_curr = path.hops[i]
-                status = h_curr.status or "VALID"
-                if status == "UNVALIDATED":
-                    has_unverified = True
+                # A traversable graph edge is a discovery fact, not causal
+                # validation. MechanismValidator may upgrade it later.
+                status = (
+                    "DATABASE_SUPPORTED"
+                    if i == 1 and (h_curr.predicate or "").upper() not in ("", "MODULATES")
+                    else "CANDIDATE_STRUCTURAL"
+                )
                 mechanism_hops.append(MechanismHop(
                     from_node=f"{h_prev.label}: {h_prev.name}",
                     to_node=f"{h_curr.label}: {h_curr.name}",
@@ -362,12 +365,17 @@ class MultiHopReasoner:
                     status=status,
                     evidence_strength=h_curr.evidence_strength or 0.5,
                     source_database=h_curr.source or "Structured Data",
-                    provenance_note=f"{h_prev.name} {h_curr.predicate or 'interacts with'} {h_curr.name}",
+                    provenance_note=(
+                        f"Discovered graph relationship: {h_prev.name} "
+                        f"{h_curr.predicate or 'interacts with'} {h_curr.name}. "
+                        "This is not causal validation."
+                    ),
                     links=getattr(h_curr, "links", []),
                 ))
 
             # Classify support level
             conf = path.confidence
+            has_unverified = False  # retained for backwards-compatible branch below
             if has_unverified:
                 level = "UNSUPPORTED"   # not speculative — actual unverified data absence
             elif conf < 0.15:
@@ -379,6 +387,9 @@ class MultiHopReasoner:
             else:
                 level = "WEAK_SPECULATIVE"
 
+            # The numerical graph confidence ranks discovery candidates only;
+            # it must not be presented as validated mechanistic support.
+            level = "WEAK_SPECULATIVE"
             target_name = path.hops[1].name if len(path.hops) > 1 else "Unknown Target"
             pathway_name = next((h.name for h in path.hops if h.label == "Pathway"), "")
             cand_name = f"Mechanism {idx}: {target_name}"
@@ -386,9 +397,8 @@ class MultiHopReasoner:
                 cand_name += f" via {pathway_name}"
 
             rationale = (
-                f"Candidate mechanism traced with confidence {conf:.1%}. "
-                f"Includes {len(mechanism_hops)} biological relationship step(s). "
-                f"Support rating: {level}."
+                f"Structural candidate traced with graph confidence {conf:.1%}. "
+                "Independent validation of the biological bridge is required."
             )
 
             candidates.append(CandidateMechanism(
@@ -400,6 +410,7 @@ class MultiHopReasoner:
                 hops=mechanism_hops,
                 literature_citations=[],
                 rationale=rationale,
+                discovery_status="CANDIDATE_STRUCTURAL",
             ))
 
         return candidates
@@ -459,6 +470,21 @@ class MultiHopReasoner:
 
         if not candidates:
             return 0.0, "NONE"
+
+        # Candidate confidence is already the validator's transparent,
+        # evidence-dimensional score. Do not add graph-path-count or related
+        # candidate bonuses: such paths commonly share the same records and do
+        # not represent independent corroboration.
+        usable = [c for c in candidates if c.support_level not in ("UNSUPPORTED", "CONTRADICTED")]
+        if not usable:
+            return 0.0, "NONE"
+        best_validated = max(usable, key=lambda c: c.confidence_score)
+        score = round(best_validated.confidence_score, 4)
+        if best_validated.support_level == "STRONGLY_SUPPORTED":
+            return score, "HIGH"
+        if best_validated.support_level == "MODERATELY_SUPPORTED":
+            return score, "MEDIUM"
+        return score, "LOW" if score > 0.0 else "NONE"
 
         # Best candidate drives base score
         best = candidates[0]

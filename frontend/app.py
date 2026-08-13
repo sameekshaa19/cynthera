@@ -638,6 +638,7 @@ elif page == "📊 Results":
                 c_level = cand.get("support_level", "MODERATELY_SUPPORTED")
                 c_conf = cand.get("confidence_score", 0.5)
                 c_chain = cand.get("summary_chain", [])
+                c_status = cand.get("discovery_status", "CANDIDATE_STRUCTURAL")
 
                 badge_color = "#10b981" if "STRONGLY" in c_level else ("#f59e0b" if "MODERATELY" in c_level else "#ef4444")
                 badge_bg = "rgba(16,185,129,0.12)" if "STRONGLY" in c_level else ("rgba(245,158,11,0.12)" if "MODERATELY" in c_level else "rgba(239,68,68,0.12)")
@@ -650,6 +651,7 @@ elif page == "📊 Results":
                             {c_level.replace('_', ' ')} ({c_conf:.1%})
                         </div>
                     </div>
+                    <div style="color: #94a3b8; margin-top: 0.35rem; font-size: 0.82rem;">{c_status.replace('_', ' ')}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -673,6 +675,8 @@ elif page == "📊 Results":
                             h_pred = h.get("predicate", "MODULATES")
                             h_src = h.get("source_database", "")
                             h_links = h.get("links", [])
+                            h_status = h.get("status", "CANDIDATE_STRUCTURAL")
+                            h_direction = h.get("directionality", "DIRECTION_UNCERTAIN")
 
                             link_buttons = []
                             for l in h_links:
@@ -692,6 +696,19 @@ elif page == "📊 Results":
                                 <div style="display: flex; gap: 0.3rem;">{button_html}</div>
                             </div>
                             """, unsafe_allow_html=True)
+                            st.caption(f"Status: {h_status.replace('_', ' ')} | Directionality: {h_direction.replace('_', ' ')} | Source: {h_src}")
+                            for citation in h.get("supporting_claims", []):
+                                url = citation.get("url")
+                                label = citation.get("citation_key") or citation.get("source", "literature")
+                                st.markdown(f"Supporting claim ({citation.get('source', 'literature')}): [{label}]({url})" if url else f"Supporting claim: {label}")
+                            for citation in h.get("contradicting_claims", []):
+                                url = citation.get("url")
+                                label = citation.get("citation_key") or citation.get("source", "literature")
+                                st.warning(f"Contradicting claim ({citation.get('source', 'literature')}): {label}" + (f" — {url}" if url else ""))
+                        for explanation in cand.get("score_explanation", []):
+                            st.caption(explanation)
+                        for gap in cand.get("missing_critical_evidence", []):
+                            st.info(f"Missing evidence: {gap}")
         elif result.mechanistic_assessment.mechanistic_chain:
             st.markdown("### 🔗 Mechanistic Chain")
             chain = result.mechanistic_assessment.mechanistic_chain

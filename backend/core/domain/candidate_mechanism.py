@@ -13,22 +13,40 @@ from backend.core.value_objects.source_url_builder import EvidenceLink
 
 
 class MechanismHop(BaseModel):
-    """A single validated or unverified hop in a candidate mechanism chain."""
+    """One relationship in a candidate mechanism chain.
+
+    ``status`` deliberately describes the *kind* of support, not whether a
+    graph edge happened to be traversable.  In particular, Reactome
+    participation is ``STRUCTURAL_EVIDENCE`` until an independent mechanistic
+    source or a mapped literature claim supports the biological bridge.
+    """
 
     model_config = {"frozen": True}
 
     from_node: str = Field(..., description="Source node name and label (e.g., 'Drug: Dapagliflozin').")
     to_node: str = Field(..., description="Target node name and label (e.g., 'Target: SLC5A2').")
     predicate: str = Field(..., description="Biological interaction predicate (e.g., 'INHIBITOR', 'PARTICIPATES_IN').")
-    status: str = Field(default="VALID", description="'VALID' | 'UNVERIFIED' | 'REJECTED'")
+    status: str = Field(
+        default="CANDIDATE_STRUCTURAL",
+        description=(
+            "CANDIDATE_STRUCTURAL | DATABASE_SUPPORTED | LITERATURE_SUPPORTED | "
+            "DIRECTION_UNCERTAIN | INSUFFICIENT_EVIDENCE | CONTRADICTED"
+        ),
+    )
     evidence_strength: float = Field(default=0.5, ge=0.0, le=1.0)
     source_database: str = Field(..., description="Database source (e.g., 'ChEMBL', 'Reactome', 'Open Targets').")
     provenance_note: str = Field(default="", description="Detailed rationale or measurement note.")
     links: list[EvidenceLink] = Field(default_factory=list, description="Clickable URL links for this hop.")
+    canonical_from_id: str | None = Field(default=None, description="Resolved canonical identifier for from_node.")
+    canonical_to_id: str | None = Field(default=None, description="Resolved canonical identifier for to_node.")
+    directionality: str = Field(default="DIRECTION_UNCERTAIN", description="SUPPORTED | DIRECTION_UNCERTAIN | NOT_APPLICABLE")
+    evidence_type: str = Field(default="STRUCTURAL", description="DIRECT | CURATED | STRUCTURAL | LITERATURE")
+    supporting_claims: list[dict[str, Any]] = Field(default_factory=list)
+    contradicting_claims: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CandidateMechanism(BaseModel):
-    """A complete candidate biological mechanism discovered between Drug and Disease."""
+    """A discovered biological route plus its independent validation record."""
 
     model_config = {"frozen": True}
 
@@ -47,6 +65,14 @@ class CandidateMechanism(BaseModel):
         description="Citations supporting this specific candidate mechanism with links.",
     )
     rationale: str = Field(default="", description="Scientific justification explaining why this mechanism is supported/rejected.")
+    discovery_status: str = Field(
+        default="CANDIDATE_STRUCTURAL",
+        description="CANDIDATE_STRUCTURAL | VALIDATED | INSUFFICIENT_EVIDENCE | CONTRADICTED",
+    )
+    validation_dimensions: dict[str, float] = Field(default_factory=dict)
+    score_explanation: list[str] = Field(default_factory=list)
+    missing_critical_evidence: list[str] = Field(default_factory=list)
+    contradictions: list[dict[str, Any]] = Field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,9 +92,20 @@ class CandidateMechanism(BaseModel):
                     "source_database": h.source_database,
                     "provenance_note": h.provenance_note,
                     "links": [l.to_dict() for l in h.links],
+                    "canonical_from_id": h.canonical_from_id,
+                    "canonical_to_id": h.canonical_to_id,
+                    "directionality": h.directionality,
+                    "evidence_type": h.evidence_type,
+                    "supporting_claims": h.supporting_claims,
+                    "contradicting_claims": h.contradicting_claims,
                 }
                 for h in self.hops
             ],
             "literature_citations": self.literature_citations,
             "rationale": self.rationale,
+            "discovery_status": self.discovery_status,
+            "validation_dimensions": self.validation_dimensions,
+            "score_explanation": self.score_explanation,
+            "missing_critical_evidence": self.missing_critical_evidence,
+            "contradictions": self.contradictions,
         }

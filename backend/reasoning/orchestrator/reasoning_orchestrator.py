@@ -45,6 +45,7 @@ from backend.reasoning.extraction.claim_extraction_agent import ClaimExtractionA
 from backend.reasoning.agents.clinical_safety_agent import ClinicalSafetyAgent, SafetyProfile
 from backend.reasoning.agents.prior_knowledge_agent import PriorKnowledgeAgent, PriorKnowledgeContext
 from backend.reasoning.mechanistic.multi_hop_reasoner import MultiHopReasoner, MechanisticPath
+from backend.reasoning.mechanistic.mechanism_validation import MechanismValidator
 from backend.reasoning.conflict.conflict_resolver import AdvancedConflictResolver, ConflictResolutionReport
 from backend.reasoning.context.scientific_context_builder import (
     ScientificContext,
@@ -143,6 +144,7 @@ class ReasoningOrchestrator:
         )
         self._safety_agent = ClinicalSafetyAgent()
         self._multi_hop_reasoner = MultiHopReasoner()
+        self._mechanism_validator = MechanismValidator()
         self._conflict_resolver = AdvancedConflictResolver()
 
     async def reason(self, package: RetrievalPackage) -> ReasoningResult:
@@ -630,18 +632,31 @@ class ReasoningOrchestrator:
         # No traversable paths: targets exist but no disease connection
         if not paths:
             failed_src = ", ".join(package.sources_failed) if package.sources_failed else "none logged"
+            failed_normalised = {source.lower() for source in (package.sources_failed or [])}
+            missing_disease_association_source = (
+                not package.validated_disease_genes
+                and bool(failed_normalised & {"opentargets", "disgenet"})
+            )
+            missing_pathway_source = not package.pathways and "reactome" in failed_normalised
+            critical_source_failure = bool(failed_normalised & {"chembl", "uniprot"}) or missing_disease_association_source or missing_pathway_source
+            evidence_status = "SOURCE_UNAVAILABLE" if critical_source_failure else "MECHANISTICALLY_UNSUPPORTED"
+            outcome = (
+                "SOURCE UNAVAILABLE: a critical mechanism source failed, so the absence of a path is not a biological negative."
+                if critical_source_failure
+                else "No retrieved database evidence supported a biological connection to the queried disease."
+            )
             return MechanisticAssessment(
                 score=0.0,
                 level="NONE",
                 pathway_count=pathway_count,
                 mechanistic_chain=[],
                 candidate_mechanisms=[],
-                evidence_status="MECHANISTICALLY_UNSUPPORTED",
+                evidence_status=evidence_status,
                 literature_grounding_level="NONE",
                 rationale=(
                     f"Mechanistic Score (MS) = 0.0 (NONE). "
                     f"{target_count} target(s) were retrieved but no biological mechanism "
-                    "could be connected to the queried disease using retrieved database evidence. "
+                    f"{outcome} "
                     f"Pathway count: {pathway_count}. "
                     f"Failed retrieval sources: [{failed_src}]."
                 ),
@@ -650,22 +665,25 @@ class ReasoningOrchestrator:
         # --- Fix 3: Discover candidates first, derive MS from their quality ---
         candidates = self._multi_hop_reasoner.discover_candidate_mechanisms(package, paths)
 
-        # --- Fix 4: Hop-level literature claim mapping ---
-        if candidates and all_claims:
-            candidates = self._map_claims_to_candidates(candidates, all_claims)
+        # Stage B: graph paths are only structural candidates until the
+        # biological bridge is validated against canonical-entity mapped
+        # literature claims. Prior knowledge is deliberately not an input.
+        candidates = self._mechanism_validator.validate(package, candidates, all_claims or [])
+        candidates.sort(key=lambda candidate: candidate.confidence_score, reverse=True)
 
         # Derive MS score AND level from candidate quality (Fix 3: always consistent)
         if candidates:
             score, level = self._multi_hop_reasoner.compute_mechanistic_score_from_candidates(candidates)
-            ev_status = "MECHANISTICALLY_PLAUSIBLE"
+            best = candidates[0]
+            if best.support_level == "CONTRADICTED":
+                ev_status = "CONTRADICTED"
+            elif best.support_level in ("STRONGLY_SUPPORTED", "MODERATELY_SUPPORTED"):
+                ev_status = "MECHANISTICALLY_PLAUSIBLE"
+            else:
+                ev_status = "INSUFFICIENT_EVIDENCE"
         else:
             score, level = 0.0, "NONE"
             ev_status = "MECHANISTICALLY_UNSUPPORTED"
-
-        # Prior knowledge mechanistic hints can nudge score upward but not change level
-        if prior_ctx.mechanistic_hints and score < 0.9:
-            hint_boost = min(0.05, len(prior_ctx.mechanistic_hints) * 0.02)
-            score = round(min(1.0, score + hint_boost), 4)
 
         # Compute global literature grounding for reporting (not for scoring)
         lit_claims_count = len(all_claims or [])
