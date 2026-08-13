@@ -42,7 +42,10 @@ class MechanisticAssessment(BaseModel):
         score: Mechanistic Score (MS) float [0.0, 1.0].
         level: Categorical level ('HIGH', 'MEDIUM', 'LOW', 'NONE').
         pathway_count: Number of overlapping pathways traced.
-        mechanistic_chain: List of nodes in the traced chain (Drug→Target→Pathway→Disease).
+        mechanistic_chain: List of nodes in the primary traced chain (Drug→Target→Pathway→Disease).
+        candidate_mechanisms: Discovered CandidateMechanism domain objects with hop evidence & URLs.
+        evidence_status: 'SOURCE_UNAVAILABLE' | 'IDENTITY_RESOLUTION_FAILED' | 'INSUFFICIENT_EVIDENCE' | 'MECHANISTICALLY_UNSUPPORTED' | 'MECHANISTICALLY_PLAUSIBLE'
+        literature_grounding_level: 'STRONG' | 'MODERATE' | 'NONE' | 'UNAVAILABLE'
         rationale: Human-readable explanation.
     """
 
@@ -53,9 +56,22 @@ class MechanisticAssessment(BaseModel):
     pathway_count: int = Field(default=0, ge=0)
     mechanistic_chain: list[str] = Field(
         default_factory=list,
-        description="Nodes in the mechanistic chain (Drug→Target→Pathway→Disease).",
+        description="Nodes in the primary mechanistic chain.",
+    )
+    candidate_mechanisms: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Serialized list of discovered CandidateMechanism objects.",
+    )
+    evidence_status: str = Field(
+        default="MECHANISTICALLY_PLAUSIBLE",
+        description="Data state: SOURCE_UNAVAILABLE | IDENTITY_RESOLUTION_FAILED | INSUFFICIENT_EVIDENCE | MECHANISTICALLY_UNSUPPORTED | MECHANISTICALLY_PLAUSIBLE",
+    )
+    literature_grounding_level: str = Field(
+        default="MODERATE",
+        description="Literature grounding state: STRONG | MODERATE | NONE | UNAVAILABLE",
     )
     rationale: str = Field(default="", description="Human-readable explanation.")
+
 
 
 class RiskAssessment(BaseModel):
@@ -169,6 +185,15 @@ class ScientificAuditReport(BaseModel):
             "Enables per-claim traceability in JSON exports and audit UI."
         ),
     )
+    candidate_mechanisms: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Discovered candidate biological mechanisms with hop evidence and clickable links.",
+    )
+    sources_accessed: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="List of queried database sources with status and direct portal links.",
+    )
+
 
 
 

@@ -19,3 +19,7 @@ class RecommendationStatus(str, Enum):
 
     RESOLUTION_FAILED = "RESOLUTION_FAILED"
     """Target drug or disease could not be mapped to any canonical ontology ID (ChEMBL, MeSH, MONDO)."""
+
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    """Retrieval pipeline failed or key biomedical databases were unavailable during analysis."""
+

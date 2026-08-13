@@ -133,7 +133,7 @@ class ClinicalSafetyAgent:
         """Analyze a RetrievalPackage to produce a SafetyProfile.
 
         Args:
-            package: The sealed RetrievalPackage containing clinical trial data.
+            package: The sealed RetrievalPackage containing clinical trial and literature data.
 
         Returns:
             SafetyProfile with structured safety characterization.
@@ -150,32 +150,31 @@ class ClinicalSafetyAgent:
             },
         )
 
-        if not trials:
-            return SafetyProfile(
-                overall_safety_grade="C",
-                safety_narrative=(
-                    f"No clinical trial data available for {package.drug.name}. "
-                    "Safety profile could not be assessed."
-                ),
-                confidence=0.1,
-            )
-
-        # Run all analyses
-        has_boxed_warning = self._detect_boxed_warnings(trials, drug_name)
+        has_boxed_warning = self._detect_boxed_warnings(package, drug_name)
         adverse_events = self._extract_adverse_events(trials)
         drug_interactions = self._detect_drug_interactions(trials, drug_name)
         population_restrictions = self._detect_population_restrictions(trials)
         safety_terminations = self._count_safety_terminations(trials)
+
+        if not trials and not has_boxed_warning:
+            return SafetyProfile(
+                overall_safety_grade="C",
+                safety_narrative=(
+                    f"No clinical trial data available for {package.drug.name}. "
+                    "Safety profile could not be fully assessed."
+                ),
+                confidence=0.1,
+            )
 
         # Compute safety grade
         grade = self._compute_safety_grade(
             has_boxed_warning=has_boxed_warning,
             safety_termination_count=safety_terminations,
             severe_ae_count=sum(1 for ae in adverse_events if ae.severity in ("SEVERE", "FATAL")),
-            total_trials=len(trials),
+            total_trials=len(trials) if trials else 1,
         )
 
-        confidence = self._compute_confidence(trials)
+        confidence = self._compute_confidence(trials) if trials else 0.7
 
         narrative = self._build_narrative(
             drug_name=package.drug.name,
@@ -226,10 +225,11 @@ class ClinicalSafetyAgent:
         return " ".join(parts).lower()
 
     def _detect_boxed_warnings(
-        self, trials: list[ClinicalTrial], drug_name: str
+        self, package: RetrievalPackage, drug_name: str
     ) -> bool:
-        """Detect boxed/black-box warning signals in trial text."""
-        for trial in trials:
+        """Detect boxed/black-box warning signals in trial text and literature evidence."""
+        # 1. Check trials
+        for trial in package.clinical_trials:
             text = self._get_trial_text(trial)
             for keyword in _BOXED_WARNING_KEYWORDS:
                 if keyword in text:
@@ -238,6 +238,23 @@ class ClinicalSafetyAgent:
                         extra={"trial_id": trial.nct_id, "keyword": keyword},
                     )
                     return True
+
+        # 2. Check literature evidence records (titles and snippets)
+        disease_name = package.disease.name.lower()
+        for ev in package.evidence_records:
+            t = ev.title or ""
+            a = getattr(ev, "abstract", "") or ""
+            s = getattr(ev, "snippet", "") or ""
+            text = f"{t} {a} {s}".lower()
+            for keyword in _BOXED_WARNING_KEYWORDS:
+                if keyword in text:
+                    logger.info("boxed_warning_detected_in_literature", extra={"title": ev.title, "keyword": keyword})
+                    return True
+            # Also check for explicit disease contraindication or exacerbation keywords
+            if ("contraindicat" in text or "exacerbat" in text or "worsen" in text or "fluid retention" in text) and (disease_name in text or "heart failure" in text):
+                logger.info("contraindication_detected_in_literature", extra={"title": ev.title})
+                return True
+
         return False
 
     def _extract_adverse_events(

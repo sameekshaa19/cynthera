@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 
 import streamlit as st
+from backend.core.value_objects.source_url_builder import SourceURLBuilder
 
 st.set_page_config(
     page_title="CYNTHERA — Drug Repurposing AI",
@@ -627,8 +628,71 @@ elif page == "📊 Results":
             </div>
             """, unsafe_allow_html=True)
 
-        # Mechanistic chain
-        if result.mechanistic_assessment.mechanistic_chain:
+        # Candidate Biological Mechanisms Discovery Display
+        cands = getattr(result.audit_report, "candidate_mechanisms", []) or getattr(result.mechanistic_assessment, "candidate_mechanisms", []) or []
+        if cands:
+            st.markdown("### 🧬 Candidate Biological Mechanisms Discovered")
+            for cand in cands[:4]:
+                c_idx = cand.get("candidate_index", 1)
+                c_name = cand.get("name", f"Mechanism {c_idx}")
+                c_level = cand.get("support_level", "MODERATELY_SUPPORTED")
+                c_conf = cand.get("confidence_score", 0.5)
+                c_chain = cand.get("summary_chain", [])
+
+                badge_color = "#10b981" if "STRONGLY" in c_level else ("#f59e0b" if "MODERATELY" in c_level else "#ef4444")
+                badge_bg = "rgba(16,185,129,0.12)" if "STRONGLY" in c_level else ("rgba(245,158,11,0.12)" if "MODERATELY" in c_level else "rgba(239,68,68,0.12)")
+
+                st.markdown(f"""
+                <div class="info-panel" style="border-left: 4px solid {badge_color}; margin-bottom: 1rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="font-weight: 700; font-size: 1.1rem; color: #f8fafc;">{c_name}</div>
+                        <div style="background: {badge_bg}; border: 1px solid {badge_color}; color: {badge_color}; padding: 0.2rem 0.6rem; border-radius: 6px; font-weight: 700; font-size: 0.8rem;">
+                            {c_level.replace('_', ' ')} ({c_conf:.1%})
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if c_chain:
+                    chain_html = " → ".join(
+                        f'<span style="background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-family: monospace;">{node}</span>'
+                        for node in c_chain
+                    )
+                    st.markdown(
+                        f'<div style="display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin-bottom: 0.75rem; padding: 0.5rem; background: rgba(15,23,42,0.6); border-radius: 6px;">{chain_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Hop-level evidence links
+                hops = cand.get("hops", [])
+                if hops:
+                    with st.expander(f"🔬 Candidate Mechanism {c_idx} — Step-by-Step Biological Evidence & Links"):
+                        for h in hops:
+                            h_from = h.get("from_node", "")
+                            h_to = h.get("to_node", "")
+                            h_pred = h.get("predicate", "MODULATES")
+                            h_src = h.get("source_database", "")
+                            h_links = h.get("links", [])
+
+                            link_buttons = []
+                            for l in h_links:
+                                u = l.get("url")
+                                lbl = l.get("display_label", l.get("source_name", "Open"))
+                                if u:
+                                    link_buttons.append(f'<a href="{u}" target="_blank" style="background: #1e293b; border: 1px solid #3b82f6; color: #60a5fa; text-decoration: none; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600;">{lbl} ↗</a>')
+                            button_html = " ".join(link_buttons) if link_buttons else f'<span style="color: #64748b; font-size: 0.75rem;">[{h_src}]</span>'
+
+                            st.markdown(f"""
+                            <div style="background: #111827; border: 1px solid #1f2937; padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 0.4rem; display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <span style="color: #cbd5e1; font-weight: 600;">{h_from}</span> 
+                                    <span style="color: #818cf8; font-weight: 700; font-size: 0.85rem;"> —{h_pred}→ </span> 
+                                    <span style="color: #cbd5e1; font-weight: 600;">{h_to}</span>
+                                </div>
+                                <div style="display: flex; gap: 0.3rem;">{button_html}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+        elif result.mechanistic_assessment.mechanistic_chain:
             st.markdown("### 🔗 Mechanistic Chain")
             chain = result.mechanistic_assessment.mechanistic_chain
             chain_html = " → ".join(
@@ -930,13 +994,41 @@ elif page == "📋 Audit Report":
             if dis:
                 st.markdown(f"**Drug Interactions:** {', '.join(str(d) for d in dis[:3])}")
 
+        # Sources Accessed Grid
+        srcs = getattr(audit, "sources_accessed", []) or []
+        if srcs:
+            st.markdown("### 🌐 Biomedical Data Sources Accessed")
+            sc_cols = st.columns(4)
+            for i, s in enumerate(srcs):
+                with sc_cols[i % 4]:
+                    s_name = s.get("name", "")
+                    s_stat = s.get("status", "SUCCESS")
+                    s_url = s.get("url", "#")
+                    s_lbl = s.get("label", "Open Portal")
+                    badge_c = "#10b981" if s_stat == "SUCCESS" else ("#ef4444" if s_stat == "FAILED" else "#64748b")
+
+                    st.markdown(f"""
+                    <div style="background: #111827; border: 1px solid #1f2937; padding: 0.6rem 0.8rem; border-radius: 8px; margin-bottom: 0.5rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                            <span style="font-weight: 700; color: #f8fafc; font-size: 0.9rem;">{s_name}</span>
+                            <span style="color: {badge_c}; font-size: 0.7rem; font-weight: 700; background: {badge_c}1a; padding: 0.1rem 0.4rem; border-radius: 4px;">{s_stat}</span>
+                        </div>
+                        <a href="{s_url}" target="_blank" style="color: #60a5fa; text-decoration: none; font-size: 0.75rem; font-weight: 600;">{s_lbl} ↗</a>
+                    </div>
+                    """, unsafe_allow_html=True)
+
         # Citations
         top_cits = getattr(audit, "top_citations", [])
         if top_cits:
             st.markdown("### 📚 Evidence Citations")
             with st.expander(f"{len(top_cits)} Citation(s) — click to expand"):
                 for cit in top_cits:
-                    st.markdown(f"- {cit}")
+                    # Parse PMID or DOI out of citation string to make clickable
+                    links = SourceURLBuilder.build_links_for_citation_key(cit.split()[0] if cit else "")
+                    link_html = ""
+                    if links:
+                        link_html = " " + " ".join(f'<a href="{l.url}" target="_blank" style="color: #60a5fa; text-decoration: none; font-size: 0.8rem; margin-left: 0.3rem;">[{l.display_label}] ↗</a>' for l in links)
+                    st.markdown(f"- {cit}{link_html}", unsafe_allow_html=True)
 
         with st.expander("📜 Recommendation Rule Trace"):
             st.markdown(f"""

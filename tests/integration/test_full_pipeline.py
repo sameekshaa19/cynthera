@@ -107,7 +107,7 @@ def _build_sildenafil_pah_package() -> RetrievalPackage:
             hypothesis_id=hypothesis_id,
             title="RCT: Sildenafil vs Placebo in PAH",
             abstract="Sildenafil prevents pulmonary vasoconstriction in PAH patients.",
-            evidence_type=EvidenceType.CLINICAL_TRIAL,
+            evidence_type=EvidenceType.RCT,
             erw=ERW(value=0.85),
             source="pubmed",
             provenance=_make_provenance("pubmed"),
@@ -130,7 +130,8 @@ def _build_sildenafil_pah_package() -> RetrievalPackage:
             drug_name="Sildenafil",
             disease_name="Pulmonary Arterial Hypertension",
             status=TrialOutcomeStatus.COMPLETED_SUCCESS,
-            phase="PHASE_3",
+            phase="Phase III",
+            provenance=prov,
         )
     ]
 
@@ -156,12 +157,18 @@ def _build_metformin_t2d_package() -> RetrievalPackage:
     drug = Drug(name="Metformin", identifiers={"chembl_id": "CHEMBL1431"})
     disease = Disease(name="Type 2 Diabetes", identifiers={"mesh_id": "D003924"})
 
+    prov = _make_provenance("ChEMBL")
+    erw = ERW.from_base(base_weight=0.85)
+
     targets = [
         Target(
-            name="AMPK",
+            drug_chembl_id="CHEMBL1431",
             protein_uniprot="Q13131",
-            chembl_target_id="CHEMBL2580",
-            confidence_score=0.8,
+            affinity_nm=10.0,
+            affinity_type="IC50",
+            mechanism="ACTIVATOR",
+            erw=erw,
+            provenance=prov,
         )
     ]
 
@@ -201,7 +208,8 @@ def _build_metformin_t2d_package() -> RetrievalPackage:
             drug_name="Metformin",
             disease_name="Type 2 Diabetes",
             status=TrialOutcomeStatus.COMPLETED_SUCCESS,
-            phase="PHASE_4",
+            phase="Phase III",
+            provenance=prov,
         )
     ]
 
@@ -330,7 +338,12 @@ class TestFullReasoningPipeline:
                 c.subject = subject
                 c.object = obj
                 c.predicate = predicate
+                c.erw = MagicMock()
                 c.erw.value = erw_val
+                c.statement = f"{subject} {predicate} {obj}"
+                c.raw_text = ""
+                c.evidence_ids = []
+                c.provenance = None
                 return c
 
             from backend.core.enums.predicate_type import PredicateType

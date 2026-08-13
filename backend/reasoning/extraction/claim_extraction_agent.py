@@ -153,116 +153,245 @@ class ClaimExtractionAgent:
     async def _call_llm(self, text: str, drug_name: str = "drug", disease_name: str = "disease") -> list[dict[str, Any]]:
         """Call the LLM API and parse the response.
 
+        Provider cascade (in order):
+          1. Groq — primary. Tries configured model then free-tier cascade.
+          2. OpenRouter — first fallback when Groq is quota-exhausted.
+          3. EdenAI — second fallback.
+          4. Rule-based keyword matching — last resort, low-quality.
+
         Args:
             text: Abstract text to extract claims from.
             drug_name: Drug name for context-aware extraction.
             disease_name: Disease name for context-aware extraction.
 
         Returns:
-            List of raw claim dicts from LLM output.
+            List of raw claim dicts.
         """
         async with self._sem:
             groq_key = self._api_key if (self._api_key and self._api_key.startswith("gsk_")) else os.environ.get("GROQ_API_KEY")
-            gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("LLM_API_KEY")
+            openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+            edenai_key = os.environ.get("EDENAI_API_KEY", "")
 
             # Validate keys (ignore unconfigured placeholders)
-            has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your_groq"))
-            has_valid_gemini = bool(gemini_key and not gemini_key.startswith("your_"))
+            has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your"))
+            has_valid_openrouter = bool(openrouter_key and not openrouter_key.startswith("your-") and openrouter_key.startswith("sk-or-"))
+            has_valid_edenai = bool(edenai_key and not edenai_key.startswith("your-") and len(edenai_key) > 10)
 
             if has_valid_groq:
                 prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
-                # Default to llama-3.1-8b-instant for fast, low-latency, high-throughput Groq extraction
-                model_name = self._model if ("8b" in self._model or "instant" in self._model) else "llama-3.1-8b-instant"
+                # Honour the configured model; fall through free-tier Groq models on quota errors.
+                configured_model = os.environ.get("LLM_MODEL", self._model)
+                groq_model_cascade = [
+                    configured_model,
+                    "llama-3.3-70b-versatile",
+                    "llama-3.1-8b-instant",
+                    "gemma2-9b-it",
+                    "mixtral-8x7b-32768",
+                ]
+                seen_m: set[str] = set()
+                groq_models_to_try: list[str] = []
+                for m in groq_model_cascade:
+                    if m and m not in seen_m:
+                        seen_m.add(m)
+                        groq_models_to_try.append(m)
+
                 url = "https://api.groq.com/openai/v1/chat/completions"
                 headers = {
                     "Authorization": f"Bearer {groq_key}",
                     "Content-Type": "application/json",
                 }
-                body = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 1000,
-                }
+                groq_quota_exhausted = False
                 try:
                     import httpx
                     async with httpx.AsyncClient(timeout=20.0) as client:
-                        for attempt in range(4):
-                            resp = await client.post(url, headers=headers, json=body)
-                            if resp.status_code == 429:
-                                # Groq free tier rate limit — back off and retry
-                                retry_delay = float(resp.headers.get("retry-after", 1.5)) + (attempt * 0.5)
-                                logger.info(
-                                    "groq_rate_limit_backoff",
-                                    extra={"attempt": attempt + 1, "retry_delay": retry_delay},
-                                )
-                                await asyncio.sleep(retry_delay)
+                        for model_name in groq_models_to_try:
+                            body = {
+                                "model": model_name,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "temperature": 0.0,
+                                "max_tokens": 1000,
+                            }
+                            for attempt in range(3):
+                                resp = await client.post(url, headers=headers, json=body)
+                                if resp.status_code == 429:
+                                    retry_delay = float(resp.headers.get("retry-after", 2.0)) + (attempt * 1.0)
+                                    logger.info(
+                                        "groq_rate_limit_backoff",
+                                        extra={"model": model_name, "attempt": attempt + 1, "retry_delay": retry_delay},
+                                    )
+                                    await asyncio.sleep(retry_delay)
+                                    continue
+                                if resp.status_code in (401, 403):
+                                    groq_quota_exhausted = True
+                                    break
+                                resp.raise_for_status()
+                                data = resp.json()
+                                response_text = data["choices"][0]["message"]["content"]
+                                self._last_extraction_method = "llm"
+                                return self._parse_llm_response(response_text)
+                            else:
+                                logger.info("groq_model_quota_exhausted_try_next", extra={"model": model_name})
                                 continue
-                            resp.raise_for_status()
-                            data = resp.json()
-                            response_text = data["choices"][0]["message"]["content"]
-                            self._last_extraction_method = "llm"
-                            return self._parse_llm_response(response_text)
+                            break
+                        else:
+                            groq_quota_exhausted = True
                 except Exception as exc:
-                    logger.error(
-                        f"llm_call_failed: provider=groq model={model_name} [{type(exc).__name__}] {exc}",
-                        extra={
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "model": model_name,
-                            "fallback": "rule_based_fallback",
-                        },
-                    )
-                    self._last_extraction_method = "rule_based_fallback"
-                    return self._rule_based_fallback(text, drug_name, disease_name)
-
-            elif has_valid_gemini:
-                prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
-                try:
-                    from google import genai as google_genai
-                    from google.genai import types as genai_types
-
-                    client = google_genai.Client(api_key=gemini_key)
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=self._model if self._model.startswith("gemini") else "gemini-2.0-flash",
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            temperature=0.0,
-                            max_output_tokens=1000,
-                        ),
-                    )
-                    self._last_extraction_method = "llm"
-                    return self._parse_llm_response(response.text)
-                except ImportError:
                     logger.warning(
-                        "google_genai_not_installed",
-                        extra={"fallback": "rule_based_fallback", "hint": "pip install google-genai"},
+                        "groq_call_failed",
+                        extra={"error": str(exc), "fallback": "openrouter_or_edenai"},
                     )
+                    groq_quota_exhausted = True
+
+                if groq_quota_exhausted:
+                    if has_valid_openrouter:
+                        logger.info("groq_exhausted_falling_back_to_openrouter")
+                        result = await self._call_openrouter(openrouter_key, text, drug_name, disease_name)
+                        if result is not None:
+                            return result
+                    if has_valid_edenai:
+                        logger.info("groq_exhausted_falling_back_to_edenai")
+                        result = await self._call_edenai(edenai_key, text, drug_name, disease_name)
+                        if result is not None:
+                            return result
+                    logger.warning("all_llm_providers_exhausted_falling_back_to_rule_based")
                     self._last_extraction_method = "rule_based_fallback"
                     return self._rule_based_fallback(text, drug_name, disease_name)
-                except Exception as exc:
-                    logger.error(
-                        f"llm_call_failed: provider=google model={self._model} [{type(exc).__name__}] {exc}",
-                        extra={
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "model": self._model,
-                            "fallback": "rule_based_fallback",
-                        },
-                    )
-                    self._last_extraction_method = "rule_based_fallback"
-                    return self._rule_based_fallback(text, drug_name, disease_name)
+
+            elif has_valid_openrouter:
+                logger.info("groq_key_absent_using_openrouter")
+                result = await self._call_openrouter(openrouter_key, text, drug_name, disease_name)
+                if result is not None:
+                    return result
+                if has_valid_edenai:
+                    result = await self._call_edenai(edenai_key, text, drug_name, disease_name)
+                    if result is not None:
+                        return result
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
+
+            elif has_valid_edenai:
+                logger.info("groq_openrouter_absent_using_edenai")
+                result = await self._call_edenai(edenai_key, text, drug_name, disease_name)
+                if result is not None:
+                    return result
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
 
             else:
                 if not self._has_logged_unconfigured_warning:
                     logger.info(
                         "llm_key_unconfigured_fallback_to_rule_based",
-                        extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY or GEMINI_API_KEY in .env"},
+                        extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY, OPENROUTER_API_KEY, or EDENAI_API_KEY in .env"},
                     )
                     self._has_logged_unconfigured_warning = True
                 self._last_extraction_method = "rule_based_fallback"
                 return self._rule_based_fallback(text, drug_name, disease_name)
+
+    async def _call_openrouter(
+        self,
+        api_key: str,
+        text: str,
+        drug_name: str,
+        disease_name: str,
+    ) -> list[dict[str, Any]] | None:
+        """Call OpenRouter for claim extraction (OpenAI-compatible endpoint).
+
+        Uses free or low-cost models available on OpenRouter.
+        Returns None on failure so caller can try next provider.
+        """
+        prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+        # Free/cheap models on OpenRouter that support instruction-following well
+        models_to_try = [
+            os.environ.get("OPENROUTER_MODEL", ""),
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "google/gemma-3-12b-it:free",
+            "mistralai/mistral-7b-instruct:free",
+        ]
+        models_to_try = [m for m in models_to_try if m]  # remove empty
+
+        try:
+            import httpx
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://cynthera.ai",
+                "X-Title": "Cynthera Drug Repurposing",
+            }
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                for model_name in models_to_try:
+                    body = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                        "max_tokens": 1000,
+                    }
+                    try:
+                        resp = await client.post(url, headers=headers, json=body)
+                        if resp.status_code == 429:
+                            await asyncio.sleep(2.0)
+                            continue
+                        resp.raise_for_status()
+                        data = resp.json()
+                        response_text = data["choices"][0]["message"]["content"]
+                        self._last_extraction_method = "llm"
+                        return self._parse_llm_response(response_text)
+                    except Exception as model_exc:
+                        logger.debug(
+                            "openrouter_model_failed",
+                            extra={"model": model_name, "error": str(model_exc)},
+                        )
+                        continue
+        except Exception as exc:
+            logger.warning("openrouter_call_failed", extra={"error": str(exc)})
+        return None
+
+    async def _call_edenai(
+        self,
+        api_key: str,
+        text: str,
+        drug_name: str,
+        disease_name: str,
+    ) -> list[dict[str, Any]] | None:
+        """Call EdenAI for claim extraction.
+
+        EdenAI aggregates multiple LLM providers under a single API.
+        Returns None on failure so caller can try next provider.
+        """
+        prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+        provider = os.environ.get("EDENAI_PROVIDER", "openai")
+        model = os.environ.get("EDENAI_MODEL", "gpt-4o-mini")
+
+        try:
+            import httpx
+            url = "https://api.edenai.run/v2/text/chat"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "providers": provider,
+                "text": prompt,
+                "chatbot_global_action": "You are a biomedical claim extraction system. Output only valid JSON.",
+                "previous_history": [],
+                "temperature": 0.0,
+                "max_tokens": 1000,
+                "model": model,
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                # EdenAI response: {provider: {generated_text: "..."}}
+                provider_result = data.get(provider, {})
+                response_text = provider_result.get("generated_text", "")
+                if response_text:
+                    self._last_extraction_method = "llm"
+                    return self._parse_llm_response(response_text)
+        except Exception as exc:
+            logger.warning("edenai_call_failed", extra={"error": str(exc)})
+        return None
 
     def _parse_llm_response(self, response_text: str) -> list[dict[str, Any]]:
         """Parse and validate LLM JSON response.

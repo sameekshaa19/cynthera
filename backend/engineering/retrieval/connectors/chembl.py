@@ -195,6 +195,23 @@ class ChEMBLConnector(BaseConnector):
         Returns:
             Raw JSON search results from ChEMBL.
         """
+        clean_name = drug_name.strip()
+        url_mol = f"{self.base_url}/molecule.json"
+        
+        try:
+            res = await self._get(url_mol, params={"pref_name__iexact": clean_name, "format": "json"})
+            if res.get("molecules"):
+                return res
+        except Exception:
+            pass
+
+        try:
+            res = await self._get(url_mol, params={"molecule_synonyms__molecule_synonym__iexact": clean_name, "format": "json"})
+            if res.get("molecules"):
+                return res
+        except Exception:
+            pass
+
         url = f"{self.base_url}/molecule/search.json"
         params = {"q": drug_name, "format": "json"}
         return await self._get(url, params=params)

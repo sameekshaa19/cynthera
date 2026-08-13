@@ -51,6 +51,7 @@ from backend.reasoning.context.scientific_context_builder import (
     ScientificContextBuilder,
 )
 from backend.infrastructure.knowledge.knowledge_store import KnowledgeStore
+from backend.core.value_objects.source_url_builder import SourceURLBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -267,10 +268,10 @@ class ReasoningOrchestrator:
             self._compute_support_score(all_claims, package, prior_ctx)
         )
         mechanistic_task = asyncio.create_task(
-            self._compute_mechanistic_score(package, mechanistic_paths, prior_ctx)
+            self._compute_mechanistic_score(package, mechanistic_paths, prior_ctx, all_claims)
         )
         risk_task = asyncio.create_task(
-            self._compute_risk_score(contradictions, package, safety_profile, conflict_report)
+            self._compute_risk_score(contradictions, package, safety_profile, conflict_report, all_claims)
         )
 
         support_assessment, mechanistic_assessment, risk_assessment = await asyncio.gather(
@@ -581,54 +582,78 @@ class ReasoningOrchestrator:
         package: RetrievalPackage,
         paths: list[MechanisticPath],
         prior_ctx: PriorKnowledgeContext,
+        all_claims: list[Claim] | None = None,
     ) -> MechanisticAssessment:
-        """Compute the Mechanistic Score (MS) from multi-hop paths.
-
-        FIX (Issue #2): Score is now penalized when pathway_count == 0.
-        Without biological pathway evidence, the maximum MS is capped at 0.55
-        (MEDIUM), regardless of target count. A 'HIGH' mechanistic score
-        requires at least one confirmed Reactome or WikiPathways pathway.
-
-        Score components:
-        - Target confidence contribution (max 0.55 without pathways, 0.90 with)
-        - Pathway contribution (0.0 if no pathways)
-        - Prior knowledge mechanistic hints (max +0.10 boost)
-        """
+        """Compute the Mechanistic Score (MS) and discover Candidate Biological Mechanisms."""
         target_count = len(package.targets)
         pathway_count = len(package.pathways)
         has_pathways = pathway_count > 0
 
+        # Discover Candidate Mechanisms
+        candidates = self._multi_hop_reasoner.discover_candidate_mechanisms(package, paths)
+        serialized_candidates = [c.to_dict() for c in candidates]
+
+        # Determine Literature Grounding Level
+        lit_claims_count = len(all_claims or [])
+        if not package.literature_evidence and "pubmed" in (package.sources_failed or []):
+            lit_grounding = "UNAVAILABLE"
+        elif lit_claims_count >= 3:
+            lit_grounding = "STRONG"
+        elif lit_claims_count >= 1:
+            lit_grounding = "MODERATE"
+        else:
+            lit_grounding = "NONE"
+
         if target_count == 0 and not paths:
+            target_sources_failed = [
+                s for s in (package.sources_failed or [])
+                if s.lower() in ("chembl", "uniprot")
+            ]
+            if target_sources_failed:
+                ev_status = "SOURCE_UNAVAILABLE"
+                rationale = (
+                    f"MS = 0.0 (NONE) — SOURCE UNAVAILABLE: "
+                    f"Target-retrieval sources failed: [{', '.join(target_sources_failed)}]. "
+                    "Drug targets could not be retrieved. This is a retrieval failure, NOT a biological negative."
+                )
+            else:
+                ev_status = "INSUFFICIENT_EVIDENCE"
+                rationale = (
+                    "MS = 0.0 (NONE) — INSUFFICIENT EVIDENCE: "
+                    "No drug targets were returned by ChEMBL/UniProt for this compound. "
+                    "It is NOT a scientific statement that the drug has no targets."
+                )
             return MechanisticAssessment(
                 score=0.0,
                 level="NONE",
                 pathway_count=0,
                 mechanistic_chain=[],
-                rationale="No drug targets found — mechanistic chain cannot be traced.",
+                candidate_mechanisms=[],
+                evidence_status=ev_status,
+                literature_grounding_level=lit_grounding,
+                rationale=rationale,
             )
 
         # -- Compute base score from multi-hop paths ---------------------
         if paths:
             ms_from_paths = self._multi_hop_reasoner.compute_mechanistic_score(paths)
+            ev_status = "MECHANISTICALLY_PLAUSIBLE"
         else:
-            # Targets exist but no multi-hop paths were traced.
-            # Per constitution §Placeholder-Logic: temporary heuristics are forbidden.
-            # Do NOT fabricate a score from target_count.
-            # Return MS=0.0 NONE with explicit rationale naming what is missing.
             failed_src = ", ".join(package.sources_failed) if package.sources_failed else "none logged"
             return MechanisticAssessment(
                 score=0.0,
                 level="NONE",
                 pathway_count=pathway_count,
                 mechanistic_chain=[],
+                candidate_mechanisms=[],
+                evidence_status="MECHANISTICALLY_UNSUPPORTED",
+                literature_grounding_level=lit_grounding,
                 rationale=(
                     f"Mechanistic Score (MS) = 0.0 (NONE). "
-                    f"{target_count} target(s) were retrieved but no multi-hop mechanistic "
-                    "path could be traced to the queried disease. "
+                    f"{target_count} target(s) were retrieved but no biological mechanism "
+                    "could be connected to the queried disease. "
                     f"Pathway count: {pathway_count}. "
-                    f"Failed retrieval sources: [{failed_src}]. "
-                    "A non-zero MS requires at least one traceable Drug->Target->Disease path. "
-                    "This is NOT a scientific negative -- it is a data absence."
+                    f"Failed retrieval sources: [{failed_src}]."
                 ),
             )
 
@@ -641,22 +666,21 @@ class ReasoningOrchestrator:
             hint_boost = min(0.10, len(prior_ctx.mechanistic_hints) * 0.03)
             ms_from_paths = min(1.0, ms_from_paths + hint_boost)
 
-        # Re-apply pathway cap as final clamp -- hint boost must not bypass it
         if not has_pathways:
             ms_from_paths = min(ms_from_paths, 0.55)
 
+        # Apply literature grounding cap if 0 literature claims exist
+        if lit_grounding == "NONE" and ms_from_paths > 0.5:
+            ms_from_paths = min(ms_from_paths, 0.50)
+
         score = round(min(1.0, ms_from_paths), 4)
 
-
-        # Level assignment — cannot be HIGH without pathway evidence
-        if has_pathways:
+        if has_pathways and lit_grounding != "NONE":
             level = "HIGH" if score >= 0.7 else ("MEDIUM" if score >= 0.4 else "LOW")
         else:
             level = "MEDIUM" if score >= 0.35 else "LOW"
 
-        # ── Build human-readable mechanistic chain ──────────────────────
-        # FIX (Issue #3, #4): Use gene symbol + protein name, not UniProt ID.
-        # Build deeper chain showing biological mechanism.
+        # Build primary mechanistic chain
         chain = self._build_mechanistic_chain(package, paths, prior_ctx)
 
         # Rationale explanation
@@ -665,20 +689,12 @@ class ReasoningOrchestrator:
             if not has_pathways else
             f"{pathway_count} Reactome pathway(s) available. "
         )
-        paths_note = (
-            f"{len(paths)} mechanistic path(s) traced "
-            f"({paths[0].path_type} to {paths[-1].path_type if len(paths) > 1 else paths[0].path_type}). "
-            if paths else "No multi-hop paths traced. "
-        )
-        prior_hint_note = (
-            f"Prior knowledge hints: {', '.join(prior_ctx.mechanistic_hints[:3])}. "
-            if prior_ctx.mechanistic_hints else ""
-        )
+        candidates_note = f"Discovered {len(candidates)} candidate biological mechanism(s). "
+        lit_note = f"Literature grounding level: {lit_grounding} ({lit_claims_count} claim(s)). "
 
         rationale = (
             f"Mechanistic Score (MS) from {target_count} target(s) and {pathway_count} pathway(s). "
-            f"{pathway_note}{paths_note}{prior_hint_note}"
-            f"Formula: target_conf × path_confidence × pathway_multiplier. "
+            f"{pathway_note}{candidates_note}{lit_note}"
             f"Final MS = {score:.3f} ({level})."
         )
 
@@ -687,6 +703,9 @@ class ReasoningOrchestrator:
             level=level,
             pathway_count=pathway_count,
             mechanistic_chain=chain,
+            candidate_mechanisms=serialized_candidates,
+            evidence_status=ev_status,
+            literature_grounding_level=lit_grounding,
             rationale=rationale,
         )
 
@@ -724,14 +743,28 @@ class ReasoningOrchestrator:
             protein_lookup[p.uniprot_accession] = (p.gene_symbol, p.name)
 
         if paths:
-            # Use the best multi-hop path, replacing UniProt IDs with readable names
-            raw_chain = paths[0].to_chain()
-            readable_chain = []
-            for node in raw_chain:
+            # Use the best multi-hop path (highest confidence first).
+            # New: use per-hop predicate + source from graph-based MechanisticHop.
+            best_path = paths[0]
+            readable_chain: list[str] = []
+            for i, h in enumerate(best_path.hops):
+                # Replace any raw UniProt accessions still in names with readable form
+                node_name = h.name
                 for uniprot, (gene_sym, prot_name) in protein_lookup.items():
-                    if uniprot in node:
-                        node = node.replace(uniprot, f"{gene_sym} ({prot_name}) [UniProt: {uniprot}]")
-                readable_chain.append(node)
+                    if uniprot and uniprot in node_name:
+                        node_name = node_name.replace(
+                            uniprot, f"{gene_sym} ({prot_name}) [UniProt: {uniprot}]"
+                        )
+                if i == 0:
+                    readable_chain.append(f"{h.label}: {node_name}")
+                else:
+                    pred_str = ""
+                    if h.predicate:
+                        pred_str = f" [{h.predicate}"
+                        if h.source:
+                            pred_str += f" via {h.source}"
+                        pred_str += "]"
+                    readable_chain.append(f"{h.label}: {node_name}{pred_str}")
             return readable_chain
 
         # Build chain from retrieved package entities
@@ -796,8 +829,9 @@ class ReasoningOrchestrator:
         package: RetrievalPackage,
         safety_profile: SafetyProfile,
         conflict_report: ConflictResolutionReport,
+        claims: list[Claim] | None = None,
     ) -> RiskAssessment:
-        """Compute the Risk Score (RS) enhanced with safety profile data."""
+        """Compute the Risk Score (RS) enhanced with safety profile data and harmful claims."""
         failed_trials = [
             t for t in package.clinical_trials
             if t.status in (
@@ -816,13 +850,29 @@ class ReasoningOrchestrator:
         raw_risk += len(safety_failed) * 0.8
         raw_risk += conflict_report.net_conflict_score * len(contradictions) * 0.5
 
-        grade_penalty = {"D": 2.0, "C": 0.8, "B": 0.2, "A": 0.0}.get(
+        # Check for harmful / disease exacerbation / contraindication claims
+        harmful_claims = []
+        for c in (claims or []):
+            text = (getattr(c, "raw_text", "") or f"{c.subject} {c.predicate.value} {c.object}").lower()
+            if (
+                c.predicate == PredicateType.CAUSES
+                or "contraindicat" in text
+                or "exacerbat" in text
+                or "worsen" in text
+                or "causes heart failure" in text
+                or "fluid retention" in text
+            ):
+                harmful_claims.append(c)
+        if harmful_claims:
+            raw_risk += len(harmful_claims) * 2.5
+
+        grade_penalty = {"D": 3.0, "C": 0.8, "B": 0.2, "A": 0.0}.get(
             safety_profile.overall_safety_grade, 0.5
         )
         raw_risk += grade_penalty
 
         if safety_profile.has_boxed_warning:
-            raw_risk += 1.5
+            raw_risk += 3.5
 
         k = 0.3
         score = round(1.0 - math.exp(-k * raw_risk), 4) if raw_risk > 0 else 0.0
@@ -907,8 +957,18 @@ safety_profile: SafetyProfile,
         """
         reasons: list[str] = []
 
-        # Build ✓/✗ evidence checklist
+        # Build evidence checklist
         checks = self._build_evidence_checks(support, mechanistic, risk, contradictions, package)
+
+        # Check Source Availability / Pipeline Failure Gate
+        if mechanistic.evidence_status == "SOURCE_UNAVAILABLE" or ("chembl" in package.sources_failed and "uniprot" in package.sources_failed):
+            reasons.append(
+                f"Rule -2 (DATA AVAILABILITY FAILURE): Critical target/mechanism databases "
+                f"failed during retrieval: [{', '.join(package.sources_failed)}]. "
+                "Unable to evaluate hypothesis due to source unavailability."
+            )
+            reasons.extend(checks)
+            return RecommendationStatus.INSUFFICIENT_DATA, reasons
 
         # Rule: Approved indication pathway (evidence-driven, not hardcoded)
         if scientific_context.regulatory.status == "APPROVED":
@@ -939,12 +999,12 @@ safety_profile: SafetyProfile,
             reasons.extend(checks)
             return RecommendationStatus.PROMISING, reasons
 
-        # Rule 0: Safety veto — boxed warning with high risk
-        if safety_profile.has_boxed_warning and risk.score >= 0.6:
+        # Rule 0: Safety & Contraindication Veto — boxed warning or high-concern safety profile
+        if safety_profile.has_boxed_warning or safety_profile.overall_safety_grade == "D" or risk.score >= 0.6:
             reasons.append(
-                f"Rule 0 (SAFETY VETO): ⚠ Boxed warning detected AND Risk Score = "
-                f"{risk.score:.3f} (HIGH). Safety grade: {safety_profile.overall_safety_grade}. "
-                "NOT RECOMMENDED due to unacceptable safety profile."
+                f"Rule 0 (SAFETY VETO): ⚠ Boxed warning / contraindication detected. Risk Score = "
+                f"{risk.score:.3f}. Safety grade: {safety_profile.overall_safety_grade}. "
+                "NOT RECOMMENDED due to unacceptable safety profile / disease contraindication."
             )
             reasons.extend(checks)
             return RecommendationStatus.NOT_RECOMMENDED, reasons
@@ -1009,7 +1069,7 @@ safety_profile: SafetyProfile,
         contradictions: list[Contradiction],
         package: RetrievalPackage,
     ) -> list[str]:
-        """Build ✓/✗ evidence checklist for transparent recommendation display.
+        """Build evidence checklist for transparent recommendation display.
 
         FIX (Issue #6, #1): Shows clear signal/gap breakdown instead of
         just a single recommendation label.
@@ -1017,24 +1077,24 @@ safety_profile: SafetyProfile,
         checks = []
         checks.append("Evidence signals:")
         checks.append(
-            f"  {'✓' if support.score >= 0.5 else '✗'} Literature support: "
+            f"  {'[PASS]' if support.score >= 0.5 else '[FAIL]'} Literature support: "
             f"SS = {support.score:.3f} ({support.level}) from {support.evidence_count} records"
         )
         checks.append(
-            f"  {'✓' if mechanistic.score >= 0.4 else '✗'} Mechanistic plausibility: "
+            f"  {'[PASS]' if mechanistic.score >= 0.4 else '[FAIL]'} Mechanistic plausibility: "
             f"MS = {mechanistic.score:.3f} ({mechanistic.level}), "
             f"{mechanistic.pathway_count} pathway(s)"
         )
         checks.append(
-            f"  {'✗' if risk.score >= 0.4 else '✓'} Safety/Risk acceptable: "
+            f"  {'[FAIL]' if risk.score >= 0.4 else '[PASS]'} Safety/Risk acceptable: "
             f"RS = {risk.score:.3f} ({risk.level})"
         )
         checks.append(
-            f"  {'✗' if contradictions else '✓'} Evidence consistency: "
+            f"  {'[FAIL]' if contradictions else '[PASS]'} Evidence consistency: "
             f"{'No contradictions' if not contradictions else f'{len(contradictions)} contradiction(s) detected'}"
         )
         checks.append(
-            f"  {'✓' if 'clinicaltrials' not in package.sources_failed else '✗'} "
+            f"  {'[PASS]' if 'clinicaltrials' not in package.sources_failed else '[FAIL]'} "
             f"Human clinical data: "
             f"{'Available' if 'clinicaltrials' not in package.sources_failed else 'Unavailable (ClinicalTrials.gov)'}"
         )
@@ -1264,10 +1324,11 @@ safety_profile: SafetyProfile,
         positive_factors: list[str] = []
         negative_factors: list[str] = []
         for check in checks:
-            if check.startswith("✓"):
-                positive_factors.append(check[2:].strip())
-            elif check.startswith("✗"):
-                negative_factors.append(check[2:].strip())
+            clean_chk = check.strip()
+            if clean_chk.startswith("[PASS]"):
+                positive_factors.append(clean_chk[6:].strip())
+            elif clean_chk.startswith("[FAIL]"):
+                negative_factors.append(clean_chk[6:].strip())
         if scientific_context.regulatory.status == "APPROVED":
             positive_factors.insert(
                 0,
@@ -1298,8 +1359,60 @@ safety_profile: SafetyProfile,
             "nephrotoxicity_signal": getattr(safety_profile, "nephrotoxicity_signal", False),
         }
 
-        # ── Clinical trial status (from package) ────────────────────────────
         ct_status = getattr(package, "clinical_trial_retrieval_status", "NOT_ATTEMPTED")
+
+        # ── Sources accessed list ──────────────────────────────────────────
+        sources_accessed: list[dict[str, str]] = []
+        u_chembl = SourceURLBuilder.chembl_compound_url(package.drug.chembl_id) if package.drug.chembl_id else None
+        sources_accessed.append({
+            "name": "ChEMBL",
+            "status": "FAILED" if "chembl" in package.sources_failed else "SUCCESS",
+            "url": u_chembl or "https://www.ebi.ac.uk/chembl/",
+            "label": "Open ChEMBL",
+        })
+        sources_accessed.append({
+            "name": "UniProt",
+            "status": "FAILED" if "uniprot" in package.sources_failed else "SUCCESS",
+            "url": "https://www.uniprot.org/",
+            "label": "Open UniProt",
+        })
+        sources_accessed.append({
+            "name": "Reactome",
+            "status": "FAILED" if "reactome" in package.sources_failed else "SUCCESS",
+            "url": "https://reactome.org/",
+            "label": "Open Reactome",
+        })
+        u_ot = SourceURLBuilder.opentargets_disease_url(package.disease.mesh_id or package.disease.name)
+        sources_accessed.append({
+            "name": "Open Targets",
+            "status": "SUCCESS" if package.validated_disease_genes else "NONE",
+            "url": u_ot or "https://platform.opentargets.org/",
+            "label": "Open Open Targets",
+        })
+        sources_accessed.append({
+            "name": "DisGeNET",
+            "status": "FAILED" if "disgenet" in package.sources_failed else "SUCCESS",
+            "url": "https://www.disgenet.org/",
+            "label": "Open DisGeNET",
+        })
+        sources_accessed.append({
+            "name": "PubMed",
+            "status": "FAILED" if "pubmed" in package.sources_failed else "SUCCESS",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/",
+            "label": "Open PubMed",
+        })
+        sources_accessed.append({
+            "name": "Europe PMC",
+            "status": "SUCCESS",
+            "url": "https://europepmc.org/",
+            "label": "Open Europe PMC",
+        })
+        sources_accessed.append({
+            "name": "ClinicalTrials.gov",
+            "status": "FAILED" if "clinicaltrials" in package.sources_failed else "SUCCESS",
+            "url": "https://clinicaltrials.gov/",
+            "label": "Open ClinicalTrials.gov",
+        })
 
         return ScientificAuditReport(
             summary=summary,
@@ -1318,6 +1431,8 @@ safety_profile: SafetyProfile,
             negative_factors=negative_factors,
             scientific_context=scientific_context.to_dict(),
             claim_citations=claim_citations,
+            candidate_mechanisms=mechanistic.candidate_mechanisms,
+            sources_accessed=sources_accessed,
         )
 
     def _extract_citations(self, evidence_records: list) -> list[str]:
@@ -1326,7 +1441,7 @@ safety_profile: SafetyProfile,
         FIX (Issue #12, P4): Returns formatted citation strings with PMID/DOI,
         evidence type, and ERW weight. Handles both 'doi:10.' prefix (OpenAlex)
         and plain '10.' prefix, with cross-source deduplication by normalised
-        DOI so the same paper doesn't appear twice from different sources.
+        DOI so the same paper does not appear twice from different sources.
         """
         citations = []
         seen_dois: set[str] = set()  # dedup: same paper from PubMed+EuropePMC+OpenAlex

@@ -281,13 +281,79 @@ class PDFReporter:
                     story.append(Paragraph(f"<b>Related prior-knowledge pairs:</b> {rel_text}", body_style))
                 story.append(Spacer(1, 0.2 * cm))
 
-        # ── Mechanistic Chain ──────────────────────────
-        if ma.mechanistic_chain:
-            story.append(Paragraph("Mechanistic Chain", section_style))
+        # ── Candidate Biological Mechanisms ───────────────────
+        cands = getattr(result.audit_report, "candidate_mechanisms", []) or ma.candidate_mechanisms or []
+        if cands:
+            story.append(Paragraph("Candidate Biological Mechanisms", section_style))
             story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
-            chain_text = " → ".join(ma.mechanistic_chain)
-            story.append(Paragraph(chain_text, mono_style))
-            story.append(Paragraph(ma.rationale, body_style))
+            for cand in cands[:4]:
+                c_idx = cand.get("candidate_index", 1)
+                c_name = cand.get("name", f"Candidate Mechanism {c_idx}")
+                c_level = cand.get("support_level", "MODERATELY_SUPPORTED")
+                c_chain = " → ".join(cand.get("summary_chain", []))
+
+                level_color = "#10b981" if "STRONGLY" in c_level else ("#f59e0b" if "MODERATELY" in c_level else "#ef4444")
+                story.append(Paragraph(
+                    f"<b>Candidate Mechanism {c_idx}: {c_name}</b> "
+                    f"[<font color='{level_color}'><b>{c_level}</b></font>]",
+                    body_style
+                ))
+                if c_chain:
+                    story.append(Paragraph(c_chain, mono_style))
+
+                # Render Hops with Links
+                hops = cand.get("hops", [])
+                for h in hops:
+                    h_from = h.get("from_node", "")
+                    h_to = h.get("to_node", "")
+                    h_pred = h.get("predicate", "MODULATES")
+                    h_src = h.get("source_database", "")
+                    h_links = h.get("links", [])
+
+                    link_strs = []
+                    for l in h_links:
+                        u = l.get("url")
+                        lbl = l.get("display_label", l.get("source_name", "Open"))
+                        if u:
+                            link_strs.append(f"<a href='{u}' color='#3b82f6'><u>[{lbl}]</u></a>")
+                    link_text = " ".join(link_strs) if link_strs else f"[{h_src}]"
+
+                    hop_p = Paragraph(
+                        f"• {h_from} —<b>{h_pred}</b>→ {h_to} {link_text}",
+                        body_style
+                    )
+                    story.append(hop_p)
+                story.append(Spacer(1, 0.2 * cm))
+
+        # ── Sources Accessed ──────────────────────────────────
+        srcs = getattr(result.audit_report, "sources_accessed", []) or []
+        if srcs:
+            story.append(Paragraph("Biomedical Data Sources Accessed", section_style))
+            story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
+            src_table_data = [["Source Name", "Status", "Direct Source Portal"]]
+            for s in srcs:
+                s_name = s.get("name", "")
+                s_stat = s.get("status", "SUCCESS")
+                s_url = s.get("url", "#")
+                s_lbl = s.get("label", "Open Source")
+                link_p = Paragraph(f"<a href='{s_url}' color='#3b82f6'><u>[{s_lbl}]</u></a>", body_style)
+                src_table_data.append([s_name, s_stat, link_p])
+
+            src_table = Table(src_table_data, colWidths=[6 * cm, 4 * cm, 7 * cm])
+            src_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f8fafc"), colors.white]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story.append(src_table)
+            story.append(Spacer(1, 0.3 * cm))
 
         # ── Contradictions ─────────────────────────────
         if result.contradictions:

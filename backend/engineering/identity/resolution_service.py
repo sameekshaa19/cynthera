@@ -243,21 +243,56 @@ class IdentifierResolutionService:
             ChEMBL compound ID string of the highest-scoring candidate, or None.
         """
         try:
-            resp = await client.get(
-                CHEMBL_SEARCH_URL,
-                params={"q": drug_name, "format": "json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            molecules = data.get("molecules", [])
+            base_url = "https://www.ebi.ac.uk/chembl/api/data/molecule.json"
+            clean_query = drug_name.strip()
+            molecules: list[dict[str, Any]] = []
+
+            # Strategy 1: Exact preferred name lookup
+            try:
+                resp1 = await client.get(base_url, params={"pref_name__iexact": clean_query, "format": "json"})
+                if resp1.status_code == 200:
+                    molecules = resp1.json().get("molecules", [])
+            except Exception:
+                pass
+
+            # Strategy 2: Synonym exact lookup if Strategy 1 found nothing
+            if not molecules:
+                try:
+                    resp2 = await client.get(base_url, params={"molecule_synonyms__molecule_synonym__iexact": clean_query, "format": "json"})
+                    if resp2.status_code == 200:
+                        molecules = resp2.json().get("molecules", [])
+                except Exception:
+                    pass
+
+            # Strategy 3: Preferred name icontains lookup
+            if not molecules:
+                try:
+                    resp3 = await client.get(base_url, params={"pref_name__icontains": clean_query, "format": "json"})
+                    if resp3.status_code == 200:
+                        molecules = resp3.json().get("molecules", [])
+                except Exception:
+                    pass
+
+            # Strategy 4: Legacy search endpoint fallback
+            if not molecules:
+                try:
+                    resp = await client.get(
+                        CHEMBL_SEARCH_URL,
+                        params={"q": drug_name, "format": "json"},
+                    )
+                    if resp.status_code == 200:
+                        molecules = resp.json().get("molecules", [])
+                except Exception:
+                    pass
+
             if not molecules:
                 return None
 
-            clean_query = drug_name.strip().lower()
+            clean_query_lower = clean_query.lower()
 
             def _score(m: dict[str, Any]) -> tuple[bool, bool, int, bool]:
                 pref_name = (m.get("pref_name") or "").strip().lower()
-                exact_match = pref_name == clean_query
+                exact_match = pref_name == clean_query_lower
                 has_pref_name = bool(pref_name)
                 max_phase = int(float(m.get("max_phase") or 0))
                 is_parent = (

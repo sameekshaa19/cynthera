@@ -62,9 +62,9 @@ class SemanticScholarConnector(BaseConnector):
         super().__init__(api_key=key)
 
     def _build_headers(self) -> dict[str, str]:
-        """Build default request headers override to set x-api-key if key is provided."""
+        """Build default request headers override to set x-api-key if valid key is provided."""
         headers = {"Accept": "application/json", "User-Agent": "CYNTHERA/1.0"}
-        if self._api_key:
+        if self._api_key and not self._api_key.startswith("your-") and self._api_key.strip() != "":
             headers["x-api-key"] = self._api_key
         return headers
 

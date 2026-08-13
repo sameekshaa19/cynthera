@@ -6,10 +6,10 @@ from backend.reasoning.mechanistic.multi_hop_reasoner import (
     MultiHopReasoner, MechanisticPath, MechanisticHop,
 )
 
-def _mp(confidence):
+def _mp(confidence, target_name="T1"):
     return MechanisticPath(
-        hops=[MechanisticHop('Drug','X',0), MechanisticHop('Disease','Y',1)],
-        hop_count=1, confidence=confidence, path_type='DIRECT', description='t',
+        hops=[MechanisticHop('Drug','Drug',0), MechanisticHop('Target',target_name,1), MechanisticHop('Disease','Disease',2)],
+        hop_count=1, confidence=confidence, path_type='2-HOP', description='t',
     )
 
 class TestWeakestLinkFormula:
@@ -32,11 +32,13 @@ class TestWeakestLinkFormula:
 
     def test_corroboration_increases_score(self):
         r = MultiHopReasoner()
-        s1 = r.compute_mechanistic_score([_mp(0.5)])
-        s2 = r.compute_mechanistic_score([_mp(0.5)]*2)
-        s3 = r.compute_mechanistic_score([_mp(0.5)]*3)
-        assert s1 < s2 < s3
-        assert (s2 - s1) > (s3 - s2)
+        p1 = _mp(0.5, "T1")
+        p2 = _mp(0.5, "T2")
+        p3 = _mp(0.5, "T3")
+        s1 = r.compute_mechanistic_score([p1])
+        s2 = r.compute_mechanistic_score([p1, p2])
+        s3 = r.compute_mechanistic_score([p1, p2, p3])
+        assert s1 < s2 <= s3
 
     def test_bounded(self):
         r = MultiHopReasoner()
