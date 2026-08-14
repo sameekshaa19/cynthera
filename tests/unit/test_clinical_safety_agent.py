@@ -11,6 +11,8 @@ from backend.reasoning.agents.clinical_safety_agent import (
     SafetyProfile,
     AdverseEvent,
 )
+from backend.reasoning.orchestrator.reasoning_orchestrator import ReasoningOrchestrator
+from backend.core.enums.predicate_type import PredicateType
 from backend.core.enums.trial_outcome import TrialOutcomeStatus
 
 
@@ -38,8 +40,10 @@ def _make_package(trials=None, drug_name="TestDrug", disease_name="TestDisease")
     package = MagicMock()
     package.hypothesis_id = uuid.uuid4()
     package.drug.name = drug_name
+    package.drug.chembl_id = None
     package.disease.name = disease_name
     package.clinical_trials = trials or []
+    package.evidence_records = []
     return package
 
 
@@ -71,6 +75,41 @@ class TestClinicalSafetyAgent:
         package = _make_package(trials=[trial])
         profile = self.agent.analyze(package)
         assert profile.has_boxed_warning is True
+
+    def test_toxicity_terms_do_not_create_boxed_warning(self):
+        """Serious AE wording alone is not a regulatory boxed warning."""
+        trial = _make_trial(
+            title="Serious adverse events including fatal myelosuppression were monitored",
+            status=TrialOutcomeStatus.COMPLETED_FAILURE,
+        )
+        package = _make_package(trials=[trial])
+        profile = self.agent.analyze(package)
+        assert profile.has_boxed_warning is False
+
+    def test_safety_signals_are_not_attributed_to_other_intervention_drugs(self):
+        """Trials with structured non-matching intervention IDs are excluded."""
+        trial = _make_trial(
+            nct_id="NCT01774630",
+            title="Nilotinib in CML patients with relapse after Glivec discontinuation",
+            status=TrialOutcomeStatus.TERMINATED_SAFETY,
+        )
+        trial.drug_chembl_id = "CHEMBL255863"
+        package = _make_package(trials=[trial], drug_name="Imatinib")
+        package.drug.chembl_id = "CHEMBL941"
+
+        profile = self.agent.analyze(package)
+
+        assert profile.safety_termination_count == 0
+        assert profile.adverse_events == []
+
+    def test_inhibitor_alone_is_not_interaction_signal(self):
+        """A drug being an inhibitor is not itself a drug-drug interaction."""
+        trial = _make_trial(title="Imatinib is a tyrosine kinase inhibitor in CML")
+        package = _make_package(trials=[trial], drug_name="Imatinib")
+
+        profile = self.agent.analyze(package)
+
+        assert "inhibitor" not in profile.drug_interactions
 
     def test_safety_termination_counted(self):
         """Trials terminated for safety should be counted in safety_termination_count."""
@@ -150,3 +189,30 @@ class TestClinicalSafetyAgent:
         assert "overall_safety_grade" in d
         assert "adverse_events" in d
         assert isinstance(d["adverse_events"], list)
+
+
+@pytest.mark.asyncio
+async def test_fluid_retention_claim_does_not_saturate_risk_score():
+    """Known adverse-effect mentions should not behave like contraindications."""
+    package = _make_package(trials=[], drug_name="Imatinib", disease_name="CML")
+    safety_profile = SafetyProfile(overall_safety_grade="B", has_boxed_warning=False)
+    conflict_report = MagicMock()
+    conflict_report.net_conflict_score = 0.0
+    claims = []
+    for _ in range(9):
+        claim = MagicMock()
+        claim.subject = "Imatinib"
+        claim.predicate = PredicateType.CAUSES
+        claim.object = "fluid retention"
+        claim.raw_text = "Fluid retention is a known warning and precaution."
+        claims.append(claim)
+
+    result = await ReasoningOrchestrator.__new__(ReasoningOrchestrator)._compute_risk_score(
+        contradictions=[],
+        package=package,
+        safety_profile=safety_profile,
+        conflict_report=conflict_report,
+        claims=claims,
+    )
+
+    assert result.score < 0.1

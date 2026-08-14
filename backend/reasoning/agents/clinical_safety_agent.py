@@ -23,11 +23,10 @@ logger = logging.getLogger(__name__)
 # Safety Domain Constants
 # ─────────────────────────────────────────────
 
-_BOXED_WARNING_KEYWORDS: list[str] = [
-    "black box", "boxed warning", "black-box", "serious adverse",
-    "life-threatening", "fatal", "death", "mortality", "severe toxicity",
-    "hepatotoxicity", "cardiotoxicity", "nephrotoxicity", "myelosuppression",
-]
+_EXPLICIT_BOXED_WARNING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bboxed\s+warning\b", re.IGNORECASE),
+    re.compile(r"\bblack[-\s]?box\s+warning\b", re.IGNORECASE),
+)
 
 _ADVERSE_EVENT_KEYWORDS: list[str] = [
     "adverse", "side effect", "toxicity", "discontinuation", "withdrawal",
@@ -38,7 +37,7 @@ _ADVERSE_EVENT_KEYWORDS: list[str] = [
 
 _INTERACTION_KEYWORDS: list[str] = [
     "interaction", "contraindicated", "CYP450", "CYP3A4", "P-glycoprotein",
-    "warfarin", "anticoagulant", "inhibitor", "inducer", "substrate",
+    "warfarin", "anticoagulant", "inducer", "substrate",
 ]
 
 _POPULATION_RESTRICTION_KEYWORDS: list[str] = [
@@ -151,10 +150,16 @@ class ClinicalSafetyAgent:
         )
 
         has_boxed_warning = self._detect_boxed_warnings(package, drug_name)
-        adverse_events = self._extract_adverse_events(trials)
-        drug_interactions = self._detect_drug_interactions(trials, drug_name)
-        population_restrictions = self._detect_population_restrictions(trials)
-        safety_terminations = self._count_safety_terminations(trials)
+        drug_chembl_id = getattr(package.drug, "chembl_id", None)
+        if not isinstance(drug_chembl_id, str):
+            drug_chembl_id = None
+        drug_specific_trials = [
+            t for t in trials if self._trial_matches_drug(t, package.drug.name, drug_chembl_id)
+        ]
+        adverse_events = self._extract_adverse_events(drug_specific_trials)
+        drug_interactions = self._detect_drug_interactions(drug_specific_trials, drug_name)
+        population_restrictions = self._detect_population_restrictions(drug_specific_trials)
+        safety_terminations = self._count_safety_terminations(drug_specific_trials)
 
         if not trials and not has_boxed_warning:
             return SafetyProfile(
@@ -171,7 +176,7 @@ class ClinicalSafetyAgent:
             has_boxed_warning=has_boxed_warning,
             safety_termination_count=safety_terminations,
             severe_ae_count=sum(1 for ae in adverse_events if ae.severity in ("SEVERE", "FATAL")),
-            total_trials=len(trials) if trials else 1,
+            total_trials=len(drug_specific_trials) if drug_specific_trials else 1,
         )
 
         confidence = self._compute_confidence(trials) if trials else 0.7
@@ -224,38 +229,67 @@ class ClinicalSafetyAgent:
             parts.append(trial.primary_outcome)
         return " ".join(parts).lower()
 
-    def _detect_boxed_warnings(
-        self, package: RetrievalPackage, drug_name: str
-    ) -> bool:
-        """Detect boxed/black-box warning signals in trial text and literature evidence."""
-        # 1. Check trials
-        for trial in package.clinical_trials:
-            text = self._get_trial_text(trial)
-            for keyword in _BOXED_WARNING_KEYWORDS:
-                if keyword in text:
-                    logger.debug(
-                        "boxed_warning_detected",
-                        extra={"trial_id": trial.nct_id, "keyword": keyword},
-                    )
-                    return True
+    def _detect_boxed_warnings(self, package: RetrievalPackage, drug_name: str) -> bool:
+        """Detect explicit boxed-warning statements.
 
-        # 2. Check literature evidence records (titles and snippets)
-        disease_name = package.disease.name.lower()
+        Serious adverse-event language in abstracts or trials is not equivalent
+        to an FDA boxed warning, so this method intentionally ignores broad
+        toxicity terms such as "fatal", "hepatotoxicity", or "myelosuppression".
+        """
+        for trial in package.clinical_trials:
+            drug_chembl_id = getattr(package.drug, "chembl_id", None)
+            if not isinstance(drug_chembl_id, str):
+                drug_chembl_id = None
+            if not self._trial_matches_drug(trial, package.drug.name, drug_chembl_id):
+                continue
+            text = self._get_trial_text(trial)
+            if self._contains_explicit_boxed_warning(text):
+                logger.debug("boxed_warning_detected", extra={"trial_id": trial.nct_id})
+                return True
+
         for ev in package.evidence_records:
             t = ev.title or ""
             a = getattr(ev, "abstract", "") or ""
             s = getattr(ev, "snippet", "") or ""
             text = f"{t} {a} {s}".lower()
-            for keyword in _BOXED_WARNING_KEYWORDS:
-                if keyword in text:
-                    logger.info("boxed_warning_detected_in_literature", extra={"title": ev.title, "keyword": keyword})
-                    return True
-            # Also check for explicit disease contraindication or exacerbation keywords
-            if ("contraindicat" in text or "exacerbat" in text or "worsen" in text or "fluid retention" in text) and (disease_name in text or "heart failure" in text):
-                logger.info("contraindication_detected_in_literature", extra={"title": ev.title})
+            if drug_name in text and self._contains_explicit_boxed_warning(text):
+                logger.info("boxed_warning_detected_in_literature", extra={"title": ev.title})
                 return True
 
         return False
+
+    def _contains_explicit_boxed_warning(self, text: str) -> bool:
+        return any(pattern.search(text) for pattern in _EXPLICIT_BOXED_WARNING_PATTERNS)
+
+    def _trial_matches_drug(
+        self,
+        trial: ClinicalTrial,
+        drug_name: str,
+        drug_chembl_id: str | None,
+    ) -> bool:
+        """Return True when a trial can be attributed to the queried drug.
+
+        If structured intervention/drug identifiers are present, they must
+        match. When no binding metadata exists, preserve the historical behavior
+        and include the trial rather than dropping potentially useful records.
+        """
+        trial_chembl = getattr(trial, "drug_chembl_id", None)
+        if isinstance(trial_chembl, str) and trial_chembl:
+            return bool(drug_chembl_id and trial_chembl.lower() == drug_chembl_id.lower())
+
+        structured_values: list[str] = []
+        for attr in ("interventions", "intervention_names", "drugs", "arms"):
+            value = getattr(trial, attr, None)
+            if isinstance(value, str):
+                structured_values.append(value)
+            elif isinstance(value, (list, tuple, set)):
+                structured_values.extend(str(v) for v in value)
+
+        if structured_values:
+            haystack = " ".join(structured_values).lower()
+            return drug_name.lower() in haystack
+
+        return True
 
     def _extract_adverse_events(
         self, trials: list[ClinicalTrial]

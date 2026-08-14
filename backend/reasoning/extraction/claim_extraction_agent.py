@@ -17,6 +17,13 @@ from backend.core.enums.predicate_type import PredicateType
 from backend.core.value_objects.erw import ERW
 from backend.core.value_objects.provenance import ProvenanceReference
 from backend.core.exceptions import LLMResponseParsingError
+from backend.core.utils.api_keys import (
+    is_valid_edenai_key,
+    is_valid_gemini_key,
+    is_valid_groq_key,
+    is_valid_openrouter_key,
+    sanitize_api_key,
+)
 
 from backend.infrastructure.cache.raw_response_cache import RawResponseCache, TTL_LITERATURE
 
@@ -70,7 +77,13 @@ class ClaimExtractionAgent:
             db_path: Path to SQLite database file for claim caching.
         """
         self._model = model
-        self._api_key = api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        resolved = (
+            sanitize_api_key(api_key)
+            or sanitize_api_key(os.environ.get("GROQ_API_KEY"))
+            or sanitize_api_key(os.environ.get("LLM_API_KEY"))
+            or sanitize_api_key(os.environ.get("GEMINI_API_KEY"))
+        )
+        self._api_key = resolved
         self._prompt_version = self.PROMPT_VERSION
         self._last_extraction_method: str = "llm"
         self._has_logged_unconfigured_warning: bool = False
@@ -168,14 +181,28 @@ class ClaimExtractionAgent:
             List of raw claim dicts.
         """
         async with self._sem:
-            groq_key = self._api_key if (self._api_key and self._api_key.startswith("gsk_")) else os.environ.get("GROQ_API_KEY")
-            openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-            edenai_key = os.environ.get("EDENAI_API_KEY", "")
+            groq_key = (
+                self._api_key
+                if is_valid_groq_key(self._api_key)
+                else sanitize_api_key(os.environ.get("GROQ_API_KEY"))
+            )
+            gemini_key = (
+                self._api_key
+                if is_valid_gemini_key(self._api_key)
+                else sanitize_api_key(os.environ.get("GEMINI_API_KEY"))
+                or (
+                    sanitize_api_key(os.environ.get("LLM_API_KEY"))
+                    if is_valid_gemini_key(os.environ.get("LLM_API_KEY"))
+                    else None
+                )
+            )
+            openrouter_key = sanitize_api_key(os.environ.get("OPENROUTER_API_KEY", ""))
+            edenai_key = sanitize_api_key(os.environ.get("EDENAI_API_KEY", ""))
 
-            # Validate keys (ignore unconfigured placeholders)
-            has_valid_groq = bool(groq_key and not groq_key.startswith("gsk_your"))
-            has_valid_openrouter = bool(openrouter_key and not openrouter_key.startswith("your-") and openrouter_key.startswith("sk-or-"))
-            has_valid_edenai = bool(edenai_key and not edenai_key.startswith("your-") and len(edenai_key) > 10)
+            has_valid_groq = is_valid_groq_key(groq_key)
+            has_valid_gemini = is_valid_gemini_key(gemini_key)
+            has_valid_openrouter = is_valid_openrouter_key(openrouter_key)
+            has_valid_edenai = is_valid_edenai_key(edenai_key)
 
             if has_valid_groq:
                 prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
@@ -243,6 +270,11 @@ class ClaimExtractionAgent:
                     groq_quota_exhausted = True
 
                 if groq_quota_exhausted:
+                    if has_valid_gemini:
+                        logger.info("groq_exhausted_falling_back_to_gemini")
+                        result = await self._call_gemini(gemini_key, text, drug_name, disease_name)
+                        if result is not None:
+                            return result
                     if has_valid_openrouter:
                         logger.info("groq_exhausted_falling_back_to_openrouter")
                         result = await self._call_openrouter(openrouter_key, text, drug_name, disease_name)
@@ -256,6 +288,22 @@ class ClaimExtractionAgent:
                     logger.warning("all_llm_providers_exhausted_falling_back_to_rule_based")
                     self._last_extraction_method = "rule_based_fallback"
                     return self._rule_based_fallback(text, drug_name, disease_name)
+
+            elif has_valid_gemini:
+                logger.info("groq_key_absent_using_gemini")
+                result = await self._call_gemini(gemini_key, text, drug_name, disease_name)
+                if result is not None:
+                    return result
+                if has_valid_openrouter:
+                    result = await self._call_openrouter(openrouter_key, text, drug_name, disease_name)
+                    if result is not None:
+                        return result
+                if has_valid_edenai:
+                    result = await self._call_edenai(edenai_key, text, drug_name, disease_name)
+                    if result is not None:
+                        return result
+                self._last_extraction_method = "rule_based_fallback"
+                return self._rule_based_fallback(text, drug_name, disease_name)
 
             elif has_valid_openrouter:
                 logger.info("groq_key_absent_using_openrouter")
@@ -281,11 +329,45 @@ class ClaimExtractionAgent:
                 if not self._has_logged_unconfigured_warning:
                     logger.info(
                         "llm_key_unconfigured_fallback_to_rule_based",
-                        extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY, OPENROUTER_API_KEY, or EDENAI_API_KEY in .env"},
+                        extra={"fallback": "rule_based_fallback", "hint": "Set GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or EDENAI_API_KEY in .env"},
                     )
                     self._has_logged_unconfigured_warning = True
                 self._last_extraction_method = "rule_based_fallback"
                 return self._rule_based_fallback(text, drug_name, disease_name)
+
+    async def _call_gemini(
+        self,
+        api_key: str,
+        text: str,
+        drug_name: str,
+        disease_name: str,
+    ) -> list[dict[str, Any]] | None:
+        """Call Google Gemini for claim extraction.
+
+        Uses ``google-generativeai`` inside a thread executor. Returns None on failure.
+        """
+        prompt = EXTRACTION_PROMPT_V1.format(text=text[:3000])
+        model_name = os.environ.get("LLM_MODEL", self._model)
+
+        def _generate() -> str:
+            import google.generativeai as genai
+
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.0, "max_output_tokens": 1000},
+            )
+            return response.text or ""
+
+        try:
+            response_text = await asyncio.get_event_loop().run_in_executor(None, _generate)
+            if response_text.strip():
+                self._last_extraction_method = "llm"
+                return self._parse_llm_response(response_text)
+        except Exception as exc:
+            logger.warning("gemini_call_failed", extra={"error": str(exc)})
+        return None
 
     async def _call_openrouter(
         self,

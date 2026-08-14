@@ -25,6 +25,7 @@ from backend.core.exceptions import (
     DiseaseNotResolvedException,
     QualityGateFailureError,
 )
+from backend.core.utils.api_keys import sanitize_api_key
 from backend.engineering.identity.resolution_service import IdentifierResolutionService
 from backend.engineering.retrieval.pipeline import RetrievalPipeline
 from backend.reasoning.orchestrator.reasoning_orchestrator import ReasoningOrchestrator
@@ -85,15 +86,23 @@ class MasterOrchestrator:
             use_cache: Whether to use the evaluation cache (default True).
         """
         self._db_path = db_path
-        self._resolver = IdentifierResolutionService(ncbi_api_key=ncbi_api_key)
+        clean_ncbi = sanitize_api_key(ncbi_api_key)
+        clean_disgenet = sanitize_api_key(disgenet_api_key)
+        clean_s2 = sanitize_api_key(semantic_scholar_api_key)
+        self._resolver = IdentifierResolutionService(ncbi_api_key=clean_ncbi)
         self._retrieval = RetrievalPipeline(
-            ncbi_api_key=ncbi_api_key,
-            disgenet_api_key=disgenet_api_key,
-            semantic_scholar_api_key=semantic_scholar_api_key,
+            ncbi_api_key=clean_ncbi,
+            disgenet_api_key=clean_disgenet,
+            semantic_scholar_api_key=clean_s2,
             db_path=db_path,
             bypass_raw_cache=not use_cache,
         )
-        resolved_llm_key = llm_api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        resolved_llm_key = (
+            sanitize_api_key(llm_api_key)
+            or sanitize_api_key(os.environ.get("GROQ_API_KEY"))
+            or sanitize_api_key(os.environ.get("LLM_API_KEY"))
+            or sanitize_api_key(os.environ.get("GEMINI_API_KEY"))
+        )
         self._reasoning = ReasoningOrchestrator(
             llm_api_key=resolved_llm_key,
             llm_model=llm_model,

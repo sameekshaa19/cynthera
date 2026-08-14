@@ -58,7 +58,8 @@ class SemanticScholarConnector(BaseConnector):
             api_key: Optional Semantic Scholar API key for higher rate limits.
         """
         import os
-        key = api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+        from backend.core.utils.api_keys import sanitize_api_key
+        key = sanitize_api_key(api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY"))
         super().__init__(api_key=key)
 
     def _build_headers(self) -> dict[str, str]:

@@ -86,9 +86,12 @@ class RetrievalPipeline:
                               Cache writes still occur so subsequent runs benefit.
         """
         import os
-        self._ncbi_api_key = ncbi_api_key
-        self._disgenet_api_key = disgenet_api_key
-        self._semantic_scholar_api_key = semantic_scholar_api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+        from backend.core.utils.api_keys import sanitize_api_key
+        self._ncbi_api_key = sanitize_api_key(ncbi_api_key)
+        self._disgenet_api_key = sanitize_api_key(disgenet_api_key)
+        self._semantic_scholar_api_key = sanitize_api_key(
+            semantic_scholar_api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+        )
         self._raw_cache = RawResponseCache(db_path=db_path)
         self._bypass_raw_cache = bypass_raw_cache
 
@@ -508,100 +511,6 @@ class RetrievalPipeline:
         except Exception as exc:
             logger.debug("disgenet_fetch_failed", extra={"error": str(exc)})
             return {}
-
-    # ── Extended literature sources (Phase 2) ────────────────────────────────
-    # These methods were missing: called in execute() but never defined, causing
-    # AttributeError caught as exceptions → sources_failed on every run.
-
-    async def _fetch_openalex(
-        self, drug_name: str, disease_name: str, hypothesis_id: uuid.UUID
-    ) -> list[Evidence]:
-        """Fetch supplementary literature from OpenAlex (no API key required).
-
-        Gracefully returns empty list on any error — caller treats [] as
-        successful-but-empty (sources_queried) not sources_failed.
-        """
-        if not _EXTENDED_SOURCES_AVAILABLE:
-            return []
-        cache_key = RawResponseCache.make_key(
-            "openalex", drug_name.lower(), disease_name.lower()
-        )
-        if not self._bypass_raw_cache:
-            cached = self._raw_cache.get(cache_key, source_name="openalex")
-            if isinstance(cached, list):
-                logger.debug("openalex_cache_hit", extra={"drug": drug_name})
-                return []  # cached raw → re-parse would require serializing Evidence; skip
-
-        try:
-            conn = OpenAlexConnector()
-            records = await conn.fetch_literature(
-                drug_name=drug_name,
-                disease_name=disease_name,
-                hypothesis_id=hypothesis_id,
-            )
-            return records
-        except Exception as exc:
-            logger.warning("openalex_fetch_failed", extra={"error": str(exc)})
-            raise  # let execute() catch and route to sources_failed
-
-    async def _fetch_semantic_scholar(
-        self, drug_name: str, disease_name: str, hypothesis_id: uuid.UUID
-    ) -> list[Evidence]:
-        """Fetch citation-weighted literature from Semantic Scholar.
-
-        Uses the optional API key for higher rate limits; works anonymously
-        (1 req/sec) when no key is configured.
-        """
-        if not _EXTENDED_SOURCES_AVAILABLE:
-            return []
-        try:
-            conn = SemanticScholarConnector(api_key=self._semantic_scholar_api_key)
-            records = await conn.fetch_literature(
-                drug_name=drug_name,
-                disease_name=disease_name,
-                hypothesis_id=hypothesis_id,
-            )
-            return records
-        except Exception as exc:
-            logger.warning("semantic_scholar_fetch_failed", extra={"error": str(exc)})
-            raise  # let execute() catch and route to sources_failed
-
-    async def _fetch_europepmc(
-        self, drug_name: str, disease_name: str, hypothesis_id: uuid.UUID
-    ) -> list[Evidence]:
-        """Fetch open-access literature from Europe PMC (no API key required)."""
-        if not _NEW_SOURCES_AVAILABLE:
-            return []
-        try:
-            conn = EuropePMCConnector()
-            records = await conn.fetch_literature(
-                drug_name=drug_name,
-                disease_name=disease_name,
-                hypothesis_id=hypothesis_id,
-            )
-            return records
-        except Exception as exc:
-            logger.warning("europepmc_fetch_failed", extra={"error": str(exc)})
-            raise
-
-    async def _fetch_opentargets(self, disease: Disease) -> dict[str, float]:
-        """Fetch gene-disease association scores from Open Targets.
-
-        Returns: dict[gene_symbol, score] — routed into validated_disease_genes,
-        NOT evidence_records, by execute().
-        """
-        if not _NEW_SOURCES_AVAILABLE:
-            return {}
-        try:
-            conn = OpenTargetsConnector()
-            disease_id = getattr(disease, "mondo_id", None) or getattr(disease, "mesh_id", None) or disease.name
-            result = await conn.fetch(disease_id=disease_id)
-            if isinstance(result, dict) and "gene_scores" in result:
-                return result["gene_scores"]
-            return result if isinstance(result, dict) else {}
-        except Exception as exc:
-            logger.warning("opentargets_fetch_failed", extra={"error": str(exc)})
-            raise
 
     def _parse_indication_data(
         self,

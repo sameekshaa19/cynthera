@@ -45,6 +45,7 @@ class OpenAlexConnector(BaseConnector):
             email: Optional contact email for the OpenAlex polite pool
                    (higher rate limits). Appended as ?mailto= parameter.
         """
+        super().__init__()
         self._email = email or "research@cynthera.ai"
         self._base_params: dict[str, str] = {"mailto": self._email}
 

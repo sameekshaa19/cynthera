@@ -5,13 +5,18 @@ Reference: 08_IMPLEMENTATION_GUIDE.md §5.5, 03_RETRIEVAL_SPECIFICATION.md
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
 from typing import Any
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from backend.core.utils.api_keys import sanitize_api_key
+
 logger = logging.getLogger(__name__)
+
+_MAX_429_RETRIES = 4
 
 
 class BaseConnector(abc.ABC):
@@ -39,7 +44,7 @@ class BaseConnector(abc.ABC):
         Args:
             api_key: Optional API key for authenticated endpoints.
         """
-        self._api_key = api_key
+        self._api_key = sanitize_api_key(api_key)
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> "BaseConnector":
@@ -98,7 +103,26 @@ class BaseConnector(abc.ABC):
         Returns:
             Parsed JSON response as dict.
         """
-        response = await self._client.get(url, params=params)
+        last_response: httpx.Response | None = None
+        for attempt in range(_MAX_429_RETRIES):
+            response = await self._client.get(url, params=params)
+            if response.status_code == 429:
+                delay = float(response.headers.get("retry-after", 2.0 + attempt * 2))
+                logger.info(
+                    "rate_limited_backoff",
+                    extra={
+                        "source": self.source_name,
+                        "attempt": attempt + 1,
+                        "delay_seconds": delay,
+                    },
+                )
+                await asyncio.sleep(delay)
+                last_response = response
+                continue
+            response.raise_for_status()
+            return response.json()
+        if last_response is not None:
+            last_response.raise_for_status()
         response.raise_for_status()
         return response.json()
 

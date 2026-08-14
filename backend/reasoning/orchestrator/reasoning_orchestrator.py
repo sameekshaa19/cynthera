@@ -972,29 +972,30 @@ class ReasoningOrchestrator:
         # Administrative/COVID terminations: do NOT add to risk
         raw_risk += conflict_report.net_conflict_score * len(contradictions) * 0.5
 
-        # Harmful / contraindication claims
+        # Harmful / contraindication claims. Ordinary adverse-effect mentions
+        # such as fluid retention are safety-monitoring signals, not evidence
+        # that the drug is contraindicated for the queried disease.
         harmful_claims = []
         for c in (claims or []):
             text = (getattr(c, "raw_text", "") or f"{c.subject} {c.predicate.value} {c.object}").lower()
             if (
-                c.predicate == PredicateType.CAUSES
-                or "contraindicat" in text
+                "contraindicat" in text
                 or "exacerbat" in text
                 or "worsen" in text
                 or "causes heart failure" in text
-                or "fluid retention" in text
             ):
                 harmful_claims.append(c)
         if harmful_claims:
-            raw_risk += len(harmful_claims) * 2.5
+            raw_risk += min(len(harmful_claims), 3) * 1.2
 
         grade_penalty = {"D": 3.0, "C": 0.8, "B": 0.2, "A": 0.0}.get(
             safety_profile.overall_safety_grade, 0.5
         )
-        raw_risk += grade_penalty
 
         if safety_profile.has_boxed_warning:
             raw_risk += 3.5
+        else:
+            raw_risk += grade_penalty
 
         k = 0.3
         score = round(1.0 - math.exp(-k * raw_risk), 4) if raw_risk > 0 else 0.0
@@ -1025,6 +1026,11 @@ class ReasoningOrchestrator:
                 f"Contradictory evidence: {len(contradictions)} conflict(s) "
                 f"(net score: {conflict_report.net_conflict_score:.2f})"
             )
+        if harmful_claims:
+            risk_factors.append(
+                f"Contraindication/exacerbation claims: {len(harmful_claims)} "
+                f"({min(len(harmful_claims), 3)} counted after cap)"
+            )
         if safety_profile.has_boxed_warning:
             risk_factors.append("FDA Boxed Warning detected")
         if safety_profile.adverse_events:
@@ -1036,7 +1042,7 @@ class ReasoningOrchestrator:
                 )
         risk_factors.append(
             f"Safety grade: {safety_profile.overall_safety_grade} "
-            f"(grade penalty: {grade_penalty:.1f})"
+            f"(grade penalty: {0.0 if safety_profile.has_boxed_warning else grade_penalty:.1f})"
         )
 
         rationale = (
