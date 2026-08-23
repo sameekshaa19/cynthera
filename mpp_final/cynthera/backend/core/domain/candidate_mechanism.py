@@ -1,0 +1,111 @@
+"""CandidateMechanism domain entity — represents a discovered, candidate biological mechanism.
+
+Models the candidate biological mechanisms connecting Drug → Target → Biological Process / Pathway → Disease.
+Each candidate mechanism contains detailed hop-by-hop evidence, status ratings, and direct source links.
+"""
+from __future__ import annotations
+
+import uuid
+from typing import Any
+from pydantic import BaseModel, Field
+
+from backend.core.value_objects.source_url_builder import EvidenceLink
+
+
+class MechanismHop(BaseModel):
+    """One relationship in a candidate mechanism chain.
+
+    ``status`` deliberately describes the *kind* of support, not whether a
+    graph edge happened to be traversable.  In particular, Reactome
+    participation is ``STRUCTURAL_EVIDENCE`` until an independent mechanistic
+    source or a mapped literature claim supports the biological bridge.
+    """
+
+    model_config = {"frozen": True}
+
+    from_node: str = Field(..., description="Source node name and label (e.g., 'Drug: Dapagliflozin').")
+    to_node: str = Field(..., description="Target node name and label (e.g., 'Target: SLC5A2').")
+    predicate: str = Field(..., description="Biological interaction predicate (e.g., 'INHIBITOR', 'PARTICIPATES_IN').")
+    status: str = Field(
+        default="CANDIDATE_STRUCTURAL",
+        description=(
+            "CANDIDATE_STRUCTURAL | DATABASE_SUPPORTED | LITERATURE_SUPPORTED | "
+            "DIRECTION_UNCERTAIN | INSUFFICIENT_EVIDENCE | CONTRADICTED"
+        ),
+    )
+    evidence_strength: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_database: str = Field(..., description="Database source (e.g., 'ChEMBL', 'Reactome', 'Open Targets').")
+    provenance_note: str = Field(default="", description="Detailed rationale or measurement note.")
+    links: list[EvidenceLink] = Field(default_factory=list, description="Clickable URL links for this hop.")
+    canonical_from_id: str | None = Field(default=None, description="Resolved canonical identifier for from_node.")
+    canonical_to_id: str | None = Field(default=None, description="Resolved canonical identifier for to_node.")
+    directionality: str = Field(default="DIRECTION_UNCERTAIN", description="SUPPORTED | DIRECTION_UNCERTAIN | NOT_APPLICABLE")
+    evidence_type: str = Field(default="STRUCTURAL", description="DIRECT | CURATED | STRUCTURAL | LITERATURE")
+    supporting_claims: list[dict[str, Any]] = Field(default_factory=list)
+    contradicting_claims: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CandidateMechanism(BaseModel):
+    """A discovered biological route plus its independent validation record."""
+
+    model_config = {"frozen": True}
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    candidate_index: int = Field(default=1, description="Index of this candidate mechanism (1-based).")
+    name: str = Field(..., description="Human-readable title (e.g., 'SLC5A2 inhibition → Renal Glucose Reabsorption').")
+    support_level: str = Field(
+        ...,
+        description="Rating: 'STRONGLY_SUPPORTED' | 'MODERATELY_SUPPORTED' | 'WEAK_SPECULATIVE' | 'CONTRADICTED' | 'UNSUPPORTED'",
+    )
+    confidence_score: float = Field(..., ge=0.0, le=1.0)
+    summary_chain: list[str] = Field(default_factory=list, description="Ordered chain strings (Drug → ... → Disease).")
+    hops: list[MechanismHop] = Field(default_factory=list, description="Detailed hop-by-hop evidence breakdown.")
+    literature_citations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Citations supporting this specific candidate mechanism with links.",
+    )
+    rationale: str = Field(default="", description="Scientific justification explaining why this mechanism is supported/rejected.")
+    discovery_status: str = Field(
+        default="CANDIDATE_STRUCTURAL",
+        description="CANDIDATE_STRUCTURAL | VALIDATED | INSUFFICIENT_EVIDENCE | CONTRADICTED",
+    )
+    validation_dimensions: dict[str, float] = Field(default_factory=dict)
+    score_explanation: list[str] = Field(default_factory=list)
+    missing_critical_evidence: list[str] = Field(default_factory=list)
+    contradictions: list[dict[str, Any]] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "candidate_index": self.candidate_index,
+            "name": self.name,
+            "support_level": self.support_level,
+            "confidence_score": self.confidence_score,
+            "summary_chain": self.summary_chain,
+            "hops": [
+                {
+                    "from_node": h.from_node,
+                    "to_node": h.to_node,
+                    "predicate": h.predicate,
+                    "status": h.status,
+                    "evidence_strength": h.evidence_strength,
+                    "source_database": h.source_database,
+                    "provenance_note": h.provenance_note,
+                    "links": [l.to_dict() for l in h.links],
+                    "canonical_from_id": h.canonical_from_id,
+                    "canonical_to_id": h.canonical_to_id,
+                    "directionality": h.directionality,
+                    "evidence_type": h.evidence_type,
+                    "supporting_claims": h.supporting_claims,
+                    "contradicting_claims": h.contradicting_claims,
+                }
+                for h in self.hops
+            ],
+            "literature_citations": self.literature_citations,
+            "rationale": self.rationale,
+            "discovery_status": self.discovery_status,
+            "validation_dimensions": self.validation_dimensions,
+            "score_explanation": self.score_explanation,
+            "missing_critical_evidence": self.missing_critical_evidence,
+            "contradictions": self.contradictions,
+        }

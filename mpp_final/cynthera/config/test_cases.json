@@ -1,0 +1,22 @@
+[
+    {
+        "drug": "Propranolol",
+        "disease": "Infantile Hemangioma"
+    },
+    {
+        "drug": "Dapagliflozin",
+        "disease": "Heart Failure"
+    },
+    {
+        "drug": "Thalidomide",
+        "disease": "Multiple Myeloma"
+    },
+    {
+        "drug": "Aspirin",
+        "disease": "Colorectal Cancer"
+    },
+    {
+        "drug": "Minoxidil",
+        "disease": "Hair Loss"
+    }
+]
