@@ -47,17 +47,19 @@ from backend.reasoning.mechanistic.evidence_graph import (
     _MAX_HOPS,
     _HOP_DECAY,
 )
+from backend.reasoning.directional.path_polarity import propagate_path_polarity
 
 logger = logging.getLogger(__name__)
 
-# Minimum confidence to include a path in the result set
-_MIN_CONFIDENCE: float = 0.05
+# Minimum confidence to include a path in the result set (calibrated for up to 5-hop decay)
+_MIN_CONFIDENCE: float = 0.01
 
 _PATH_TYPE_BY_HOP_COUNT: dict[int, str] = {
     1: "DIRECT",
     2: "2-HOP",
     3: "3-HOP",
     4: "4-HOP",
+    5: "5-HOP",
 }
 
 
@@ -90,6 +92,9 @@ class MechanisticHop:
     links: list[EvidenceLink] = field(default_factory=list)
     direction: str = "UNKNOWN"
     relationship_type: str | None = None
+    # Phase 4B: typed directional fields from the incoming GraphEdge
+    polarity: str = "UNKNOWN"         # MolecularPolarity.value
+    causal_grounding: str = "STRUCTURAL"  # CausalGrounding.value
 
 
 @dataclass
@@ -146,6 +151,7 @@ def _label_for_node_type(node_label: str) -> str:
     return {
         "DRUG": "Drug",
         "TARGET": "Target",
+        "REACTION": "Reaction",
         "PATHWAY": "Pathway",
         "GENE": "Gene",
         "DISEASE": "Disease",
@@ -206,6 +212,9 @@ class PathFinder:
                 links=list(edge_in.links) if edge_in and hasattr(edge_in, "links") else [],
                 direction=getattr(edge_in, "direction", "UNKNOWN") if edge_in else "UNKNOWN",
                 relationship_type=getattr(edge_in, "relationship_type", None) or (edge_in.predicate if edge_in else None),
+                # Phase 4B: populate typed directional fields from the GraphEdge
+                polarity=getattr(edge_in, "polarity", "UNKNOWN").value if edge_in and hasattr(getattr(edge_in, "polarity", None), "value") else (getattr(edge_in, "polarity", "UNKNOWN") if edge_in else "UNKNOWN"),
+                causal_grounding=getattr(edge_in, "causal_grounding", "STRUCTURAL").value if edge_in and hasattr(getattr(edge_in, "causal_grounding", None), "value") else (getattr(edge_in, "causal_grounding", "STRUCTURAL") if edge_in else "STRUCTURAL"),
             ))
 
         # hop_count = number of intermediate nodes (not counting Drug and Disease)
@@ -298,7 +307,7 @@ class MultiHopReasoner:
         if not package.targets:
             return []
 
-        graph = self._graph_builder.build(package)
+        graph, _resolver = self._graph_builder.build(package)
         drug_id = f"DRUG:{package.drug.name}"
         disease_id = f"DISEASE:{package.disease.name}"
 
@@ -354,6 +363,9 @@ class MultiHopReasoner:
         for idx, path in enumerate(paths[:5], start=1):
             # Hop breakdown
             mechanism_hops: list[MechanismHop] = []
+
+            # Collect GraphEdge objects for this path from path.hops
+            # path.hops carries edge info via MechanisticHop attributes
             for i in range(1, len(path.hops)):
                 h_prev = path.hops[i - 1]
                 h_curr = path.hops[i]
@@ -377,7 +389,30 @@ class MultiHopReasoner:
                         "This is not causal validation."
                     ),
                     links=getattr(h_curr, "links", []),
+                    # Phase 4B: populate polarity/grounding from the incoming edge
+                    polarity=getattr(h_curr, "polarity", "UNKNOWN"),
+                    causal_grounding=getattr(h_curr, "causal_grounding", "STRUCTURAL"),
                 ))
+
+            # Phase 4B: compute path-level polarity from per-hop GraphEdge data
+            # MechanisticHop objects carry polarity/causal_grounding from the edge
+            # We reconstruct a lightweight proxy for propagate_path_polarity
+            from backend.core.enums.molecular_polarity import MolecularPolarity
+            from backend.core.enums.causal_grounding import CausalGrounding
+
+            class _HopEdgeProxy:
+                """Minimal proxy to feed hop polarity data into propagate_path_polarity."""
+                def __init__(self, hop: MechanismHop):
+                    raw_p = getattr(hop, "polarity", "UNKNOWN")
+                    self.polarity = MolecularPolarity(raw_p) if isinstance(raw_p, str) else raw_p
+                    raw_g = getattr(hop, "causal_grounding", "STRUCTURAL")
+                    try:
+                        self.causal_grounding = CausalGrounding(raw_g) if isinstance(raw_g, str) else raw_g
+                    except ValueError:
+                        self.causal_grounding = CausalGrounding.STRUCTURAL
+
+            hop_proxies = [_HopEdgeProxy(h) for h in mechanism_hops]
+            path_pol = propagate_path_polarity(hop_proxies)
 
             # Classify support level
             conf = path.confidence
@@ -407,6 +442,15 @@ class MultiHopReasoner:
                 "Independent validation of the biological bridge is required."
             )
 
+            # Phase 4B: best causal grounding level across hops
+            grounding_priority = ["DIRECT", "CURATED", "INFERRED", "STRUCTURAL", "NONE"]
+            hop_groundings = [getattr(h, "causal_grounding", "STRUCTURAL") for h in mechanism_hops]
+            best_grounding = "NONE"
+            for tier in grounding_priority:
+                if tier in hop_groundings:
+                    best_grounding = tier
+                    break
+
             candidates.append(CandidateMechanism(
                 candidate_index=idx,
                 name=cand_name,
@@ -417,6 +461,11 @@ class MultiHopReasoner:
                 literature_citations=[],
                 rationale=rationale,
                 discovery_status="CANDIDATE_STRUCTURAL",
+                # Phase 4B directional fields
+                directional_polarity=path_pol.polarity.value,
+                causal_grounding_level=best_grounding,
+                grounded_edge_count=path_pol.grounded_edges,
+                therapeutic_direction="UNKNOWN",  # Phase 4C will fill this
             ))
 
         return candidates

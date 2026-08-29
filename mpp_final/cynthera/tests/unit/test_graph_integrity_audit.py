@@ -166,7 +166,7 @@ def test_10_root_cause_diagnosis_on_observed_graph_state():
 def test_11_audit_does_not_modify_evidence_graph(sample_package):
     """Property 11: GraphIntegrityAuditor is strictly read-only and does not mutate graph nodes or edges."""
     builder = EvidenceGraphBuilder()
-    graph = builder.build(sample_package)
+    graph, _ = builder.build(sample_package)
 
     nodes_before = len(graph.nodes)
     edges_before = len(graph.edges)

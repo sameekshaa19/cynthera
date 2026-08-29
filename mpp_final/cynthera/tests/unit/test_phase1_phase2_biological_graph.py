@@ -187,7 +187,7 @@ def test_6_and_7_participates_in_remains_association_with_unknown_direction():
     )
 
     builder = EvidenceGraphBuilder()
-    graph = builder.build(package)
+    graph, _ = builder.build(package)
 
     tp_edges = [e for e in graph.edges if e.source_id.startswith("TARGET:") and e.target_id.startswith("PATHWAY:")]
     assert len(tp_edges) == 1

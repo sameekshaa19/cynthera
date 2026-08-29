@@ -256,7 +256,22 @@ class ReasoningOrchestrator:
         graph.seal()
 
         # ── Step 3: Advanced Conflict Resolution ─────────────────────────
-        conflict_report = self._conflict_resolver.resolve(all_claims)
+        # Phase 4B: build the evidence graph first to obtain the resolver, then
+        # pass it to the conflict resolver for canonical entity gating.
+        # The graph itself is consumed by MultiHopReasoner below (it re-builds internally
+        # because MultiHopReasoner owns its own EvidenceGraphBuilder instance).
+        # We build a throwaway graph here solely to get the resolver for gating.
+        from backend.reasoning.mechanistic.evidence_graph import EvidenceGraphBuilder as _EGB
+        from backend.reasoning.normalization.biological_identifier_resolver import (
+            BiologicalIdentifierResolver as _BIR,
+        )
+        try:
+            _gating_resolver: _BIR | None = None
+            if package.targets:
+                _, _gating_resolver = _EGB().build(package)
+        except Exception:
+            _gating_resolver = None
+        conflict_report = self._conflict_resolver.resolve(all_claims, resolver=_gating_resolver)
         contradictions = conflict_report.contradictions
 
         # ── Step 4: Multi-hop Mechanistic Path Tracing ───────────────────

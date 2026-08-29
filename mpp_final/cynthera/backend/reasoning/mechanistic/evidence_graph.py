@@ -41,6 +41,18 @@ from typing import Any, Iterator
 from backend.core.domain.retrieval_package import RetrievalPackage
 from backend.core.value_objects.source_url_builder import EvidenceLink, SourceURLBuilder
 
+# Phase 4B: Directional evidence infrastructure
+from backend.core.enums.molecular_polarity import MolecularPolarity
+from backend.core.enums.causal_grounding import CausalGrounding
+from backend.reasoning.directional.chembl_polarity import (
+    chembl_action_to_polarity,
+    chembl_action_to_grounding,
+)
+from backend.reasoning.directional.reactome_polarity import (
+    reactome_role_to_polarity,
+    reactome_role_to_grounding,
+)
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
@@ -48,20 +60,34 @@ logger = logging.getLogger(__name__)
 # Track in MECHANISTIC_BENCHMARK_RESULTS.md once the benchmark lands.
 # ─────────────────────────────────────────────
 _HOP_DECAY: float = 0.85               # per-additional-hop length penalty
-_MIN_PATH_CONFIDENCE: float = 0.05
+_MIN_PATH_CONFIDENCE: float = 0.01
 _UNREVIEWED_PENALTY: float = 0.3       # TrEMBL (unreviewed) protein multiplier
 _UNVALIDATED_GENE_DEFAULT: float = 0.3 # fallback strength when a target's gene
                                         # has no Open Targets/DisGeNET score at all
 _MAX_TARGETS: int = 8
 _MAX_PATHWAYS_PER_TARGET: int = 6
-_MAX_HOPS: int = 4
+_MAX_HOPS: int = 5
 
 # Node type constants
 _NODE_DRUG = "DRUG"
 _NODE_TARGET = "TARGET"
+_NODE_REACTION = "REACTION"
 _NODE_PATHWAY = "PATHWAY"
 _NODE_GENE = "GENE"
 _NODE_DISEASE = "DISEASE"
+
+# Target role to edge predicate mapping
+_ROLE_TO_PREDICATE: dict[str, str] = {
+    "CATALYST": "CATALYZES",
+    "INPUT": "INPUT_TO",
+    "OUTPUT": "OUTPUT_OF",
+    "POSITIVE_REGULATOR": "POSITIVE_REGULATES",
+    "NEGATIVE_REGULATOR": "NEGATIVE_REGULATES",
+    "REQUIREMENT": "REQUIREMENT_FOR",
+    "COMPLEX_COMPONENT": "COMPLEX_COMPONENT_OF",
+    "ENTITY_SET_MEMBER": "ENTITY_SET_MEMBER_OF",
+    "PARTICIPANT": "PARTICIPATES_IN_REACTION",
+}
 
 _NON_HUMAN_KEYWORDS = (
     "bacteria", "bacterial", "virus", "viral", "coli", "yeast",
@@ -282,11 +308,14 @@ class GraphEdge:
     provenance: str = ""
     links: list[EvidenceLink] = field(default_factory=list)
     data_quality: str = "EVIDENCE_BACKED"  # "EVIDENCE_BACKED" | "STRUCTURE_ONLY" | "UNVALIDATED"
-    direction: str = "UNKNOWN"             # "POSITIVE" | "NEGATIVE" | "UNKNOWN"
+    direction: str = "UNKNOWN"             # "POSITIVE" | "NEGATIVE" | "UNKNOWN" (legacy string, kept for compat)
     relationship_type: str = ""           # Semantic type e.g. PARTICIPATES_IN, INHIBITS, ASSOCIATED_WITH
     source_id_ref: str = ""               # Database-specific identifier
     evidence_type: str = ""               # IN_VITRO | DATABASE | PATHWAY_MEMBERSHIP | etc.
     context: dict = field(default_factory=dict)
+    # Phase 4B: Typed directional fields — separate from legacy string direction
+    polarity: MolecularPolarity = field(default=MolecularPolarity.UNKNOWN)
+    causal_grounding: CausalGrounding = field(default=CausalGrounding.NONE)
 
 
 class EvidenceGraph:
@@ -357,14 +386,16 @@ class EvidenceGraphBuilder:
         graph = builder.build(package)
     """
 
-    def build(self, package: RetrievalPackage) -> EvidenceGraph:
+    def build(self, package: RetrievalPackage) -> tuple[EvidenceGraph, BiologicalIdentifierResolver]:
         """Build and return the EvidenceGraph for the given package.
 
         Args:
             package: Sealed RetrievalPackage from the retrieval pipeline.
 
         Returns:
-            EvidenceGraph with nodes and edges populated from retrieved data.
+            Tuple of (EvidenceGraph, BiologicalIdentifierResolver).
+            The resolver is populated from retrieved proteins/genes/mappings and
+            can be passed to AdvancedConflictResolver for canonical entity gating.
         """
         graph = EvidenceGraph()
 
@@ -378,7 +409,13 @@ class EvidenceGraphBuilder:
 
         if not targets:
             # No targets → empty graph → PathFinder finds nothing → MS=0 NONE
-            return graph
+            # Still return (graph, resolver) tuple for consistent API.
+            empty_resolver = BiologicalIdentifierResolver(
+                proteins=package.proteins,
+                genes=package.genes,
+                mappings=getattr(package, "identifier_mappings", []),
+            )
+            return graph, empty_resolver
 
         # ── Pre-build lookup tables & resolver ────────────────────────────
         resolver = BiologicalIdentifierResolver(
@@ -416,6 +453,16 @@ class EvidenceGraphBuilder:
         )
 
         genes_linked_to_disease: set[str] = set()  # track to avoid duplicate edges
+
+        # Pre-index Reactome reaction evidence by target
+        rxn_ev_by_target: dict[str, list[Any]] = defaultdict(list)
+        for rev in getattr(package, "reactome_reaction_evidence", []):
+            acc_clean = clean_uniprot(getattr(rev, "target_original_id", None))
+            if acc_clean:
+                rxn_ev_by_target[acc_clean].append(rev)
+            can_sym = getattr(rev, "target_canonical_id", None)
+            if can_sym:
+                rxn_ev_by_target[can_sym.upper()].append(rev)
 
         for target in targets:
             uniprot_id = getattr(target, "protein_uniprot", None)
@@ -471,6 +518,10 @@ class EvidenceGraphBuilder:
             elif pred_u in ("ACTIVATOR", "ACTIVATES", "AGONIST", "OPENER", "POSITIVE_ALLOSTERIC_MODULATOR", "PARTIAL_AGONIST"):
                 direction = "POSITIVE"
 
+            # Phase 4B: typed polarity and causal grounding derived from ChEMBL action_type
+            dt_polarity = chembl_action_to_polarity(mechanism)
+            dt_grounding = chembl_action_to_grounding(mechanism)
+
             graph.add_edge(GraphEdge(
                 source_id=drug_id,
                 target_id=target_id,
@@ -483,6 +534,8 @@ class EvidenceGraphBuilder:
                 direction=direction,
                 relationship_type=predicate,
                 evidence_type="IN_VITRO",
+                polarity=dt_polarity,
+                causal_grounding=dt_grounding,
             ))
 
             # ── Target → Gene → Disease ───────────────────────────────────
@@ -592,6 +645,81 @@ class EvidenceGraphBuilder:
                 if u_pw:
                     pw_links.append(EvidenceLink("Reactome", "Open Reactome Pathway", u_pw, pathway.reactome_id, "database"))
 
+                # ── Reaction-level decomposition (Phase 3) ─────────────────
+                # Look up target-specific reactions matching this pathway
+                target_evs = rxn_ev_by_target.get(norm_uniprot, [])
+                if gene_sym_u:
+                    target_evs = target_evs + [e for e in rxn_ev_by_target.get(gene_sym_u, []) if e not in target_evs]
+
+                for rev in target_evs:
+                    if rev.pathway_id == pathway.reactome_id:
+                        rxn_id = f"{_NODE_REACTION}:{rev.reaction_id}"
+                        graph.add_node(GraphNode(
+                            rxn_id,
+                            _NODE_REACTION,
+                            f"{rev.reaction_name} ({rev.reaction_id})",
+                            meta={
+                                "reaction_id": rev.reaction_id,
+                                "schema_class": rev.schema_class,
+                                "species": rev.species,
+                                "compartment": rev.compartment,
+                                "disease_context": rev.disease_context,
+                            },
+                        ))
+
+                        role_pred = _ROLE_TO_PREDICATE.get(rev.target_role.upper(), rev.target_role.upper())
+                        rxn_links: list[EvidenceLink] = []
+                        u_rxn = SourceURLBuilder.reactome_url(rev.reaction_id)
+                        if u_rxn:
+                            rxn_links.append(EvidenceLink("Reactome", "Open Reactome Reaction", u_rxn, rev.reaction_id, "database"))
+
+                        # Phase 4B: typed polarity + causal grounding for Reactome reaction roles
+                        rxn_polarity = reactome_role_to_polarity(rev.target_role)
+                        rxn_grounding = reactome_role_to_grounding(rev.target_role)
+
+                        # Target -> Reaction
+                        graph.add_edge(GraphEdge(
+                            source_id=target_id,
+                            target_id=rxn_id,
+                            predicate=role_pred,
+                            evidence_strength=participation_strength,
+                            source="Reactome",
+                            provenance=f"target-specific reaction role: {rev.target_role} in {rev.reaction_name}",
+                            links=rxn_links,
+                            data_quality="EVIDENCE_BACKED",
+                            direction=rev.direction,
+                            relationship_type=role_pred,
+                            source_id_ref=rev.reaction_id,
+                            evidence_type="CURATED_REACTION",
+                            context={
+                                "target_role": rev.target_role,
+                                "schema_class": rev.schema_class,
+                                "species": rev.species,
+                                "compartment": rev.compartment,
+                                "disease_context": rev.disease_context,
+                            },
+                            polarity=rxn_polarity,
+                            causal_grounding=rxn_grounding,
+                        ))
+
+                        # Reaction -> Pathway
+                        graph.add_edge(GraphEdge(
+                            source_id=rxn_id,
+                            target_id=pathway_id,
+                            predicate="PART_OF",
+                            evidence_strength=1.0,
+                            source="Reactome",
+                            provenance=f"reaction {rev.reaction_id} is part of pathway {pathway.name}",
+                            links=pw_links,
+                            data_quality="EVIDENCE_BACKED",
+                            direction="UNKNOWN",
+                            relationship_type="PART_OF",
+                            source_id_ref=pathway.reactome_id,
+                            evidence_type="CURATED_REACTION",
+                            context={"mapping_type": rev.mapping_type},
+                        ))
+
+                # Retain baseline broad pathway participation edge
                 graph.add_edge(GraphEdge(
                     source_id=target_id,
                     target_id=pathway_id,
@@ -672,4 +800,6 @@ class EvidenceGraphBuilder:
                 "edges": len(graph.edges),
             },
         )
-        return graph
+        # Phase 4B: return (graph, resolver) so callers can pass resolver to
+        # AdvancedConflictResolver for canonical entity gating.
+        return graph, resolver

@@ -349,6 +349,66 @@ class PDFReporter:
                     story.append(Paragraph(f"<b>Missing evidence:</b> {gap}", body_style))
                 story.append(Spacer(1, 0.2 * cm))
 
+            # ── Dedicated Reaction-Enriched Evidence Section (Phase 3) ────
+            reaction_rows: list[list[Any]] = [["Target", "Reaction / Event", "Role", "Pathway", "Direction", "Source"]]
+            seen_rxn_keys = set()
+            for cand in cands:
+                hops = cand.get("hops", [])
+                for i, h in enumerate(hops):
+                    to_node = str(h.get("to_node", ""))
+                    if "Reaction:" in to_node or "REACTION:" in to_node:
+                        from_node = str(h.get("from_node", ""))
+                        target_name = from_node.replace("Target:", "").replace("TARGET:", "").strip()
+                        rxn_name = to_node.replace("Reaction:", "").replace("REACTION:", "").strip()
+                        role_name = str(h.get("predicate", "PARTICIPATES_IN")).replace("_", " ")
+                        direction_str = str(h.get("directionality", "UNKNOWN"))
+                        source_db = str(h.get("source_database", "Reactome"))
+                        
+                        # Find containing pathway from the next hop
+                        pw_name = "—"
+                        if i + 1 < len(hops):
+                            next_to = str(hops[i + 1].get("to_node", ""))
+                            if "Pathway:" in next_to or "PATHWAY:" in next_to:
+                                pw_name = next_to.replace("Pathway:", "").replace("PATHWAY:", "").strip()
+                        
+                        rk = (target_name, rxn_name, role_name)
+                        if rk not in seen_rxn_keys:
+                            seen_rxn_keys.add(rk)
+                            reaction_rows.append([
+                                target_name[:25],
+                                rxn_name[:40],
+                                role_name[:20],
+                                pw_name[:35],
+                                direction_str,
+                                source_db,
+                            ])
+
+            if len(reaction_rows) > 1:
+                story.append(Spacer(1, 0.2 * cm))
+                story.append(Paragraph("Reaction-Enriched Mechanistic Evidence (Phase 3)", section_style))
+                story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
+                story.append(Paragraph(
+                    "<font color='#64748b' size='8'><i>Reactome reaction evidence describes the target's molecular role within the reaction. "
+                    "It does not by itself establish therapeutic activation or inhibition. Direction defaults to UNKNOWN.</i></font>",
+                    body_style
+                ))
+                story.append(Spacer(1, 0.15 * cm))
+                rxn_table = Table(reaction_rows, colWidths=[3 * cm, 4.5 * cm, 2.5 * cm, 4.5 * cm, 2 * cm, 1.5 * cm])
+                rxn_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d97706")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#fffbeb"), colors.white]),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ]))
+                story.append(rxn_table)
+                story.append(Spacer(1, 0.2 * cm))
+
         # ── Sources Accessed ──────────────────────────────────
         srcs = getattr(result.audit_report, "sources_accessed", []) or []
         if srcs:

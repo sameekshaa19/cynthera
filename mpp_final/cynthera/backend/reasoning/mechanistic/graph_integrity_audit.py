@@ -148,7 +148,7 @@ class GraphIntegrityAuditor:
         # 2. Build graph if not supplied (read-only)
         if graph is None:
             builder = EvidenceGraphBuilder()
-            graph = builder.build(package)
+            graph, _ = builder.build(package)
 
         # 3. Node Inventory
         nodes_by_type: dict[str, int] = defaultdict(int)

@@ -43,6 +43,15 @@ class MechanismHop(BaseModel):
     evidence_type: str = Field(default="STRUCTURAL", description="DIRECT | CURATED | STRUCTURAL | LITERATURE")
     supporting_claims: list[dict[str, Any]] = Field(default_factory=list)
     contradicting_claims: list[dict[str, Any]] = Field(default_factory=list)
+    # Phase 4B: typed directional fields for this hop's incoming edge
+    polarity: str = Field(
+        default="UNKNOWN",
+        description="Phase 4B molecular polarity: POSITIVE | NEGATIVE | UNKNOWN",
+    )
+    causal_grounding: str = Field(
+        default="STRUCTURAL",
+        description="Phase 4B causal grounding: DIRECT | CURATED | INFERRED | STRUCTURAL | NONE",
+    )
 
 
 class CandidateMechanism(BaseModel):
@@ -73,6 +82,27 @@ class CandidateMechanism(BaseModel):
     score_explanation: list[str] = Field(default_factory=list)
     missing_critical_evidence: list[str] = Field(default_factory=list)
     contradictions: list[dict[str, Any]] = Field(default_factory=list)
+    # Phase 4B: path-level directional evidence fields
+    directional_polarity: str = Field(
+        default="UNKNOWN",
+        description="Phase 4B net path polarity: POSITIVE | NEGATIVE | UNKNOWN",
+    )
+    causal_grounding_level: str = Field(
+        default="NONE",
+        description="Phase 4B causal grounding of best-grounded edge: DIRECT | CURATED | STRUCTURAL | NONE",
+    )
+    grounded_edge_count: int = Field(
+        default=0,
+        ge=0,
+        description="Phase 4B number of edges with curated/direct directional evidence.",
+    )
+    therapeutic_direction: str = Field(
+        default="UNKNOWN",
+        description=(
+            "Phase 4B placeholder: always UNKNOWN. "
+            "Therapeutic direction (SUPPORTS/CONTRADICTS) requires Phase 4C disease-state evidence."
+        ),
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,6 +128,9 @@ class CandidateMechanism(BaseModel):
                     "evidence_type": h.evidence_type,
                     "supporting_claims": h.supporting_claims,
                     "contradicting_claims": h.contradicting_claims,
+                    # Phase 4B fields
+                    "polarity": h.polarity,
+                    "causal_grounding": h.causal_grounding,
                 }
                 for h in self.hops
             ],
@@ -108,4 +141,9 @@ class CandidateMechanism(BaseModel):
             "score_explanation": self.score_explanation,
             "missing_critical_evidence": self.missing_critical_evidence,
             "contradictions": self.contradictions,
+            # Phase 4B fields
+            "directional_polarity": self.directional_polarity,
+            "causal_grounding_level": self.causal_grounding_level,
+            "grounded_edge_count": self.grounded_edge_count,
+            "therapeutic_direction": self.therapeutic_direction,
         }

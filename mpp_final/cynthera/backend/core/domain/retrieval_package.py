@@ -17,6 +17,7 @@ from backend.core.domain.pathway import Pathway
 from backend.core.domain.evidence import Evidence
 from backend.core.domain.clinical_trial import ClinicalTrial
 from backend.core.domain.approval_signal import ApprovalSignal
+from backend.core.domain.reactome_reaction_evidence import ReactomeReactionEvidence
 from backend.core.value_objects.biological_identifier import BiologicalIdentifierMapping
 
 
@@ -95,6 +96,10 @@ class RetrievalPackage(BaseModel):
     identifier_mappings: list[BiologicalIdentifierMapping] = Field(
         default_factory=list,
         description="Preserved source-provided biological identifier mappings from Open Targets, Reactome, etc.",
+    )
+    reactome_reaction_evidence: list[ReactomeReactionEvidence] = Field(
+        default_factory=list,
+        description="Preserved target-specific Reactome reaction and event level evidence records.",
     )
 
 

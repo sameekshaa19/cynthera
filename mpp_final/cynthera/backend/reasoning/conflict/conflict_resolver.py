@@ -17,11 +17,17 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.core.domain.claim import Claim
 from backend.core.domain.contradiction import Contradiction
 from backend.core.enums.predicate_type import PredicateType
+
+# Phase 4B: Canonical entity gating — only imported when resolver is provided
+if TYPE_CHECKING:
+    from backend.reasoning.normalization.biological_identifier_resolver import (
+        BiologicalIdentifierResolver,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +156,21 @@ class AdvancedConflictResolver:
     def __init__(self) -> None:
         logger.info("AdvancedConflictResolver initialized")
 
-    def resolve(self, claims: list[Claim]) -> ConflictResolutionReport:
+    def resolve(
+        self,
+        claims: list[Claim],
+        resolver: "BiologicalIdentifierResolver | None" = None,
+    ) -> ConflictResolutionReport:
         """Detect and resolve all conflicts between claims.
 
         Args:
-            claims: All extracted claims from the reasoning pipeline.
+            claims:   All extracted claims from the reasoning pipeline.
+            resolver: Optional BiologicalIdentifierResolver for Phase 4B canonical entity gating.
+                      When provided, claims must reference canonically resolved biological entities
+                      on BOTH subject AND object before they can be compared for contradiction.
+                      Ungrounded claims (e.g. subject='compound', object='molecular target') are
+                      silently skipped and logged as 'contradiction_skipped_ungrounded'.
+                      When None (default), existing behavior is preserved unchanged.
 
         Returns:
             ConflictResolutionReport with raw contradictions and resolutions.
@@ -183,6 +199,25 @@ class AdvancedConflictResolver:
 
                 if claim_a is None or claim_b is None:
                     continue
+
+                # Phase 4B: Canonical entity gating.
+                # Skip contradictions where either claim's subject or object is
+                # a generic ungrounded token (e.g. "compound", "molecular target").
+                if resolver is not None:
+                    from backend.reasoning.directional.canonical_entity_gate import claims_are_comparable
+                    if not claims_are_comparable(claim_a, claim_b, resolver):
+                        logger.debug(
+                            "contradiction_skipped_ungrounded",
+                            extra={
+                                "subject_a": claim_a.subject,
+                                "object_a": claim_a.object,
+                                "subject_b": claim_b.subject,
+                                "object_b": claim_b.object,
+                                "predicate_a": pred_a.value,
+                                "predicate_b": pred_b.value,
+                            },
+                        )
+                        continue
 
                 # Compute weighted scores
                 weight_a = self._compute_claim_weight(claim_a)

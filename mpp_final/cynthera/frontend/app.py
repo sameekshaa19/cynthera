@@ -256,6 +256,132 @@ hr {
 .stAlert {
     border-radius: 8px !important;
 }
+
+/* ─────────────────────────────────────────────
+ * Phase 3 Reaction Layer & Node Chain Styles
+ * ───────────────────────────────────────────── */
+.node-chain-container {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 0.5rem;
+    padding: 0.85rem;
+    background: #0b1120;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    margin-bottom: 0.85rem;
+}
+
+.node-chip {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 0.5rem 0.85rem;
+    border-radius: 8px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    min-width: 130px;
+    flex: 1;
+}
+
+.node-chip-drug {
+    background: rgba(59, 130, 246, 0.12);
+    border-color: rgba(59, 130, 246, 0.45);
+}
+.node-chip-target {
+    background: rgba(139, 92, 246, 0.12);
+    border-color: rgba(139, 92, 246, 0.45);
+}
+.node-chip-reaction {
+    background: rgba(245, 158, 11, 0.14);
+    border-color: rgba(245, 158, 11, 0.55);
+}
+.node-chip-pathway {
+    background: rgba(6, 182, 212, 0.12);
+    border-color: rgba(6, 182, 212, 0.45);
+}
+.node-chip-gene {
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.45);
+}
+.node-chip-disease {
+    background: rgba(244, 63, 94, 0.12);
+    border-color: rgba(244, 63, 94, 0.45);
+}
+
+.node-header {
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.15rem;
+}
+
+.node-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #f1f5f9;
+    line-height: 1.25;
+}
+
+.node-sub {
+    font-size: 0.72rem;
+    color: #94a3b8;
+    margin-top: 0.2rem;
+    font-family: monospace;
+}
+
+.arrow-divider {
+    color: #64748b;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.25rem;
+    font-weight: 700;
+}
+
+.arrow-label {
+    font-size: 0.65rem;
+    color: #818cf8;
+    font-weight: 600;
+    margin-bottom: 0.1rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.role-badge {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.direction-badge {
+    display: inline-block;
+    padding: 0.2rem 0.55rem;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    border: 1px solid #334155;
+    background: rgba(30, 41, 59, 0.6);
+    color: #94a3b8;
+}
+
+.disclaimer-box {
+    background: rgba(30, 41, 59, 0.35);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-left: 3px solid #64748b;
+    border-radius: 6px;
+    padding: 0.65rem 0.9rem;
+    color: #94a3b8;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    margin-bottom: 0.85rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -336,6 +462,38 @@ def render_recommendation_badge(status: str) -> None:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+
+_ROLE_CONFIG = {
+    "CATALYST": ("#f59e0b", "rgba(245, 158, 11, 0.15)", "#fbbf24"),
+    "INPUT": ("#3b82f6", "rgba(59, 130, 246, 0.15)", "#60a5fa"),
+    "OUTPUT": ("#10b981", "rgba(16, 185, 129, 0.15)", "#34d399"),
+    "COMPLEX_COMPONENT": ("#8b5cf6", "rgba(139, 92, 246, 0.15)", "#a78bfa"),
+    "ENTITY_SET_MEMBER": ("#ec4899", "rgba(236, 72, 153, 0.15)", "#f472b6"),
+    "POSITIVE_REGULATOR": ("#10b981", "rgba(16, 185, 129, 0.15)", "#34d399"),
+    "NEGATIVE_REGULATOR": ("#ef4444", "rgba(239, 68, 68, 0.15)", "#f87171"),
+    "REQUIREMENT": ("#06b6d4", "rgba(6, 182, 212, 0.15)", "#22d3ee"),
+    "PARTICIPANT": ("#64748b", "rgba(100, 116, 139, 0.15)", "#94a3b8"),
+    "UNKNOWN": ("#64748b", "rgba(100, 116, 139, 0.15)", "#94a3b8"),
+}
+
+
+def get_role_badge_html(role_str: str) -> str:
+    clean_role = role_str.upper().replace(" ", "_") if role_str else "UNKNOWN"
+    color, bg, border = _ROLE_CONFIG.get(clean_role, ("#64748b", "rgba(100, 116, 139, 0.15)", "#94a3b8"))
+    display_label = clean_role.replace("_", " ")
+    return f'<span class="role-badge" style="color: {color}; background: {bg}; border: 1px solid {border};">{display_label}</span>'
+
+
+def get_direction_badge_html(direction_str: str) -> str:
+    d = (direction_str or "UNKNOWN").upper()
+    if d == "POSITIVE":
+        return '<span class="direction-badge" style="color: #10b981; border-color: #10b98155; background: rgba(16,185,129,0.12);" title="Curated positive regulation (activation/stimulation)">Direction: POSITIVE</span>'
+    elif d == "NEGATIVE":
+        return '<span class="direction-badge" style="color: #ef4444; border-color: #ef444455; background: rgba(239,68,68,0.12);" title="Curated negative regulation (inhibition/repression)">Direction: NEGATIVE</span>'
+    else:
+        return '<span class="direction-badge" style="color: #94a3b8; border-color: #334155; background: rgba(30,41,59,0.6);" title="No explicit regulatory polarity established">Direction: UNKNOWN</span>'
+
 
 
 # ─────────────────────────────────────────────
@@ -598,17 +756,31 @@ elif page == "📊 Results":
 
         st.markdown("---")
 
-        # Evidence summary
+        # Evidence summary with Phase 3 Reaction Metrics
+        rxn_evidence = getattr(pkg, "reactome_reaction_evidence", []) or []
+        unique_rxn_ids = set(r.reaction_id for r in rxn_evidence if hasattr(r, "reaction_id"))
+        cands = getattr(result.audit_report, "candidate_mechanisms", []) or getattr(result.mechanistic_assessment, "candidate_mechanisms", []) or []
+        
+        # Count reaction-enriched candidate mechanisms
+        enriched_cand_count = sum(
+            1 for c in cands if any(
+                "REACTION" in str(h.get("from_node", "")).upper() or "REACTION" in str(h.get("to_node", "")).upper()
+                for h in c.get("hops", [])
+            )
+        )
+
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("### 📊 Evidence Summary")
+            st.markdown("### 📊 Evidence & Pathway Summary")
             st.markdown(f"""
             <div class="info-panel">
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                    <div><div style="font-size: 1.8rem; font-weight: 700; color: #3b82f6;">{len(pkg.evidence_records)}</div><div style="color: #94a3b8; font-size: 0.8rem;">Evidence Records</div></div>
-                    <div><div style="font-size: 1.8rem; font-weight: 700; color: #8b5cf6;">{len(pkg.targets)}</div><div style="color: #94a3b8; font-size: 0.8rem;">Drug Targets</div></div>
-                    <div><div style="font-size: 1.8rem; font-weight: 700; color: #06b6d4;">{len(pkg.clinical_trials)}</div><div style="color: #94a3b8; font-size: 0.8rem;">Clinical Trials</div></div>
-                    <div><div style="font-size: 1.8rem; font-weight: 700; color: #10b981;">{len(result.contradictions)}</div><div style="color: #94a3b8; font-size: 0.8rem;">Contradictions</div></div>
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem;">
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #3b82f6;">{len(cands) or (1 if result.mechanistic_assessment.mechanistic_chain else 0)}</div><div style="color: #94a3b8; font-size: 0.75rem;">Mechanistic Paths</div></div>
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #f59e0b;">{enriched_cand_count}</div><div style="color: #94a3b8; font-size: 0.75rem;">Reaction-Enriched</div></div>
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #10b981;">{len(unique_rxn_ids)}</div><div style="color: #94a3b8; font-size: 0.75rem;">Reactome Reactions</div></div>
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #8b5cf6;">{len(pkg.targets)}</div><div style="color: #94a3b8; font-size: 0.75rem;">Drug Targets</div></div>
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #06b6d4;">{len(pkg.pathways)}</div><div style="color: #94a3b8; font-size: 0.75rem;">Reactome Pathways</div></div>
+                    <div><div style="font-size: 1.6rem; font-weight: 700; color: #ec4899;">{len(pkg.evidence_records)}</div><div style="color: #94a3b8; font-size: 0.75rem;">Evidence Records</div></div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -628,34 +800,115 @@ elif page == "📊 Results":
             </div>
             """, unsafe_allow_html=True)
 
-        # Candidate Biological Mechanisms Discovery Display
-        cands = getattr(result.audit_report, "candidate_mechanisms", []) or getattr(result.mechanistic_assessment, "candidate_mechanisms", []) or []
+        # ── Candidate Biological Mechanisms Discovery Display (Phase 3 Enriched) ──
         if cands:
             st.markdown("### 🧬 Candidate Biological Mechanisms Discovered")
-            for cand in cands[:4]:
+            
+            for cand in cands[:5]:
                 c_idx = cand.get("candidate_index", 1)
                 c_name = cand.get("name", f"Mechanism {c_idx}")
                 c_level = cand.get("support_level", "MODERATELY_SUPPORTED")
                 c_conf = cand.get("confidence_score", 0.5)
                 c_chain = cand.get("summary_chain", [])
                 c_status = cand.get("discovery_status", "CANDIDATE_STRUCTURAL")
+                hops = cand.get("hops", [])
+
+                has_reaction_hop = any(
+                    "REACTION" in str(h.get("from_node", "")).upper() or "REACTION" in str(h.get("to_node", "")).upper()
+                    for h in hops
+                ) or any("REACTION" in str(node).upper() for node in c_chain)
 
                 badge_color = "#10b981" if "STRONGLY" in c_level else ("#f59e0b" if "MODERATELY" in c_level else "#ef4444")
                 badge_bg = "rgba(16,185,129,0.12)" if "STRONGLY" in c_level else ("rgba(245,158,11,0.12)" if "MODERATELY" in c_level else "rgba(239,68,68,0.12)")
+                path_type_badge = (
+                    '<span style="background: rgba(245,158,11,0.18); border: 1px solid #f59e0b; color: #fbbf24; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 700; font-size: 0.72rem; margin-right: 0.5rem;">⚡ 5-HOP REACTION-ENRICHED</span>'
+                    if has_reaction_hop else
+                    '<span style="background: rgba(59,130,246,0.15); border: 1px solid #3b82f6; color: #60a5fa; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 700; font-size: 0.72rem; margin-right: 0.5rem;">🔬 4-HOP DIRECT PATHWAY</span>'
+                )
 
                 st.markdown(f"""
-                <div class="info-panel" style="border-left: 4px solid {badge_color}; margin-bottom: 1rem;">
+                <div class="info-panel" style="border-left: 4px solid {badge_color}; margin-bottom: 0.75rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div style="font-weight: 700; font-size: 1.1rem; color: #f8fafc;">{c_name}</div>
+                        <div>
+                            {path_type_badge}
+                            <span style="font-weight: 700; font-size: 1.05rem; color: #f8fafc;">{c_name}</span>
+                        </div>
                         <div style="background: {badge_bg}; border: 1px solid {badge_color}; color: {badge_color}; padding: 0.2rem 0.6rem; border-radius: 6px; font-weight: 700; font-size: 0.8rem;">
                             {c_level.replace('_', ' ')} ({c_conf:.1%})
                         </div>
                     </div>
-                    <div style="color: #94a3b8; margin-top: 0.35rem; font-size: 0.82rem;">{c_status.replace('_', ' ')}</div>
+                    <div style="color: #94a3b8; margin-top: 0.35rem; font-size: 0.82rem;">Discovery Status: {c_status.replace('_', ' ')}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
-                if c_chain:
+                # Render structured multi-node visual chain (Drug → Target → Reaction → Pathway → Gene → Disease)
+                if hops:
+                    chain_chips_html = []
+                    for h_i, h in enumerate(hops):
+                        from_raw = h.get("from_node", "")
+                        to_raw = h.get("to_node", "")
+                        pred = h.get("predicate", "MODULATES")
+
+                        # Parse from_node on the very first hop
+                        if h_i == 0:
+                            f_label, _, f_val = from_raw.partition(":")
+                            f_lbl_clean = f_label.strip().upper()
+                            chip_cls = "node-chip-drug" if "DRUG" in f_lbl_clean else "node-chip-target"
+                            f_header_col = "#60a5fa" if "DRUG" in f_lbl_clean else "#a78bfa"
+                            chain_chips_html.append(f"""
+                            <div class="node-chip {chip_cls}">
+                                <div class="node-header" style="color: {f_header_col};">{f_label.strip()}</div>
+                                <div class="node-title">{f_val.strip() or f_label.strip()}</div>
+                            </div>
+                            """)
+
+                        # Divider arrow
+                        chain_chips_html.append(f"""
+                        <div class="arrow-divider">
+                            <span class="arrow-label">{pred.replace('_', ' ')}</span>
+                            <span>↓</span>
+                        </div>
+                        """)
+
+                        # Parse to_node
+                        t_label, _, t_val = to_raw.partition(":")
+                        t_lbl_clean = t_label.strip().upper()
+                        if "TARGET" in t_lbl_clean or "PROTEIN" in t_lbl_clean:
+                            chip_cls = "node-chip-target"
+                            t_header_col = "#a78bfa"
+                            sub_text = f"UniProt: {h.get('canonical_to_id')}" if h.get('canonical_to_id') else ""
+                        elif "REACTION" in t_lbl_clean:
+                            chip_cls = "node-chip-reaction"
+                            t_header_col = "#fbbf24"
+                            sub_text = "Reactome Curated Event"
+                        elif "PATHWAY" in t_lbl_clean:
+                            chip_cls = "node-chip-pathway"
+                            t_header_col = "#22d3ee"
+                            sub_text = "Reactome Pathway"
+                        elif "GENE" in t_lbl_clean:
+                            chip_cls = "node-chip-gene"
+                            t_header_col = "#34d399"
+                            sub_text = "Disease-Associated Gene"
+                        elif "DISEASE" in t_lbl_clean:
+                            chip_cls = "node-chip-disease"
+                            t_header_col = "#f43f5e"
+                            sub_text = "Indication"
+                        else:
+                            chip_cls = "node-chip"
+                            t_header_col = "#94a3b8"
+                            sub_text = ""
+
+                        sub_html = f'<div class="node-sub">{sub_text}</div>' if sub_text else ""
+                        chain_chips_html.append(f"""
+                        <div class="node-chip {chip_cls}">
+                            <div class="node-header" style="color: {t_header_col};">{t_label.strip()}</div>
+                            <div class="node-title">{t_val.strip() or t_label.strip()}</div>
+                            {sub_html}
+                        </div>
+                        """)
+
+                    st.markdown(f'<div class="node-chain-container">{"".join(chain_chips_html)}</div>', unsafe_allow_html=True)
+                elif c_chain:
                     chain_html = " → ".join(
                         f'<span style="background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-family: monospace;">{node}</span>'
                         for node in c_chain
@@ -665,8 +918,7 @@ elif page == "📊 Results":
                         unsafe_allow_html=True,
                     )
 
-                # Hop-level evidence links
-                hops = cand.get("hops", [])
+                # Hop-level evidence expander
                 if hops:
                     with st.expander(f"🔬 Candidate Mechanism {c_idx} — Step-by-Step Biological Evidence & Links"):
                         for h in hops:
@@ -709,6 +961,125 @@ elif page == "📊 Results":
                             st.caption(explanation)
                         for gap in cand.get("missing_critical_evidence", []):
                             st.info(f"Missing evidence: {gap}")
+        elif result.mechanistic_assessment.mechanistic_chain:
+            st.markdown("### 🔗 Mechanistic Chain")
+            chain = result.mechanistic_assessment.mechanistic_chain
+            chain_html = " → ".join(
+                f'<span style="background: #1a2235; border: 1px solid #2a3a55; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.85rem;">{node}</span>'
+                for node in chain
+            )
+            st.markdown(
+                f'<div class="info-panel"><div style="display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;">{chain_html}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Dedicated Reactome Reaction & Event Evidence Cards (Phase 3) ──
+        if rxn_evidence:
+            st.markdown("---")
+            st.markdown("### ⚡ Reactome Reaction & Molecular Event Evidence")
+            st.markdown("""
+            <div class="disclaimer-box">
+                ℹ️ <b>Biological Role Context:</b> Reactome reaction evidence describes the target's specific molecular role within the reaction/event.
+                It establishes molecular participation without converting catalyst/structural roles into unsupported therapeutic activation or inhibition claims.
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Filtering if multiple reactions exist
+            roles_present = sorted(list(set(
+                (r.target_role.value if hasattr(r.target_role, "value") else str(r.target_role)).upper()
+                for r in rxn_evidence
+            )))
+            filter_col1, filter_col2 = st.columns([2, 2])
+            with filter_col1:
+                selected_role_filter = st.selectbox(
+                    "Filter by Target Role",
+                    ["ALL ROLES"] + roles_present,
+                    index=0,
+                    key="rxn_role_filter",
+                )
+            with filter_col2:
+                selected_dir_filter = st.selectbox(
+                    "Filter by Direction",
+                    ["ALL DIRECTIONS", "UNKNOWN", "POSITIVE", "NEGATIVE"],
+                    index=0,
+                    key="rxn_dir_filter",
+                )
+
+            filtered_ev = rxn_evidence
+            if selected_role_filter != "ALL ROLES":
+                filtered_ev = [
+                    r for r in filtered_ev
+                    if (r.target_role.value if hasattr(r.target_role, "value") else str(r.target_role)).upper() == selected_role_filter
+                ]
+            if selected_dir_filter != "ALL DIRECTIONS":
+                filtered_ev = [
+                    r for r in filtered_ev
+                    if (getattr(r, "direction", "UNKNOWN") or "UNKNOWN").upper() == selected_dir_filter
+                ]
+
+            st.caption(f"Showing {len(filtered_ev)} of {len(rxn_evidence)} Reactome reaction evidence records")
+
+            # Group evidence by target symbol / reaction
+            for ev_i, ev in enumerate(filtered_ev):
+                role_val = ev.target_role.value if hasattr(ev.target_role, "value") else str(ev.target_role)
+                dir_val = getattr(ev, "direction", "UNKNOWN") or "UNKNOWN"
+                rxn_name = ev.reaction_name or "Reaction Event"
+                rxn_id = ev.reaction_id or "R-HSA-UNKNOWN"
+                pw_name = ev.pathway_name or "Reactome Pathway"
+                pw_id = ev.pathway_id or ""
+                target_sym = getattr(ev, "target_canonical_id", None) or getattr(ev, "target_symbol", "Target")
+                uniprot_acc = getattr(ev, "target_original_id", None) or getattr(ev, "target_uniprot", "")
+
+                role_badge_html = get_role_badge_html(role_val)
+                dir_badge_html = get_direction_badge_html(dir_val)
+                rxn_url = f"https://reactome.org/content/detail/{rxn_id}"
+                pw_url = f"https://reactome.org/content/detail/{pw_id}" if pw_id else "#"
+
+                st.markdown(f"""
+                <div style="background: #111827; border: 1px solid #1f2937; border-left: 4px solid #f59e0b; border-radius: 8px; padding: 0.85rem 1.1rem; margin-bottom: 0.75rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.4rem;">
+                        <div>
+                            <span style="font-size: 0.72rem; font-weight: 700; color: #fbbf24; text-transform: uppercase; letter-spacing: 0.06em;">⚡ REACTOME REACTION</span>
+                            <div style="font-size: 1.05rem; font-weight: 700; color: #f8fafc; margin-top: 0.15rem;">
+                                {rxn_name}
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 0.4rem; align-items: center;">
+                            {role_badge_html}
+                            {dir_badge_html}
+                        </div>
+                    </div>
+                    <div style="display: flex; flex-wrap: wrap; gap: 1.2rem; font-size: 0.82rem; color: #94a3b8; margin-top: 0.4rem; padding-top: 0.4rem; border-top: 1px solid #1e293b;">
+                        <div><b>Target:</b> <span style="color: #cbd5e1;">{target_sym}</span> <span style="color: #64748b; font-family: monospace;">({uniprot_acc})</span></div>
+                        <div><b>Reactome ID:</b> <a href="{rxn_url}" target="_blank" style="color: #60a5fa; text-decoration: none; font-family: monospace;">{rxn_id} ↗</a></div>
+                        <div><b>Containing Pathway:</b> <a href="{pw_url}" target="_blank" style="color: #22d3ee; text-decoration: none;">{pw_name} ({pw_id}) ↗</a></div>
+                        <div><b>Evidence Source:</b> <span style="color: #10b981;">Reactome · Curated Reaction</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                with st.expander(f"📋 View Full Reaction & Provenance Details — {rxn_id}"):
+                    d_col1, d_col2 = st.columns(2)
+                    with d_col1:
+                        st.markdown(f"**Target Canonical Symbol:** `{target_sym}`")
+                        st.markdown(f"**Target UniProt Accession:** `{uniprot_acc}`")
+                        st.markdown(f"**Reactome Reaction StId:** [`{rxn_id}`]({rxn_url})")
+                        st.markdown(f"**Schema Class:** `{getattr(ev, 'schema_class', 'Reaction')}`")
+                        st.markdown(f"**Target Role:** `{role_val}`")
+                        st.markdown(f"**Directionality:** `{dir_val}` (No causal polarity assumed)")
+                    with d_col2:
+                        st.markdown(f"**Pathway ID:** [`{pw_id}`]({pw_url})")
+                        st.markdown(f"**Pathway Name:** {pw_name}")
+                        st.markdown(f"**Mapping Type:** `{getattr(ev, 'mapping_type', 'DIRECT_PATHWAY_MAPPING')}`")
+                        st.markdown(f"**Species:** `{getattr(ev, 'species', 'Homo sapiens')}`")
+                        cmps = getattr(ev, "compartment", []) or []
+                        st.markdown(f"**Compartment:** {', '.join(cmps) if cmps else 'Unspecified'}")
+                        dis_ctx = getattr(ev, "disease_context", None)
+                        st.markdown(f"**Disease Context:** {dis_ctx or 'Normal Physiology'}")
+
+                    prov = getattr(ev, "provenance", {}) or {}
+                    if prov:
+                        st.caption(f"Provenance Source: {prov.get('source', 'reactome')} | Retrieved: {prov.get('retrieved_at', 'Session')}")
         elif result.mechanistic_assessment.mechanistic_chain:
             st.markdown("### 🔗 Mechanistic Chain")
             chain = result.mechanistic_assessment.mechanistic_chain

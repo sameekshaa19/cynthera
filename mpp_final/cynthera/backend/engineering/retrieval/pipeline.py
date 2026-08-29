@@ -20,6 +20,7 @@ from backend.core.domain.evidence import Evidence
 from backend.core.domain.clinical_trial import ClinicalTrial
 from backend.core.domain.retrieval_package import RetrievalPackage
 from backend.core.domain.approval_signal import ApprovalSignal
+from backend.core.domain.reactome_reaction_evidence import ReactomeReactionEvidence
 from backend.core.value_objects.biological_identifier import BiologicalIdentifierMapping
 from backend.core.enums.evidence_type import EvidenceType
 from backend.core.enums.trial_outcome import TrialOutcomeStatus
@@ -142,12 +143,17 @@ class RetrievalPipeline:
 
         # Extract unique UniProt IDs from targets to fetch in Phase 2
         uniprot_ids = list(set(t.protein_uniprot for t in targets if t.protein_uniprot))
+        uniprot_to_sym: dict[str, str] = {}
+        for t in targets:
+            if t.protein_uniprot:
+                # Target entity might have mechanism/provenance, symbol resolved in UniProt/Reactome
+                uniprot_to_sym[t.protein_uniprot] = getattr(t, "gene_symbol", "")
 
         # --- Phase 2: Parallel Fetch (core sources) ---
         results = await asyncio.gather(
             self._fetch_uniprot(uniprot_ids),
             self._fetch_pubmed(drug.name, disease.name),
-            self._fetch_reactome(uniprot_ids),
+            self._fetch_reactome(uniprot_ids, uniprot_to_sym),
             self._fetch_clinicaltrials(drug.name, disease.name),
             self._fetch_disgenet(disease),
             return_exceptions=True,
@@ -198,14 +204,16 @@ class RetrievalPipeline:
 
         # Collect source-provided biological identifier mappings
         identifier_mappings: list[BiologicalIdentifierMapping] = []
+        reactome_reaction_evidence: list[ReactomeReactionEvidence] = []
 
-        # Process Reactome pathways
+        # Process Reactome pathways & reactions
         if isinstance(reactome_data, Exception):
             sources_failed.append("reactome")
             logger.warning("reactome_failed", extra={"error": str(reactome_data)})
         else:
             sources_queried.append("reactome")
             pathways = self._parse_reactome_data(reactome_data)
+            reactome_reaction_evidence = reactome_data.get("reaction_evidence", [])
             for m in reactome_data.get("mappings", []):
                 if isinstance(m, BiologicalIdentifierMapping):
                     identifier_mappings.append(m)
@@ -335,6 +343,7 @@ class RetrievalPipeline:
             clinical_trial_retrieval_status=ct_status,
             validated_disease_genes=validated_disease_genes,
             identifier_mappings=identifier_mappings,
+            reactome_reaction_evidence=reactome_reaction_evidence,
         )
 
         # Pipeline summary: cache stats for this run
@@ -453,8 +462,12 @@ class RetrievalPipeline:
         async with PubMedConnector(api_key=self._ncbi_api_key) as conn:
             return await conn.fetch(drug_name, disease_name, max_results=50)
 
-    async def _fetch_reactome(self, uniprot_ids: list[str]) -> dict[str, Any]:
-        """Fetch biological pathways from Reactome and their UniProt participant lists.
+    async def _fetch_reactome(
+        self,
+        uniprot_ids: list[str],
+        uniprot_to_symbol: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch Reactome pathway and reaction/event data for target UniProt accessions.r UniProt participant lists.
 
         Two-phase retrieval:
           Phase 1 (forward): For each target UniProt ID, fetch which pathways contain it.
@@ -471,17 +484,22 @@ class RetrievalPipeline:
         async with ReactomeConnector() as conn:
             # Phase 1: forward direction — which pathways contain each protein?
             raw_pathways: list[dict] = []
+            target_to_pathways: dict[str, list[str]] = {}
 
             async def fetch_pathways_for_protein(uid: str) -> None:
                 cache_key = RawResponseCache.make_key("reactome_pathways", uid, "allForms")
                 if not self._bypass_raw_cache:
                     cached = self._raw_cache.get(cache_key, source_name="reactome_pathways")
                     if cached is not None:
-                        raw_pathways.extend(cached.get("pathways", []))
+                        pws = cached.get("pathways", [])
+                        raw_pathways.extend(pws)
+                        target_to_pathways[uid] = [p.get("stId") for p in pws if p.get("stId")]
                         return
                 try:
                     res = await conn.fetch(uid)
-                    raw_pathways.extend(res.get("pathways", []))
+                    pws = res.get("pathways", [])
+                    raw_pathways.extend(pws)
+                    target_to_pathways[uid] = [p.get("stId") for p in pws if p.get("stId")]
                     self._raw_cache.set(
                         cache_key, "reactome_pathways", uid, "allForms", res, TTL_STRUCTURAL
                     )
@@ -490,6 +508,7 @@ class RetrievalPipeline:
                         "reactome_fetch_one_failed",
                         extra={"uniprot_id": uid, "error": str(e)},
                     )
+                    target_to_pathways[uid] = []
 
             await asyncio.gather(*(fetch_pathways_for_protein(uid) for uid in uniprot_ids[:5]))
 
@@ -500,11 +519,255 @@ class RetrievalPipeline:
                 if stid and stid not in seen_stids:
                     seen_stids[stid] = pw
 
-            # Phase 2: reverse direction — for each unique pathway, who are the participants?
-            # Cap to 10 pathways to limit network load. Semaphore bounds concurrency to 3.
+            # Phase 2: reaction & event level evidence for target proteins
+            # Maps target -> specific reactions -> roles -> existing pathways
+            sem = asyncio.Semaphore(3)
+            reaction_evidence_list: list[ReactomeReactionEvidence] = []
+            target_reactions_map: dict[str, list[dict]] = {}
+
+            async def fetch_reactions_for_target(uid: str) -> None:
+                async with sem:
+                    cache_key = RawResponseCache.make_key(
+                        "reactome_target_reactions", uid, "reactions"
+                    )
+                    if not self._bypass_raw_cache:
+                        cached = self._raw_cache.get(
+                            cache_key, source_name="reactome_target_reactions"
+                        )
+                        if cached is not None and isinstance(cached, list):
+                            target_reactions_map[uid] = cached
+                            return
+                    res = await conn.fetch_reactions(uid)
+                    target_reactions_map[uid] = res
+                    self._raw_cache.set(
+                        cache_key, "reactome_target_reactions", uid, "reactions", res, TTL_STRUCTURAL
+                    )
+
+            await asyncio.gather(*(fetch_reactions_for_target(uid) for uid in uniprot_ids[:8]))
+
+            # Collect unique reactions across targets (capped to top 25 reactions)
+            unique_rxn_stids: list[str] = []
+            for uid, rxns in target_reactions_map.items():
+                for rxn in rxns:
+                    rst = rxn.get("stId")
+                    if rst and rst not in unique_rxn_stids:
+                        unique_rxn_stids.append(rst)
+
+            rxn_details_map: dict[str, dict] = {}
+            rxn_ancestors_map: dict[str, list] = {}
+            rxn_participants_map: dict[str, list] = {}
+
+            async def fetch_single_rxn_info(rst: str) -> None:
+                async with sem:
+                    # 1. Reaction details
+                    det_key = RawResponseCache.make_key("reactome_rxn_detail", rst, "detail")
+                    cached_det = self._raw_cache.get(det_key, source_name="reactome_rxn_detail") if not self._bypass_raw_cache else None
+                    if cached_det is not None and isinstance(cached_det, dict):
+                        det = cached_det
+                    else:
+                        det = await conn.fetch_reaction_details(rst)
+                        self._raw_cache.set(det_key, "reactome_rxn_detail", rst, "detail", det, TTL_STRUCTURAL)
+                    rxn_details_map[rst] = det
+
+                    # 2. Reaction ancestors
+                    anc_key = RawResponseCache.make_key("reactome_rxn_anc", rst, "ancestors")
+                    cached_anc = self._raw_cache.get(anc_key, source_name="reactome_rxn_anc") if not self._bypass_raw_cache else None
+                    if cached_anc is not None and isinstance(cached_anc, list):
+                        anc = cached_anc
+                    else:
+                        anc = await conn.fetch_reaction_ancestors(rst)
+                        self._raw_cache.set(anc_key, "reactome_rxn_anc", rst, "ancestors", anc, TTL_STRUCTURAL)
+                    rxn_ancestors_map[rst] = anc
+
+                    # 3. Participating entities
+                    part_key = RawResponseCache.make_key("reactome_rxn_part", rst, "entities")
+                    cached_part = self._raw_cache.get(part_key, source_name="reactome_rxn_part") if not self._bypass_raw_cache else None
+                    if cached_part is not None and isinstance(cached_part, list):
+                        part = cached_part
+                    else:
+                        part = await conn.fetch_participating_entities(rst)
+                        self._raw_cache.set(part_key, "reactome_rxn_part", rst, "entities", part, TTL_STRUCTURAL)
+                    rxn_participants_map[rst] = part
+
+            await asyncio.gather(*(fetch_single_rxn_info(rst) for rst in unique_rxn_stids[:25]))
+
+            # Construct ReactomeReactionEvidence records
+            seen_evidence_keys: set[tuple[str, str, str, str | None]] = set()
+
+            for uid, rxns in target_reactions_map.items():
+                for rxn in rxns:
+                    rst = rxn.get("stId")
+                    if not rst:
+                        continue
+                    det = rxn_details_map.get(rst, {})
+                    anc = rxn_ancestors_map.get(rst, [])
+                    part = rxn_participants_map.get(rst, [])
+
+                    # Species check (prefer Homo sapiens or unspecified)
+                    species_name = det.get("speciesName") or rxn.get("speciesName") or "Homo sapiens"
+                    if species_name and "homo sapiens" not in str(species_name).lower():
+                        continue
+
+                    # Extract roles
+                    target_sym = (uniprot_to_symbol or {}).get(uid) or ""
+                    roles = ReactomeConnector.extract_target_roles(
+                        det, part, uid, target_symbol=target_sym if target_sym else None
+                    )
+                    if not roles:
+                        roles = [{
+                            "role": "PARTICIPANT",
+                            "direction": "UNKNOWN",
+                            "raw_field": "reactions",
+                            "object_name": rxn.get("displayName", "Reaction"),
+                            "schema_class": rxn.get("schemaClass", "Reaction"),
+                        }]
+
+                    # Extract compartment
+                    compartment_list = det.get("compartment", [])
+                    compartments: list[str] = []
+                    if isinstance(compartment_list, list):
+                        for c in compartment_list:
+                            if isinstance(c, dict) and c.get("displayName"):
+                                compartments.append(str(c.get("displayName")))
+                    compartment_str = ", ".join(compartments) if compartments else None
+
+                    # Extract ancestor pathways
+                    ancestor_pathways: dict[str, str] = {}
+                    if isinstance(anc, list):
+                        for path in anc:
+                            if isinstance(path, list):
+                                for node in path:
+                                    if isinstance(node, dict):
+                                        sc = node.get("schemaClass", "")
+                                        if "Pathway" in sc:
+                                            pst = node.get("stId")
+                                            pname = node.get("displayName", pst)
+                                            if pst:
+                                                ancestor_pathways[pst] = pname
+
+                    # Map to known pathways in seen_stids
+                    matched_any_pathway = False
+                    for pw_stid, pw_obj in seen_stids.items():
+                        if pw_stid in ancestor_pathways:
+                            matched_any_pathway = True
+                            pw_name = pw_obj.get("displayName", pw_stid)
+                            mapping_type = "HIERARCHICAL_PATHWAY_MAPPING"
+
+                            for r_info in roles:
+                                ev_key = (uid, rst, r_info["role"], pw_stid)
+                                if ev_key in seen_evidence_keys:
+                                    continue
+                                seen_evidence_keys.add(ev_key)
+
+                                reaction_evidence_list.append(
+                                    ReactomeReactionEvidence(
+                                        target_canonical_id=uid,
+                                        target_original_id=uid,
+                                        reaction_id=rst,
+                                        reaction_name=det.get("displayName") or rxn.get("displayName", "Unnamed reaction"),
+                                        schema_class=det.get("schemaClass") or rxn.get("schemaClass", "Reaction"),
+                                        target_role=r_info["role"],
+                                        pathway_id=pw_stid,
+                                        pathway_name=pw_name,
+                                        mapping_type=mapping_type,
+                                        direction=r_info.get("direction", "UNKNOWN"),
+                                        source="REACTOME",
+                                        source_id=rst,
+                                        evidence_type="CURATED_REACTION",
+                                        species=species_name,
+                                        compartment=compartment_str,
+                                        disease_context=det.get("isInDisease", rxn.get("isInDisease", False)),
+                                        provenance={
+                                            "reactome_reaction": rst,
+                                            "pathway_id": pw_stid,
+                                            "raw_field": r_info.get("raw_field", "catalystActivity"),
+                                            "object_name": r_info.get("object_name", ""),
+                                        },
+                                    )
+                                )
+
+                    # If no known pathway matched directly, record reaction without pathway association
+                    if not matched_any_pathway:
+                        for r_info in roles:
+                            ev_key = (uid, rst, r_info["role"], None)
+                            if ev_key in seen_evidence_keys:
+                                continue
+                            seen_evidence_keys.add(ev_key)
+
+                            reaction_evidence_list.append(
+                                ReactomeReactionEvidence(
+                                    target_canonical_id=uid,
+                                    target_original_id=uid,
+                                    reaction_id=rst,
+                                    reaction_name=det.get("displayName") or rxn.get("displayName", "Unnamed reaction"),
+                                    schema_class=det.get("schemaClass") or rxn.get("schemaClass", "Reaction"),
+                                    target_role=r_info["role"],
+                                    pathway_id=None,
+                                    pathway_name=None,
+                                    mapping_type="DIRECT_PATHWAY_MAPPING",
+                                    direction=r_info.get("direction", "UNKNOWN"),
+                                    source="REACTOME",
+                                    source_id=rst,
+                                    evidence_type="CURATED_REACTION",
+                                    species=species_name,
+                                    compartment=compartment_str,
+                                    disease_context=det.get("isInDisease", rxn.get("isInDisease", False)),
+                                    provenance={
+                                        "reactome_reaction": rst,
+                                        "raw_field": r_info.get("raw_field", "catalystActivity"),
+                                        "object_name": r_info.get("object_name", ""),
+                                    },
+                                )
+                            )
+
+            # Phase 3: Prioritized reverse participant fetching.
+            # Fix: Ensure pathways required by reaction evidence are NEVER excluded by arbitrary cap.
+            # Priority 1: Pathways referenced by reactome_reaction_evidence
+            p1_reaction_pathways: list[str] = []
+            for rev in reaction_evidence_list:
+                if rev.pathway_id and rev.pathway_id in seen_stids and rev.pathway_id not in p1_reaction_pathways:
+                    p1_reaction_pathways.append(rev.pathway_id)
+            p1_set = set(p1_reaction_pathways)
+
+            # Priority 2: Direct pathways associated with drug targets (interleaved across targets)
+            p2_target_pathways: list[str] = []
+            max_target_pws = max((len(pws) for pws in target_to_pathways.values()), default=0)
+            for i in range(max_target_pws):
+                for uid in uniprot_ids[:5]:
+                    u_pws = target_to_pathways.get(uid, [])
+                    if i < len(u_pws):
+                        stid = u_pws[i]
+                        if stid in seen_stids and stid not in p1_set and stid not in p2_target_pathways:
+                            p2_target_pathways.append(stid)
+            p2_set = set(p2_target_pathways)
+
+            # Priority 3: Remaining pathways
+            p3_remaining_pathways = [
+                stid for stid in seen_stids.keys() if stid not in p1_set and stid not in p2_set
+            ]
+
+            # Build prioritized fetch list:
+            # ALL Priority 1 reaction pathways are guaranteed.
+            # Priority 2 and Priority 3 fill up to MAX_ORDINARY_PARTICIPANT_FETCH (default 10).
+            MAX_ORDINARY_PARTICIPANT_FETCH = 10
+            remaining_slots = max(0, MAX_ORDINARY_PARTICIPANT_FETCH - len(p1_reaction_pathways))
+            selected_pathway_stids = list(p1_reaction_pathways)
+            if remaining_slots > 0:
+                selected_pathway_stids.extend((p2_target_pathways + p3_remaining_pathways)[:remaining_slots])
+
+            logger.info(
+                "reactome_prioritized_pathway_fetch",
+                extra={
+                    "total_pathways_discovered": len(seen_stids),
+                    "reaction_referenced_pathways": len(p1_reaction_pathways),
+                    "target_associated_pathways": len(p2_target_pathways),
+                    "priority_pathways_selected": len(selected_pathway_stids),
+                    "selected_stids": selected_pathway_stids,
+                },
+            )
+
             participant_map: dict[str, list[str]] = {}
             participant_mappings: list[BiologicalIdentifierMapping] = []
-            sem = asyncio.Semaphore(3)
 
             async def fetch_participants_for_pathway(stid: str) -> None:
                 async with sem:
@@ -531,32 +794,43 @@ class RetrievalPipeline:
                                         )
                                     )
                             return
-                    res = await conn.fetch_participants(stid)
-                    participant_map[stid] = res.get("uniprot_ids", [])
-                    for m in res.get("mappings", []):
-                        if isinstance(m, BiologicalIdentifierMapping):
-                            participant_mappings.append(m)
-                        elif isinstance(m, dict):
-                            participant_mappings.append(
-                                BiologicalIdentifierMapping(
-                                    canonical_symbol=m.get("canonical_symbol"),
-                                    uniprot_accession=m.get("uniprot_accession"),
-                                    source=m.get("source", "Reactome"),
-                                    score=m.get("score"),
-                                    original_identifiers=tuple(m.get("original_identifiers", ())),
+                    try:
+                        res = await conn.fetch_participants(stid)
+                        participant_map[stid] = res.get("uniprot_ids", [])
+                        for m in res.get("mappings", []):
+                            if isinstance(m, BiologicalIdentifierMapping):
+                                participant_mappings.append(m)
+                            elif isinstance(m, dict):
+                                participant_mappings.append(
+                                    BiologicalIdentifierMapping(
+                                        canonical_symbol=m.get("canonical_symbol"),
+                                        uniprot_accession=m.get("uniprot_accession"),
+                                        source=m.get("source", "Reactome"),
+                                        score=m.get("score"),
+                                        original_identifiers=tuple(m.get("original_identifiers", ())),
+                                    )
                                 )
-                            )
-                    self._raw_cache.set(
-                        cache_key, "reactome_participants", stid, "participants", res, TTL_STRUCTURAL
-                    )
+                        self._raw_cache.set(
+                            cache_key, "reactome_participants", stid, "participants", res, TTL_STRUCTURAL
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "reactome_participants_fetch_failed",
+                            extra={"stid": stid, "error": str(e)},
+                        )
+                        participant_map[stid] = []
 
-            await asyncio.gather(*(fetch_participants_for_pathway(stid) for stid in list(seen_stids.keys())[:10]))
+            await asyncio.gather(*(fetch_participants_for_pathway(stid) for stid in selected_pathway_stids))
 
             # Attach participant lists to raw pathway dicts before parsing.
             for stid, pw in seen_stids.items():
                 pw["_participant_uniprot_ids"] = participant_map.get(stid, [])
 
-            return {"pathways": list(seen_stids.values()), "mappings": participant_mappings}
+            return {
+                "pathways": list(seen_stids.values()),
+                "mappings": participant_mappings,
+                "reaction_evidence": reaction_evidence_list,
+            }
 
     async def _fetch_clinicaltrials(self, drug_name: str, disease_name: str) -> dict[str, Any]:
         async with ClinicalTrialsConnector() as conn:
