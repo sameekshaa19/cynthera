@@ -50,6 +50,15 @@ except ImportError:
 try:
     from backend.engineering.retrieval.connectors.europepmc import EuropePMCConnector
     from backend.engineering.retrieval.connectors.opentargets import OpenTargetsConnector
+    from backend.engineering.retrieval.connectors.datts import DATTsConnector
+    from backend.infrastructure.knowledge.drugmechdb_client import DrugMechDBClient
+    from backend.core.value_objects.therapeutic_direction_evidence import (
+        OpenTargetsDoEEvidence,
+        DATTsEvidence,
+        DrugMechDBEvidence,
+        TherapeuticDirectionEvidence,
+    )
+    from backend.reasoning.directional.directional_evidence_builder import DirectionalEvidenceBuilder
     _NEW_SOURCES_AVAILABLE = True
 except ImportError:
     _NEW_SOURCES_AVAILABLE = False
@@ -304,6 +313,46 @@ class RetrievalPipeline:
                 sources_failed.append("opentargets")
                 logger.warning("opentargets_failed", extra={"error": str(ot_result)})
 
+        # --- Phase 4C: Directional Evidence Retrieval (OT DoE, DATTs, DrugMechDB) ---
+        opentargets_doe_evidence: list[OpenTargetsDoEEvidence] = []
+        datts_evidence: list[DATTsEvidence] = []
+        drugmechdb_evidence: list[DrugMechDBEvidence] = []
+        therapeutic_direction_evidence: list[TherapeuticDirectionEvidence] = []
+
+        if _NEW_SOURCES_AVAILABLE:
+            doe_res, datts_res, dm_res = await asyncio.gather(
+                self._fetch_opentargets_doe(targets, proteins, disease),
+                self._fetch_datts(proteins, disease),
+                self._fetch_drugmechdb(drug, disease, targets),
+                return_exceptions=True,
+            )
+
+            if isinstance(doe_res, tuple):
+                doe_list, doe_mappings = doe_res
+                sources_queried.append("opentargets_doe")
+                opentargets_doe_evidence.extend(doe_list)
+                identifier_mappings.extend(doe_mappings)
+            elif isinstance(doe_res, list):
+                sources_queried.append("opentargets_doe")
+                opentargets_doe_evidence.extend(doe_res)
+            elif isinstance(doe_res, Exception):
+                sources_failed.append("opentargets_doe")
+                logger.warning("opentargets_doe_failed", extra={"error": str(doe_res)})
+
+            if isinstance(datts_res, list):
+                sources_queried.append("datts")
+                datts_evidence.extend(datts_res)
+            elif isinstance(datts_res, Exception):
+                sources_failed.append("datts")
+                logger.warning("datts_failed", extra={"error": str(datts_res)})
+
+            if isinstance(dm_res, list):
+                sources_queried.append("drugmechdb")
+                drugmechdb_evidence.extend(dm_res)
+            elif isinstance(dm_res, Exception):
+                sources_failed.append("drugmechdb")
+                logger.warning("drugmechdb_failed", extra={"error": str(dm_res)})
+
         # --- Determine approval signal from retrieved indication data ---
         approval_signal = self._parse_indication_data(
             chembl_data.get("indications", {}),
@@ -326,6 +375,39 @@ class RetrievalPipeline:
             targets, evidence_records, pathways, clinical_trials, sources_failed
         )
 
+        # Preliminary package for directional builder normalization
+        package_prelim = RetrievalPackage(
+            hypothesis_id=hypothesis_id,
+            drug=drug,
+            disease=disease,
+            targets=targets,
+            proteins=proteins,
+            pathways=pathways,
+            evidence_records=evidence_records,
+            clinical_trials=clinical_trials,
+            retrieval_confidence=confidence,
+            sources_queried=sources_queried,
+            sources_failed=sources_failed,
+            sealed_at=datetime.utcnow(),
+            approval_signal=approval_signal,
+            clinical_trial_retrieval_status=ct_status,
+            validated_disease_genes=validated_disease_genes,
+            identifier_mappings=identifier_mappings,
+            reactome_reaction_evidence=reactome_reaction_evidence,
+            opentargets_doe_evidence=opentargets_doe_evidence,
+            datts_evidence=datts_evidence,
+            drugmechdb_evidence=drugmechdb_evidence,
+            therapeutic_direction_evidence=[],
+        )
+
+        # Build normalized TherapeuticDirectionEvidence
+        try:
+            builder = DirectionalEvidenceBuilder()
+            therapeutic_direction_evidence = builder.build_all(package_prelim)
+        except Exception as exc:
+            logger.warning("directional_evidence_builder_failed", extra={"error": str(exc)})
+            therapeutic_direction_evidence = []
+
         package = RetrievalPackage(
             hypothesis_id=hypothesis_id,
             drug=drug,
@@ -344,6 +426,10 @@ class RetrievalPipeline:
             validated_disease_genes=validated_disease_genes,
             identifier_mappings=identifier_mappings,
             reactome_reaction_evidence=reactome_reaction_evidence,
+            opentargets_doe_evidence=opentargets_doe_evidence,
+            datts_evidence=datts_evidence,
+            drugmechdb_evidence=drugmechdb_evidence,
+            therapeutic_direction_evidence=therapeutic_direction_evidence,
         )
 
         # Pipeline summary: cache stats for this run
@@ -1479,6 +1565,135 @@ class RetrievalPipeline:
                     result, TTL_ASSOCIATIONS,
                 )
             return result
+
+    async def _fetch_opentargets_doe(
+        self,
+        targets: list[Target],
+        proteins: list[Protein],
+        disease: Disease,
+    ) -> tuple[list[OpenTargetsDoEEvidence], list[BiologicalIdentifierMapping]]:
+        """Fetch Open Targets Direction of Effect (DoE) records for retrieved targets."""
+        if not _NEW_SOURCES_AVAILABLE:
+            return [], []
+
+        async with OpenTargetsConnector() as connector:
+            mondo_id = disease.mondo_id
+            if not mondo_id:
+                mondo_id = await connector.resolve_mondo_id(disease.name)
+            if not mondo_id:
+                return [], []
+
+            results: list[OpenTargetsDoEEvidence] = []
+            doe_mappings: list[BiologicalIdentifierMapping] = []
+            seen_ensembl: set[str] = set()
+
+            for p in proteins[:12]:
+                query_sym = p.gene_symbol if p.gene_symbol != "UNKNOWN" else p.uniprot_accession
+                ensembl_id, _ = await connector.resolve_target_ensembl_id(query_sym, gene_symbol=p.gene_symbol)
+                if ensembl_id and ensembl_id not in seen_ensembl:
+                    seen_ensembl.add(ensembl_id)
+                    doe_mappings.append(
+                        BiologicalIdentifierMapping(
+                            canonical_symbol=p.gene_symbol if p.gene_symbol != "UNKNOWN" else None,
+                            uniprot_accession=p.uniprot_accession,
+                            ensembl_id=ensembl_id,
+                            source="OpenTargets",
+                            original_identifiers=(p.gene_symbol, p.uniprot_accession, ensembl_id),
+                        )
+                    )
+                    cache_key = RawResponseCache.make_key("ot_doe", ensembl_id, mondo_id)
+                    if not self._bypass_raw_cache:
+                        cached = self._raw_cache.get(cache_key, source_name="ot_doe")
+                        if cached is not None and isinstance(cached, list):
+                            try:
+                                results.extend([OpenTargetsDoEEvidence.model_validate(r) for r in cached])
+                                continue
+                            except Exception:
+                                pass
+
+                    doe_rows = await connector.fetch_direction_of_effect(ensembl_id, mondo_id)
+                    results.extend(doe_rows)
+                    if doe_rows:
+                        self._raw_cache.set(
+                            cache_key,
+                            "ot_doe",
+                            ensembl_id,
+                            mondo_id,
+                            [r.model_dump(mode="json") for r in doe_rows],
+                            TTL_ASSOCIATIONS,
+                        )
+            return results, doe_mappings
+
+    async def _fetch_datts(
+        self,
+        proteins: list[Protein],
+        disease: Disease,
+    ) -> list[DATTsEvidence]:
+        """Fetch DATTs therapeutic action records for retrieved targets and disease."""
+        if not _NEW_SOURCES_AVAILABLE:
+            return []
+
+        async with DATTsConnector() as connector:
+            results: list[DATTsEvidence] = []
+            seen_queries: set[tuple[str, str, str]] = set()
+
+            for p in proteins[:12]:
+                sym = p.gene_symbol if p.gene_symbol != "UNKNOWN" else ""
+                uni = p.uniprot_accession
+                k = (sym, uni, disease.name.lower())
+                if k in seen_queries:
+                    continue
+                seen_queries.add(k)
+
+                cache_key = RawResponseCache.make_key("datts", sym or uni, disease.name)
+                if not self._bypass_raw_cache:
+                    cached = self._raw_cache.get(cache_key, source_name="datts")
+                    if cached is not None and isinstance(cached, list):
+                        try:
+                            results.extend([DATTsEvidence.model_validate(r) for r in cached])
+                            continue
+                        except Exception:
+                            pass
+
+                datts_rows = await connector.fetch_therapeutic_actions(sym, uni, disease.name)
+                results.extend(datts_rows)
+                if datts_rows:
+                    self._raw_cache.set(
+                        cache_key,
+                        "datts",
+                        sym or uni,
+                        disease.name,
+                        [r.model_dump(mode="json") for r in datts_rows],
+                        TTL_ASSOCIATIONS,
+                    )
+            return results
+
+    async def _fetch_drugmechdb(
+        self,
+        drug: Drug,
+        disease: Disease,
+        targets: list[Target],
+    ) -> list[DrugMechDBEvidence]:
+        """Fetch DrugMechDB curated mechanistic path validation records."""
+        if not _NEW_SOURCES_AVAILABLE:
+            return []
+
+        client = DrugMechDBClient()
+        results: list[DrugMechDBEvidence] = []
+        uniprot_ids = list(set(t.protein_uniprot for t in targets if t.protein_uniprot))
+
+        if uniprot_ids:
+            for uid in uniprot_ids[:5]:
+                ev = await client.lookup_mechanism(drug.name, disease.name, uid)
+                if ev.is_curated_path_available:
+                    results.append(ev)
+                    break
+        if not results:
+            ev = await client.lookup_mechanism(drug.name, disease.name, None)
+            if ev.is_curated_path_available:
+                results.append(ev)
+
+        return results
 
     def _parse_disgenet_to_gene_scores(
         self,

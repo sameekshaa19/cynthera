@@ -19,6 +19,12 @@ from backend.core.domain.clinical_trial import ClinicalTrial
 from backend.core.domain.approval_signal import ApprovalSignal
 from backend.core.domain.reactome_reaction_evidence import ReactomeReactionEvidence
 from backend.core.value_objects.biological_identifier import BiologicalIdentifierMapping
+from backend.core.value_objects.therapeutic_direction_evidence import (
+    OpenTargetsDoEEvidence,
+    DATTsEvidence,
+    DrugMechDBEvidence,
+    TherapeuticDirectionEvidence,
+)
 
 
 class RetrievalPackage(BaseModel):
@@ -100,6 +106,22 @@ class RetrievalPackage(BaseModel):
     reactome_reaction_evidence: list[ReactomeReactionEvidence] = Field(
         default_factory=list,
         description="Preserved target-specific Reactome reaction and event level evidence records.",
+    )
+    opentargets_doe_evidence: list[OpenTargetsDoEEvidence] = Field(
+        default_factory=list,
+        description="Open Targets Direction of Effect evidence records.",
+    )
+    datts_evidence: list[DATTsEvidence] = Field(
+        default_factory=list,
+        description="DATTs disease-associated therapeutic target evidence records.",
+    )
+    drugmechdb_evidence: list[DrugMechDBEvidence] = Field(
+        default_factory=list,
+        description="DrugMechDB curated mechanistic path validation records.",
+    )
+    therapeutic_direction_evidence: list[TherapeuticDirectionEvidence] = Field(
+        default_factory=list,
+        description="Normalized therapeutic direction evidence records with provenance and independence grouping.",
     )
 
 

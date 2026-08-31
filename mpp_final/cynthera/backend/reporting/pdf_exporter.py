@@ -241,6 +241,55 @@ class PDFReporter:
         story.append(score_table)
         story.append(Spacer(1, 0.3 * cm))
 
+        # ── Phase 4D: Therapeutic Direction Alignment ─────────────────
+        ta = getattr(result.audit_report, "therapeutic_alignment", {}) or {}
+        if ta:
+            story.append(Paragraph("Therapeutic Direction Alignment (Phase 4D)", section_style))
+            story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0")))
+            overall_ta = ta.get("overall_alignment", "INSUFFICIENT")
+            ta_expl = ta.get("explanation", "")
+            ta_color = "#16a34a" if overall_ta == "SUPPORTS" else ("#dc2626" if overall_ta == "OPPOSES" else "#64748b")
+            story.append(Paragraph(
+                f"<b>Overall Directional Alignment:</b> <font color='{ta_color}'><b>{overall_ta}</b></font>",
+                body_style,
+            ))
+            if ta_expl:
+                story.append(Paragraph(f"<i>{ta_expl}</i>", body_style))
+            story.append(Spacer(1, 0.15 * cm))
+
+            t_aligns = ta.get("target_alignments", [])
+            if t_aligns:
+                t_align_data = [["Target", "Drug Action", "Desired Action", "Alignment", "Evidence Groups"]]
+                for t in t_aligns:
+                    tid = t.get("target_id", "—")
+                    d_act = t.get("drug_action", "UNKNOWN")
+                    des_act = t.get("desired_target_action", "UNKNOWN")
+                    al = t.get("alignment", "INSUFFICIENT")
+                    supp = len(t.get("supporting_groups", []))
+                    opp = len(t.get("opposing_groups", []))
+                    t_align_data.append([
+                        tid,
+                        d_act,
+                        des_act,
+                        al,
+                        f"{supp} supp / {opp} opp groups",
+                    ])
+                t_align_table = Table(t_align_data, colWidths=[3.5 * cm, 3.5 * cm, 3.5 * cm, 3 * cm, 3.5 * cm])
+                t_align_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4338ca")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#eef2ff"), colors.white]),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.append(t_align_table)
+                story.append(Spacer(1, 0.3 * cm))
+
         # ── Scientific Context (dimensional prior knowledge) ────────────
         sc = getattr(result.audit_report, "scientific_context", {}) or {}
         if sc:

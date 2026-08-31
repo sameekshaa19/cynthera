@@ -514,7 +514,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigation",
-        ["🔬 Evaluate", "📊 Results", "📋 Audit Report", "🕐 History", "⚡ Batch"],
+        ["🔬 Evaluate", "📊 Results", "📋 Audit Report", "🕐 History", "⚡ Batch", "🧪 Phase 4E Evaluation"],
         index=0,
         label_visibility="collapsed",
     )
@@ -1640,3 +1640,154 @@ elif page == "⚡ Batch":
             st.info("No batch jobs yet.")
     except Exception as exc:
         st.warning(f"Could not load batch history: {exc}")
+
+
+# ─────────────────────────────────────────────
+# Page: Phase 4E Evaluation (Benchmark & Ablations)
+# ─────────────────────────────────────────────
+elif page == "🧪 Phase 4E Evaluation":
+    st.markdown("## 🧪 Phase 4E — Therapeutic Direction Benchmark & Ablations")
+    st.markdown(
+        "<p style='color: #94a3b8;'>Quantitative evaluation of CYNTHERA's directional reasoning engine "
+        "across curated positive indications, directional negative controls, and uncharacterized pairs. "
+        "Features 3×3 multi-class confusion matrices, systematic ablations, and downloadable research reports.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if "phase4e_report" not in st.session_state:
+        st.session_state.phase4e_report = None
+
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        run_bench_btn = st.button("🚀 Run Phase 4E Benchmark", type="primary", use_container_width=True)
+    with col_info:
+        st.caption("Executes all benchmark cases through the production MasterOrchestrator pipeline with fresh evaluations.")
+
+    if run_bench_btn:
+        with st.spinner("Running Phase 4E Benchmark & Ablation Study..."):
+            try:
+                from backend.evaluation.benchmark_runner import BenchmarkRunner
+                runner = BenchmarkRunner()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                report = loop.run_until_complete(runner.run_benchmark(bypass_cache=True, include_ablations=True))
+                st.session_state.phase4e_report = report
+                st.success("✅ Benchmark evaluation and ablation study complete!")
+            except Exception as exc:
+                st.error(f"Benchmark execution failed: {exc}")
+
+    report = st.session_state.phase4e_report
+    if report:
+        st.markdown("---")
+        # ── 1. Overall Metrics ────────────────────────────────────────────────
+        st.markdown("### 📊 Benchmark Performance Summary")
+        m = report.full_4d_metrics
+        b = report.baseline_metrics
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Total Cases", f"{m.total_cases}", f"{m.positive_cases}P / {m.negative_cases}N / {m.uncertain_cases}U")
+        c2.metric("Accuracy", f"{m.accuracy:.1%}" if m.accuracy is not None else "N/A", f"Baseline: {b.accuracy:.1%}" if b.accuracy is not None else "N/A")
+        c3.metric("Precision", f"{m.precision:.1%}" if m.precision is not None else "N/A", f"Baseline: {b.precision:.1%}" if b.precision is not None else "N/A")
+        c4.metric("Recall / Sens.", f"{m.recall:.1%}" if m.recall is not None else "N/A", f"Baseline: {b.recall:.1%}" if b.recall is not None else "N/A")
+        c5.metric("Specificity", f"{m.specificity:.1%}" if m.specificity is not None else "N/A", "Dir. Neg. Rejection")
+        c6.metric("MCC", f"{m.mcc:.3f}" if m.mcc is not None else "N/A", "Correlation")
+
+        # ── 2. Confusion Matrix ───────────────────────────────────────────────
+        st.markdown("### 🔲 3×3 Multi-Class Confusion Matrix")
+        import pandas as pd
+        cm = m.confusion_matrix
+        from backend.evaluation.benchmark_models import BenchmarkClass
+        cm_dict = {
+            "Pred: POSITIVE": [
+                cm.get(BenchmarkClass.POSITIVE, BenchmarkClass.POSITIVE),
+                cm.get(BenchmarkClass.NEGATIVE, BenchmarkClass.POSITIVE),
+                cm.get(BenchmarkClass.UNCERTAIN, BenchmarkClass.POSITIVE),
+            ],
+            "Pred: NEGATIVE": [
+                cm.get(BenchmarkClass.POSITIVE, BenchmarkClass.NEGATIVE),
+                cm.get(BenchmarkClass.NEGATIVE, BenchmarkClass.NEGATIVE),
+                cm.get(BenchmarkClass.UNCERTAIN, BenchmarkClass.NEGATIVE),
+            ],
+            "Pred: UNCERTAIN": [
+                cm.get(BenchmarkClass.POSITIVE, BenchmarkClass.UNCERTAIN),
+                cm.get(BenchmarkClass.NEGATIVE, BenchmarkClass.UNCERTAIN),
+                cm.get(BenchmarkClass.UNCERTAIN, BenchmarkClass.UNCERTAIN),
+            ],
+        }
+        cm_df = pd.DataFrame(cm_dict, index=["Exp: POSITIVE", "Exp: NEGATIVE", "Exp: UNCERTAIN"])
+        st.table(cm_df)
+
+        # ── 3. Case Results Table ─────────────────────────────────────────────
+        st.markdown("### 📋 Case-by-Case Evaluation Results")
+        case_rows = []
+        for cr in report.case_results:
+            is_pass = cr.is_correct
+            status_badge = "✅ PASS" if is_pass else ("⚠️ UNCERTAIN" if cr.predicted_class.value == "UNCERTAIN" else "❌ FAIL")
+            case_rows.append({
+                "Case ID": cr.case.case_id,
+                "Drug": cr.case.drug,
+                "Disease": cr.case.disease,
+                "Expected": cr.case.expected_class.value,
+                "Predicted": cr.predicted_class.value,
+                "Alignment": cr.predicted_alignment,
+                "Primary Target": cr.primary_target or "—",
+                "Concordance": f"{cr.directional_concordance:.2f}",
+                "Status": status_badge,
+            })
+        st.dataframe(pd.DataFrame(case_rows), use_container_width=True)
+
+        # ── 4. Case Detail Accordion ──────────────────────────────────────────
+        st.markdown("#### 🔍 Deep Evidence Inspection")
+        for cr in report.case_results:
+            with st.expander(f"{cr.case.case_id}: {cr.case.drug} → {cr.case.disease} ({cr.predicted_class.value})"):
+                st.markdown(f"**Rationale:** {cr.case.rationale}")
+                st.markdown(f"**Primary Target:** `{cr.primary_target or 'None'}` | **Predicted Alignment:** `{cr.predicted_alignment}`")
+                st.markdown(f"**Directional Concordance Ratio:** `{cr.directional_concordance:.2f}` (Supporting: {cr.supporting_group_count} / Opposing: {cr.opposing_group_count})")
+                st.markdown(f"**Explanation:** {cr.explanation}")
+                if cr.target_alignments:
+                    st.markdown("**Target Alignment Breakdown:**")
+                    st.json(cr.target_alignments)
+
+        # ── 5. Ablation Study ─────────────────────────────────────────────────
+        st.markdown("### 🔬 Systematic Ablation Analysis")
+        st.markdown("<small style='color: #94a3b8;'>Quantifies directional shift and metric deltas when individual evidence layers are removed.</small>", unsafe_allow_html=True)
+        if report.ablation_results:
+            ab_rows = []
+            for ab in report.ablation_results:
+                m_ab = ab.metrics
+                ab_rows.append({
+                    "Configuration": ab.config_name.value,
+                    "Description": ab.description,
+                    "Accuracy": f"{m_ab.accuracy:.1%}" if m_ab.accuracy is not None else "N/A",
+                    "Precision": f"{m_ab.precision:.1%}" if m_ab.precision is not None else "N/A",
+                    "Recall": f"{m_ab.recall:.1%}" if m_ab.recall is not None else "N/A",
+                    "F1 Score": f"{m_ab.f1_score:.3f}" if m_ab.f1_score is not None else "N/A",
+                    "Cases Shifted": len(ab.changed_cases_from_full),
+                })
+            st.dataframe(pd.DataFrame(ab_rows), use_container_width=True)
+
+            for ab in report.ablation_results:
+                if ab.changed_cases_from_full:
+                    with st.expander(f"Shifted cases for {ab.config_name.value} ({len(ab.changed_cases_from_full)})"):
+                        for ch in ab.changed_cases_from_full:
+                            st.markdown(f"- **{ch.get('drug')} → {ch.get('disease')}**: `{ch.get('full_prediction')}` → `{ch.get('ablated_prediction')}` ({ch.get('reason')})")
+
+        # ── 6. Downloadable Report ────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📥 Download Research Evaluation Report")
+        try:
+            from backend.reporting.evaluation_pdf_exporter import EvaluationPDFExporter
+            pdf_bytes = EvaluationPDFExporter(report).generate_pdf_bytes()
+            st.download_button(
+                label="📄 Download Phase 4E Evaluation Report (PDF)",
+                data=pdf_bytes,
+                file_name=f"cynthera_phase4e_evaluation_{time.strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.warning(f"PDF export failed: {exc}")
+    else:
+        st.info("Click **🚀 Run Phase 4E Benchmark** above to run the evaluation suite and generate the report.")
+

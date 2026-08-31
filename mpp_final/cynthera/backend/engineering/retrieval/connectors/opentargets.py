@@ -37,11 +37,49 @@ from typing import Any
 
 from backend.core.exceptions import SourceUnavailableError
 from backend.core.value_objects.biological_identifier import BiologicalIdentifierMapping
+from backend.core.value_objects.therapeutic_direction_evidence import OpenTargetsDoEEvidence
 from backend.engineering.retrieval.connectors.base import BaseConnector
 
 logger = logging.getLogger(__name__)
 
 _OT_GQL_URL = "https://api.platform.opentargets.org/api/v4/graphql"
+
+_GQL_TARGET_SEARCH = """
+query SearchTarget($name: String!) {
+  search(queryString: $name, entityNames: ["target"], page: {index: 0, size: 5}) {
+    hits {
+      id
+      name
+      entity
+      score
+    }
+  }
+}
+"""
+
+_GQL_DOE = """
+query TargetDOE($ensemblId: String!, $efoId: String!, $size: Int!) {
+  target(ensemblId: $ensemblId) {
+    id
+    approvedSymbol
+    evidences(efoIds: [$efoId], size: $size) {
+      count
+      rows {
+        id
+        datasourceId
+        datatypeId
+        directionOnTarget
+        directionOnTrait
+        targetModulation
+        targetRole
+        score
+        literature
+        studyId
+      }
+    }
+  }
+}
+"""
 
 # Number of top associations to fetch per disease query.
 # The top 50 by score include all clinically relevant targets.
@@ -281,6 +319,8 @@ class OpenTargetsConnector(BaseConnector):
             score = row.get("score", 0.0)
             raw_symbol = target.get("approvedSymbol")
             gene_symbol = str(raw_symbol).strip().upper() if raw_symbol else None
+            raw_ensembl = target.get("id")
+            ensembl_id = str(raw_ensembl).strip().upper() if raw_ensembl else None
             score_val = round(float(score), 6) if isinstance(score, (int, float)) and score > 0 else None
 
             # Extract UniProt accessions from proteinIds
@@ -293,15 +333,17 @@ class OpenTargetsConnector(BaseConnector):
                         protein_ids.append(clean_pid)
 
             # Preserve row-level paired mapping
+            orig_ids = [i for i in (gene_symbol, ensembl_id) if i]
             if gene_symbol and protein_ids:
                 for pid in protein_ids:
                     mappings.append(
                         BiologicalIdentifierMapping(
                             canonical_symbol=gene_symbol,
                             uniprot_accession=pid,
+                            ensembl_id=ensembl_id,
                             source="OpenTargets",
                             score=score_val,
-                            original_identifiers=(gene_symbol, pid),
+                            original_identifiers=tuple(orig_ids + [pid]),
                         )
                     )
             elif gene_symbol:
@@ -309,9 +351,10 @@ class OpenTargetsConnector(BaseConnector):
                     BiologicalIdentifierMapping(
                         canonical_symbol=gene_symbol,
                         uniprot_accession=None,
+                        ensembl_id=ensembl_id,
                         source="OpenTargets",
                         score=score_val,
-                        original_identifiers=(gene_symbol,),
+                        original_identifiers=tuple(orig_ids),
                     )
                 )
             elif protein_ids:
@@ -320,9 +363,10 @@ class OpenTargetsConnector(BaseConnector):
                         BiologicalIdentifierMapping(
                             canonical_symbol=None,
                             uniprot_accession=pid,
+                            ensembl_id=ensembl_id,
                             source="OpenTargets",
                             score=score_val,
-                            original_identifiers=(pid,),
+                            original_identifiers=tuple([ensembl_id, pid] if ensembl_id else [pid]),
                         )
                     )
 
@@ -330,6 +374,8 @@ class OpenTargetsConnector(BaseConnector):
             if score_val is not None:
                 if gene_symbol:
                     gene_scores[gene_symbol] = score_val
+                if ensembl_id:
+                    gene_scores[ensembl_id] = score_val
                 for pid in protein_ids:
                     gene_scores[pid] = score_val
 
@@ -344,3 +390,135 @@ class OpenTargetsConnector(BaseConnector):
             },
         )
         return gene_scores, mappings
+
+    async def resolve_target_ensembl_id(
+        self,
+        target_query: str,
+        gene_symbol: str | None = None,
+    ) -> tuple[str | None, str]:
+        """Resolve a target name, symbol, or UniProt ID to an Ensembl ID.
+
+        Args:
+            target_query: Query string (e.g., gene symbol 'SLC12A1' or UniProt 'Q13621').
+            gene_symbol: Optional known HGNC symbol to verify exact match.
+
+        Returns:
+            Tuple of (ensembl_id or None, mapping_status: 'EXACT' | 'RESOLVED' | 'UNRESOLVED').
+        """
+        if not target_query:
+            return None, "UNRESOLVED"
+
+        try:
+            resp = await self._post(
+                self.base_url,
+                {"query": _GQL_TARGET_SEARCH, "variables": {"name": target_query}},
+            )
+        except Exception as exc:
+            logger.warning(
+                "opentargets_target_resolution_failed",
+                extra={"target_query": target_query, "error": str(exc)},
+            )
+            return None, "UNRESOLVED"
+
+        hits = (resp.get("data") or {}).get("search", {}).get("hits", [])
+        if not hits:
+            return None, "UNRESOLVED"
+
+        expected_symbol = (gene_symbol or target_query).strip().upper()
+
+        # Check for exact symbol match
+        for hit in hits:
+            hit_name = str(hit.get("name") or "").strip().upper()
+            hit_id = str(hit.get("id") or "")
+            if hit_name == expected_symbol and hit_id.startswith("ENSG"):
+                return hit_id, "EXACT"
+
+        # Check for any valid Ensembl ID hit
+        for hit in hits:
+            hit_id = str(hit.get("id") or "")
+            if hit_id.startswith("ENSG"):
+                return hit_id, "RESOLVED"
+
+        return None, "UNRESOLVED"
+
+    async def fetch_direction_of_effect(
+        self,
+        ensembl_id: str,
+        mondo_id: str,
+        page_size: int = 50,
+    ) -> list[OpenTargetsDoEEvidence]:
+        """Fetch Direction of Effect (DoE) evidence for a target-disease pair.
+
+        Queries target perturbation effect on disease trait (LoF/GoF + protect/risk).
+
+        Args:
+            ensembl_id: Ensembl gene ID (e.g., 'ENSG00000074803').
+            mondo_id: MONDO / EFO disease identifier (e.g., 'MONDO_0009693').
+            page_size: Max rows to retrieve (default 50).
+
+        Returns:
+            List of OpenTargetsDoEEvidence value objects.
+        """
+        if not ensembl_id or not mondo_id:
+            return []
+
+        try:
+            resp = await self._post(
+                self.base_url,
+                {
+                    "query": _GQL_DOE,
+                    "variables": {"ensemblId": ensembl_id, "efoId": mondo_id, "size": page_size},
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "opentargets_doe_fetch_failed",
+                extra={"ensembl_id": ensembl_id, "mondo_id": mondo_id, "error": str(exc)},
+            )
+            raise
+
+        target_data = (resp.get("data") or {}).get("target") or {}
+        rows = (target_data.get("evidences") or {}).get("rows", [])
+        approved_symbol = target_data.get("approvedSymbol")
+
+        doe_records: list[OpenTargetsDoEEvidence] = []
+        for row in rows:
+            lit_raw = row.get("literature")
+            literature_list = [str(l).strip() for l in lit_raw if l] if isinstance(lit_raw, list) else []
+
+            score_val = row.get("score")
+            try:
+                parsed_score = float(score_val) if score_val is not None else None
+            except (ValueError, TypeError):
+                parsed_score = None
+
+            doe_records.append(
+                OpenTargetsDoEEvidence(
+                    target_id=ensembl_id,
+                    disease_id=mondo_id,
+                    target_symbol=approved_symbol,
+                    direction_on_target=row.get("directionOnTarget"),
+                    direction_on_trait=row.get("directionOnTrait"),
+                    datasource_id=row.get("datasourceId"),
+                    datatype_id=row.get("datatypeId"),
+                    evidence_id=str(row.get("id")) if row.get("id") else None,
+                    score=parsed_score,
+                    literature=literature_list,
+                    study_id=row.get("studyId"),
+                    target_modulation=row.get("targetModulation"),
+                    target_role=row.get("targetRole"),
+                    provenance=row,
+                )
+            )
+
+        logger.info(
+            "opentargets_doe_fetched",
+            extra={
+                "ensembl_id": ensembl_id,
+                "mondo_id": mondo_id,
+                "total_rows": len(rows),
+                "directional_rows": sum(1 for r in doe_records if r.direction_on_target or r.direction_on_trait),
+            },
+        )
+        return doe_records
+

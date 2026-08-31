@@ -77,7 +77,7 @@ class EvaluationCache:
                 pass
             conn.commit()
 
-    _CACHE_VERSION: str = "v3.0_phase3"
+    _CACHE_VERSION: str = "v4.2_phase4d"
 
     @classmethod
     def _make_key(cls, drug_name: str, disease_name: str, policy: str) -> str:

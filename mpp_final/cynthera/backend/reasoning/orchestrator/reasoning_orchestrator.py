@@ -1602,6 +1602,16 @@ safety_profile: SafetyProfile,
             f"Conclusion Summary: {reasons[0] if reasons else 'No recommendation reasons generated.'}"
         )
 
+        # ── Phase 4D: Compute Therapeutic Alignment Report ──────────────────
+        from backend.reasoning.directional.therapeutic_alignment import TherapeuticAlignmentEngine
+        try:
+            ta_engine = TherapeuticAlignmentEngine()
+            ta_report = ta_engine.align_package(package)
+            ta_dict = ta_report.model_dump(mode="json")
+        except Exception as exc:
+            logger.warning("therapeutic_alignment_computation_failed", extra={"error": str(exc)})
+            ta_dict = {}
+
         return ScientificAuditReport(
             summary=summary,
             key_supporting_claim_ids=[str(c.id) for c in supporting],
@@ -1625,6 +1635,7 @@ safety_profile: SafetyProfile,
             claim_citations=claim_citations,
             candidate_mechanisms=mechanistic.candidate_mechanisms,
             sources_accessed=sources_accessed,
+            therapeutic_alignment=ta_dict,
         )
 
     def _extract_citations(self, evidence_records: list) -> list[str]:

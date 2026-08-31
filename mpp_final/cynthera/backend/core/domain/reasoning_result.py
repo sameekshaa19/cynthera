@@ -209,6 +209,10 @@ class ScientificAuditReport(BaseModel):
         default_factory=list,
         description="List of queried database sources with status and direct portal links.",
     )
+    therapeutic_alignment: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Phase 4D Therapeutic Alignment report capturing target-level and overall directional compatibility.",
+    )
 
 
 

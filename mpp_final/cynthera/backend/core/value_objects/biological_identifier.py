@@ -13,6 +13,7 @@ class BiologicalIdentifierType(str, Enum):
     """Classification of biological identifier types."""
     GENE_SYMBOL = "GENE_SYMBOL"
     UNIPROT = "UNIPROT"
+    ENSEMBL = "ENSEMBL"
     NCBI_GENE = "NCBI_GENE"
     UNKNOWN = "UNKNOWN"
 
@@ -41,7 +42,7 @@ class BiologicalRelationshipType(str, Enum):
 
 @dataclass(frozen=True)
 class BiologicalIdentifierMapping:
-    """Source-provided mapping between biological identifiers (e.g. Gene Symbol <-> UniProt).
+    """Source-provided mapping between biological identifiers (e.g. Gene Symbol <-> UniProt <-> Ensembl).
 
     Preserves row-level paired relationships directly from Open Targets, Reactome, etc.
     """
@@ -50,6 +51,8 @@ class BiologicalIdentifierMapping:
     source: str
     score: float | None = None
     original_identifiers: tuple[str, ...] = field(default_factory=tuple)
+    ensembl_id: str | None = None
+    identifier_type: str | None = None
 
 
 @dataclass(frozen=True)
