@@ -864,9 +864,10 @@ def trial_to_negative_claim(
     # remain contextual in the retrieval package, but cannot create direct
     # therapeutic opposition claims.
     applicability = assess_trial_applicability(trial, disease_name)
-    if applicability.status not in (
-        TrialApplicabilityStatus.DIRECT,
-        TrialApplicabilityStatus.PARENT_OR_BROAD_CONTEXT,
+    if applicability.status in (
+        TrialApplicabilityStatus.SUBTYPE_MISMATCH,
+        TrialApplicabilityStatus.POPULATION_MISMATCH,
+        TrialApplicabilityStatus.DOSE_MISMATCH,
     ):
         logger.info(
             "trial_applicability_rejected",

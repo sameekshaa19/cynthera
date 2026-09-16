@@ -57,15 +57,34 @@ def _text(trial: ClinicalTrial) -> str:
     ).lower()
 
 
-def _has_marker(term: str) -> bool:
-    return bool(re.search(r"\b(?:egfr|alk|her2|her-2|braf|kras|pd-l1|brca|ros1|ntrk)[- ]?(?:positive|mutant|mutation|negative)\b", term.lower()))
+_MARKER_NAMES = ("egfr", "alk", "her2", "her-2", "braf", "kras", "pd-l1", "brca", "ros1", "ntrk")
+_MARKER_STATES = ("positive", "negative", "mutant", "mutation", "wild[- ]?type")
+
+
+def _marker_requirements(term: str) -> dict[str, str]:
+    """Extract marker identity plus requested state from a query or trial text."""
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(name) for name in _MARKER_NAMES) + r")[- ]?"
+        r"(positive|negative|mutant|mutation|wild[- ]?type)\b",
+        re.IGNORECASE,
+    )
+    requirements: dict[str, str] = {}
+    for marker, state in pattern.findall(term or ""):
+        canonical_state = "positive" if state.lower() in {"positive", "mutant", "mutation"} else state.lower().replace(" ", "-")
+        requirements[marker.lower().replace("-", "")] = canonical_state
+    return requirements
 
 
 def _marker_mismatch(query: str, text: str) -> bool:
-    if not _has_marker(query):
+    requested = _marker_requirements(query)
+    if not requested:
         return False
-    marker_tokens = re.findall(r"\b(?:egfr|alk|her2|her-2|braf|kras|pd-l1|brca|ros1|ntrk)\b", query.lower())
-    return bool(marker_tokens) and not any(token in text for token in marker_tokens)
+    observed = _marker_requirements(text)
+    for marker, requested_state in requested.items():
+        observed_state = observed.get(marker)
+        if observed_state is None or observed_state != requested_state:
+            return True
+    return False
 
 
 def _population_mismatch(query: str, text: str) -> bool:
@@ -92,16 +111,20 @@ def assess_trial_applicability(trial: ClinicalTrial, queried_disease: str) -> Tr
     """Classify direct applicability without silently treating missing metadata as a match."""
     conditions = list(getattr(trial, "condition_names", []) or [])
     relation = DiseaseRelation.UNRELATED
+    relation_from_condition = False
     for condition in conditions:
         candidate = classify_disease_relation(queried_disease, condition)
         if candidate == DiseaseRelation.SIBLING_EXCLUDED:
             relation = candidate
+            relation_from_condition = True
             break
         if candidate == DiseaseRelation.SAME:
             relation = candidate
+            relation_from_condition = True
             break
         if candidate == DiseaseRelation.PARENT_CHILD and relation == DiseaseRelation.UNRELATED:
             relation = candidate
+            relation_from_condition = True
     if relation == DiseaseRelation.UNRELATED:
         relation = classify_disease_relation(queried_disease, trial.title or "")
 
@@ -164,6 +187,12 @@ def assess_trial_applicability(trial: ClinicalTrial, queried_disease: str) -> Tr
             disease_relation=relation,
             reasons=("No exact or curated parent-child disease relation was established.",),
         )
+    if relation == DiseaseRelation.PARENT_CHILD and not relation_from_condition:
+        return TrialApplicability(
+            status=TrialApplicabilityStatus.INSUFFICIENT_METADATA,
+            disease_relation=relation,
+            reasons=("Parent-child relation inferred from title only; retain as contextual evidence pending explicit conditions.",),
+        )
     if _marker_mismatch(queried_disease, text):
         reasons.append("Query is biomarker-defined but the trial record lacks the requested biomarker.")
         return TrialApplicability(
@@ -190,8 +219,8 @@ def assess_trial_applicability(trial: ClinicalTrial, queried_disease: str) -> Tr
         return TrialApplicability(
             status=TrialApplicabilityStatus.PARENT_OR_BROAD_CONTEXT,
             disease_relation=relation,
-            reasons=("Curated parent-child disease relation; retain as contextual evidence.",),
-            direct_therapeutic_evidence=True,
+            reasons=("Curated parent-child disease relation; retain as contextual evidence only.",),
+            direct_therapeutic_evidence=False,
         )
     return TrialApplicability(
         status=TrialApplicabilityStatus.DIRECT,
